@@ -11,7 +11,7 @@ test:
 # skip. pg/testdb needs Docker; nothing else does.
 .PHONY: test-db
 test-db:
-	KEEL_REQUIRE_DB=1 go test -count=1 ./pg/... ./auth/pg/... ./admin/pg/...
+	KEEL_REQUIRE_DB=1 go test -count=1 ./pg/... ./auth/pg/... ./admin/pg/... ./app/...
 
 .PHONY: lint
 lint:

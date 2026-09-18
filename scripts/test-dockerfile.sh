@@ -11,9 +11,10 @@
 # variable actually named Revision cannot be caught here (see the
 # Dockerfile's own comment on why).
 #
-# This never builds against keel itself: keel has no cmd/ directory (it is
-# a library), so there is nothing for CMD_PATH to point at here. The
-# throwaway project below plays that role.
+# This never builds against keel itself: keel's only main package outside the
+# example is cmd/keel, a scaffolding CLI rather than a service, so there is
+# nothing for CMD_PATH to point at here. The throwaway project below plays
+# that role.
 #
 # Usage:
 #   scripts/test-dockerfile.sh

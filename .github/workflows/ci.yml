@@ -33,7 +33,7 @@ jobs:
       - name: Database-backed tests
         env:
           KEEL_REQUIRE_DB: "1"
-        run: go test -count=1 ./pg/... ./examples/... ./auth/pg/... ./admin/pg/...
+        run: go test -count=1 ./pg/... ./examples/... ./auth/pg/... ./admin/pg/... ./app/...
 
       # Its own step, so a migration that does not replay is reported as that
       # rather than as one failure among a package's worth. ARCHITECTURE.md
@@ -126,7 +126,8 @@ jobs:
       - name: docker compose config validates
         run: docker compose -f deploy/compose.yaml config >/dev/null
       # Builds deploy/Dockerfile against a throwaway project, not keel
-      # itself — keel is a library with no cmd/ of its own. See the
+      # itself — keel's only main package outside the example is cmd/keel, a
+      # scaffolding CLI rather than a service. See the
       # script's own header for exactly what this does and does not prove.
       - name: Dockerfile self-test
         run: scripts/test-dockerfile.sh

@@ -50,6 +50,9 @@ idempotency/     HTTP middleware that replays a response for a repeated request
   pg/              the Postgres-backed Store, and its migration
 outbox/          write an event with a transaction, relay it to events
   pg/              the outbox table's migration
+app/             the optional lifecycle: logger, pool, migrations, router,
+                 auth and admin mounts, jobs, graceful shutdown
+cmd/keel/        scaffolding: `keel new` copies examples/minimal into a project
 scripts/         developer and CI scripts
 deploy/          deployment templates and checks
 examples/
@@ -75,8 +78,12 @@ anything strictly below it.
    for a shortcut around its own session auth, or vice versa. `auth/pg` and
    `admin/pg` are each their owning package's Postgres-backed store, at the
    same level as the package that owns them.
+5. **`app`** — may use levels 1 through 4. It wires the other packages into a
+   running service and is the only package allowed to depend on all of them.
 
-`examples/minimal` sits outside the layers and imports whatever it needs.
+`examples/minimal` and `cmd/keel` sit outside the layers. The example imports
+whatever it needs; the scaffolder imports no keel package, only the standard
+library.
 
 ## Optional backends
 
@@ -120,6 +127,12 @@ every request.
 keel is a set of packages with no lifecycle to adopt and no plugin registry.
 `pg` provides a pool, a transaction helper and paging; queries and repositories
 belong to the service.
+
+`app` is the one opinionated layer. It owns the startup sequence — logger,
+pool, migrations, router, mounts, jobs, shutdown — and connects the other
+packages through values the caller hands in. Adopting it is optional: a
+service that wires the packages itself gets the same behaviour with more
+control.
 
 Some things were considered and left out:
 

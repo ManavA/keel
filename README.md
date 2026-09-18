@@ -72,7 +72,8 @@ func main() {
 ```
 
 `examples/minimal` is a runnable service built this way, with a notes API over
-Postgres. Run it with `make run-local`.
+Postgres. Run it with `make run-local`, or start your own from it with
+`go run ./cmd/keel new <name>`.
 
 ## Packages
 
@@ -99,6 +100,8 @@ Postgres. Run it with `make run-local`.
 | `retry` | Exponential backoff with full jitter, and context cancellation |
 | `idempotency` | HTTP middleware that replays a stored response for a repeated `Idempotency-Key` |
 | `outbox` | Writes an event with a domain transaction, then relays it to `events` |
+| `app` | The service lifecycle: logger, pool, migrations, router, auth and admin mounts, jobs, shutdown |
+| `cmd/keel` | Scaffolds a project from `examples/minimal` (`keel new <name>`) |
 
 ## Configuration
 
