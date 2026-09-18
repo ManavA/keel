@@ -13,6 +13,10 @@
 # The app's DATABASE_URL points at the postgres service by its compose name,
 # not localhost, since containers on the default compose network reach each
 # other by service name.
+#
+# CMD_PATH defaults to this repository's example so the file is runnable here
+# rather than only illustrative. A service using keel overrides it with its own
+# main package, usually ./cmd/api.
 
 services:
   app:
@@ -20,7 +24,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       args:
-        CMD_PATH: ./cmd/api
+        CMD_PATH: ./examples/minimal
     ports:
       - "8080:8080"
     environment:
