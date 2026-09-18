@@ -2,7 +2,7 @@
 
 ## Requirements
 
-Go 1.25 or later. Docker, for the database-backed tests.
+Go 1.26 or later. Docker, for the database-backed tests.
 
 ## Building and testing
 

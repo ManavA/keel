@@ -12,7 +12,7 @@ project running only Postgres gets a complete backend.
 go get github.com/ManavA/keel
 ```
 
-Go 1.25 or later. Docker is needed only by `pg/testdb`.
+Go 1.26 or later. Docker is needed only by `pg/testdb`.
 
 ## Quick start
 

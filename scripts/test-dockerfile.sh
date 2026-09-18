@@ -52,16 +52,28 @@ DOCKERFILE="$REPO_ROOT/deploy/Dockerfile"
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
+# The fixture module's own go directive must be at least what deploy/Dockerfile's
+# base image provides, or every check below fails for a reason that has
+# nothing to do with what this script tests: a toolchain mismatch, not a
+# real Dockerfile defect. Read it from this repository's own go.mod rather
+# than a literal, so a future go.mod bump (like the one that made this
+# script's previous hard-coded "go 1.25" build against a go:1.26 image and
+# fail on a version this repository no longer supports) cannot go unnoticed
+# — this fixture always matches what the rest of the repository actually
+# requires.
+GO_DIRECTIVE="$(grep -m1 '^go ' "$REPO_ROOT/go.mod" | awk '{print $2}')"
+[[ -n "$GO_DIRECTIVE" ]] || { echo "could not read a go directive from $REPO_ROOT/go.mod" >&2; exit 1; }
+
 setup_project() {
     # A minimal Go module: a buildinfo package with a settable Revision var,
     # and a cmd/api that prints it, standing in for any real project's own
     # buildinfo package (keel's httpx/buildinfo included) without depending
     # on one existing at a specific import path.
     mkdir -p "$WORKDIR/project/internal/buildinfo" "$WORKDIR/project/cmd/api"
-    cat > "$WORKDIR/project/go.mod" <<'EOF'
+    cat > "$WORKDIR/project/go.mod" <<EOF
 module dockerfile-selftest
 
-go 1.25
+go $GO_DIRECTIVE
 EOF
     : > "$WORKDIR/project/go.sum"
     cat > "$WORKDIR/project/internal/buildinfo/buildinfo.go" <<'EOF'
