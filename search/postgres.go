@@ -354,6 +354,13 @@ const pgInvalidTextRepresentation = "22P02"
 // into an HTTP response or a log a wider audience reads — echoes whatever
 // bad data was already in the table. Every other error is returned
 // unchanged.
+//
+// The replacement is deliberately a new error, not `fmt.Errorf("...: %w",
+// err)`: wrapping would still let errors.As or errors.Unwrap recover the
+// original *pgconn.PgError, and with it the offending value this function
+// exists to keep out of the returned error. This is containment, not the
+// usual case for wrapping, which is to add context while keeping the
+// original reachable.
 func wrapPgError(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == pgInvalidTextRepresentation {

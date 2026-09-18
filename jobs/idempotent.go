@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"fmt"
+	"strconv"
 )
 
 // Guard remembers which idempotency keys have already completed
@@ -26,17 +27,19 @@ type Guard interface {
 // job namespaces key. Without it, two unrelated callers that both reach for
 // the same natural key — a calendar date, a batch id — collide: the second
 // caller's Done check reports true, and it never runs at all. job and key
-// are joined with a separator that cannot appear in either half naturally,
-// but a caller supplying job or key values from untrusted input should not
-// rely on that; construct g directly with a manually chosen key in that
-// case.
+// are combined with [namespacedKey], which is collision-free for any pair
+// of strings, including ones containing whatever byte a simpler
+// concatenation might have picked as a separator; job may not be empty.
 //
 // A failed Done check is returned as an error rather than treated as "not
 // done". Treating it as "not done" would re-run fn whenever the guard's
 // store is briefly unreachable, which is unsafe for a fn whose side effect
 // (an email send, a charge) is not itself idempotent.
 func Idempotent(ctx context.Context, g Guard, job, key string, fn func(ctx context.Context) error) error {
-	namespaced := job + "\x00" + key
+	if job == "" {
+		return fmt.Errorf("jobs: Idempotent requires a non-empty job name")
+	}
+	namespaced := namespacedKey(job, key)
 
 	done, err := g.Done(ctx, namespaced)
 	if err != nil {
@@ -55,6 +58,17 @@ func Idempotent(ctx context.Context, g Guard, job, key string, fn func(ctx conte
 		return fmt.Errorf("mark idempotency key %q for job %q done (side effect already ran): %w", key, job, err)
 	}
 	return nil
+}
+
+// namespacedKey combines job and key into a single string with no
+// collisions: two different (job, key) pairs never produce the same
+// result, regardless of what bytes job or key contain. It length-prefixes
+// job rather than joining with a separator character, because any fixed
+// separator can itself appear inside job or key — a plain job+"\x00"+key
+// join collides for job="a\x00b", key="c" against job="a", key="b\x00c",
+// both of which produce "a\x00b\x00c".
+func namespacedKey(job, key string) string {
+	return strconv.Itoa(len(job)) + ":" + job + key
 }
 
 // MemoryGuard is an in-memory [Guard] for tests and single-process jobs. It

@@ -24,8 +24,10 @@
 // [LogSender] writes each send through slog and requires no external
 // service; use it for local development or when no provider is configured
 // yet. Because it is also what runs in production if a provider is never
-// configured, it logs only the template alias and a non-reversible hash of
-// the recipient address at Info by default. The recipient address and the
+// configured, it logs only the template alias and a hash of the recipient
+// address at Info by default — not reversible for an address nobody
+// already suspects, though a specific candidate address can always be
+// confirmed by hashing it and comparing. The recipient address and the
 // full template model — which for a real template can include a
 // password-reset token or another sensitive value — are logged only when
 // [LogSenderOptions.LogBodies] is set, at Debug; leave it unset outside

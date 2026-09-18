@@ -138,6 +138,51 @@ func TestIdempotent_SameKeyDifferentJobsDoNotCollide(t *testing.T) {
 	assert.Equal(t, 1, jobBCalls, "job-b must run even though job-a already completed the same natural key")
 }
 
+// TestIdempotent_KeysWithSeparatorBytesDoNotCollide is the regression test
+// for the join scheme itself: job="a\x00b", key="c" and job="a",
+// key="b\x00c" both produced "a\x00b\x00c" under a plain separator join,
+// so the second pair's Done check saw the first pair's completion despite
+// naming a different job entirely.
+func TestIdempotent_KeysWithSeparatorBytesDoNotCollide(t *testing.T) {
+	g := NewMemoryGuard()
+	var calls int
+	fn := func(ctx context.Context) error {
+		calls++
+		return nil
+	}
+
+	require.NoError(t, Idempotent(context.Background(), g, "a\x00b", "c", fn))
+	require.NoError(t, Idempotent(context.Background(), g, "a", "b\x00c", fn))
+
+	assert.Equal(t, 2, calls,
+		"two different (job, key) pairs must not collide even when a value contains the byte a naive separator join would have used")
+}
+
+func TestIdempotent_EmptyJobNameIsRefused(t *testing.T) {
+	g := NewMemoryGuard()
+	calls := 0
+	err := Idempotent(context.Background(), g, "", "key", func(ctx context.Context) error {
+		calls++
+		return nil
+	})
+	require.Error(t, err)
+	assert.Zero(t, calls)
+}
+
+func TestNamespacedKey_NoCollisionsAcrossVariedInputs(t *testing.T) {
+	tests := []struct{ job1, key1, job2, key2 string }{
+		{"a\x00b", "c", "a", "b\x00c"},
+		{"1", "23", "12", "3"},
+		{"", "ab", "a", "b"},
+		{"job", "key", "job2", "key"},
+	}
+	for _, tt := range tests {
+		k1 := namespacedKey(tt.job1, tt.key1)
+		k2 := namespacedKey(tt.job2, tt.key2)
+		assert.NotEqual(t, k1, k2, "namespacedKey(%q,%q) collided with namespacedKey(%q,%q)", tt.job1, tt.key1, tt.job2, tt.key2)
+	}
+}
+
 func TestMemoryGuard_DoneDefaultsFalse(t *testing.T) {
 	g := NewMemoryGuard()
 	done, err := g.Done(context.Background(), "never-seen")

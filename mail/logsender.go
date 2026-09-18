@@ -61,9 +61,13 @@ func (s *LogSender) Send(_ context.Context, to, templateAlias string, templateMo
 // DeliversToProvider reports false: LogSender never contacts a provider.
 func (s *LogSender) DeliversToProvider() bool { return false }
 
-// hashRecipientForLog returns a short, non-reversible identifier for an
-// address, so repeated sends to the same recipient can be correlated in a
-// log without the address itself appearing in it.
+// hashRecipientForLog returns a short identifier for an address, so
+// repeated sends to the same recipient can be correlated in a log without
+// the address itself appearing in it. It is hashed, not encrypted: it is
+// not reversible for an address an attacker does not already have in
+// hand, but email addresses are a small and guessable space, so anyone who
+// already suspects a particular address can hash it themselves and confirm
+// a match. Treat this as a correlation token, not a secret.
 func hashRecipientForLog(to string) string {
 	normalized := strings.ToLower(strings.TrimSpace(to))
 	sum := sha256.Sum256([]byte(normalized))

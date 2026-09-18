@@ -148,6 +148,12 @@ func TestPostgresIndex_Search_WrapsInvalidTextRepresentation(t *testing.T) {
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "not a number", "the raw offending value must not reach the caller")
 	assert.NotContains(t, err.Error(), "invalid input syntax")
+
+	// The containment must survive unwrapping too: this is why wrapPgError
+	// builds a fresh error instead of using %w.
+	var recovered *pgconn.PgError
+	assert.False(t, errors.As(err, &recovered),
+		"the original *pgconn.PgError, and the offending value inside it, must not be recoverable via errors.As")
 }
 
 func TestPostgresIndex_Search_OtherPgErrorsPassThroughUnchanged(t *testing.T) {
