@@ -1,0 +1,18 @@
+# Build output
+/bin/
+*.test
+*.out
+
+# Anything that could hold a real credential. keel never reads a .env of its
+# own; config.Load reads one only when a service asks it to.
+.env
+.env.*
+*.pem
+*.p8
+*.p12
+*.key
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

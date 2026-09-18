@@ -1,0 +1,25 @@
+title = "keel"
+
+[extend]
+useDefault = true
+
+# Nothing in this repository should ever hold a real credential: keel is
+# infrastructure, and every example value is deliberately fake. The allowlist
+# below therefore names only the shapes that are *structurally* fake — a
+# localhost Postgres URL, a documented placeholder — and never a specific
+# string that happened to trip the scanner once.
+
+[allowlist]
+description = "Fixtures and documentation placeholders"
+
+paths = [
+  '''go\.sum''',
+]
+
+regexes = [
+  # Local test databases. The credentials are the literal word "keel" against
+  # 127.0.0.1, which is what pg/testdb starts and what the docs show.
+  '''postgres(ql)?://keel:keel@127\.0\.0\.1:\d+/''',
+  # Placeholders in prose and examples.
+  '''(?i)(example|placeholder|changeme|your-[a-z-]+-here|xxx+)''',
+]

@@ -1,0 +1,40 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - goconst
+    - gocritic
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - unconvert
+    - unparam
+    - usetesting
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+    revive:
+      rules:
+        - name: package-comments
+        - name: exported
+          arguments: ["disableStutteringCheck"]
+
+  exclusions:
+    rules:
+      # Encoding a response body after the status line is on the wire can only
+      # fail because the client hung up. There is nothing left to say to them
+      # and nothing to log that is not noise.
+      - linters: [errcheck]
+        source: "json.NewEncoder\\(w\\).Encode"
+      # Test helpers assert rather than return.
+      - linters: [errcheck, gosec]
+        path: _test\.go
+
+formatters:
+  enable:
+    - gofmt
