@@ -121,6 +121,8 @@ func (p *PostgresIndex) EnsureSchema(ctx context.Context) error {
 	return nil
 }
 
+// Health reports whether the index table is reachable. The readiness probe
+// calls it on every check, so it does one ping and nothing else.
 func (p *PostgresIndex) Health(ctx context.Context) error {
 	return p.conn.Ping(ctx)
 }
