@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  # gitleaks-action reads the pull request's commit list to work out the range
+  # to scan, so contents:read alone fails it with 403 on every PR.
+  pull-requests: read
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      # The same suite again with a missing Docker turned into a failure. A
+      # database-backed test that skips itself is indistinguishable from one
+      # that passes, and the runner has Docker, so there is nothing to skip.
+      - name: Database-backed tests
+        env:
+          KEEL_REQUIRE_DB: "1"
+        run: go test -count=1 ./pg/... ./examples/... ./auth/pg/... ./admin/pg/... ./app/...
+
+      # Its own step, so a migration that does not replay is reported as that
+      # rather than as one failure among a package's worth. ARCHITECTURE.md
+      # presents Replay as a guarantee of this repository; this is what makes
+      # it one.
+      - name: Migrations replay
+        env:
+          KEEL_REQUIRE_DB: "1"
+        run: go test -count=1 -run 'TestRepositoryMigrations|TestDiscoverMigrationDirs' -v ./pg/migrate/
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          # Pinned to the earliest release whose binary was itself built with
+          # a go1.26 toolchain (checked directly: `go version` on the
+          # released binary reports go1.25.5 for v2.8.0 and go1.26.0 for
+          # v2.9.0) — golangci-lint refuses to analyze a module whose go.mod
+          # targets a newer Go version than the linter binary was compiled
+          # with, and go.mod here now requires go 1.26.0.
+          version: v2.9.0
+      # A build artifact in the tree is the usual cause, and the tree is the last
+      # place anyone looks. Cheap to check, and it catches any binary rather
+      # than the one name an ignore rule happens to list.
+      - name: No large files committed
+        run: |
+          large=$(git ls-files | while read -r f; do
+            [ -f "$f" ] || continue
+            size=$(wc -c < "$f")
+            if [ "$size" -gt 1048576 ]; then printf '%s\t%s\n' "$size" "$f"; fi
+          done)
+          if [ -n "$large" ]; then
+            echo "committed files over 1 MiB:"
+            echo "$large"
+            echo
+            echo "'go build ./...' writes a main package's binary into the working directory."
+            exit 1
+          fi
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would rewrite:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks scans history, and a shallow clone silently scans almost
+          # none of it — the job would pass by having nothing to look at.
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - name: check-deployed-revision.sh self-test
+        run: scripts/check-deployed-revision.sh --self-test
+      - name: verify-deployed.sh self-test
+        run: scripts/verify-deployed.sh --self-test
+      - name: deploy-cloudbuild.sh self-test
+        run: scripts/deploy-cloudbuild.sh --self-test
+      - name: docker compose config validates
+        run: docker compose -f deploy/compose.yaml config >/dev/null
+      # Builds deploy/Dockerfile against a throwaway project, not keel
+      # itself — keel's only main package outside the example is cmd/keel, a
+      # scaffolding CLI rather than a service. See the
+      # script's own header for exactly what this does and does not prove.
+      - name: Dockerfile self-test
+        run: scripts/test-dockerfile.sh

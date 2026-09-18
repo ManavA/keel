@@ -1,0 +1,47 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - errcheck
+    - gosec
+    - copyloopvar
+    - errorlint
+    - goconst
+    - gocritic
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - unconvert
+    - unparam
+    - usetesting
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+    revive:
+      rules:
+        - name: package-comments
+        - name: exported
+          arguments: ["disableStutteringCheck"]
+
+  exclusions:
+    rules:
+      # The status line is already on the wire, so the only error Encode can
+      # return is the client having hung up.
+      - linters: [errcheck]
+        source: "json.NewEncoder\\(w\\).Encode"
+      # Test helpers assert rather than return, and a test client talking to a
+      # server it started itself needs neither a context nor a body close. A
+      # fixture that repeats a literal is clearer than one that names it.
+      - linters: [errcheck, gosec, noctx, bodyclose, goconst]
+        path: _test\.go
+      # These are word lists. The repeated entries are the data, and naming them
+      # would obscure what the lists say.
+      - linters: [goconst]
+        path: (config/secretname|log/redact)\.go
+
+formatters:
+  enable:
+    - gofmt
