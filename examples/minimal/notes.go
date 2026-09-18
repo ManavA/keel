@@ -81,8 +81,11 @@ func (n *Notes) Delete(ctx context.Context, id string) error {
 // notesKeyset is the ordering every listing page uses. The id is in it because
 // created_at is not unique, and a keyset whose last column can repeat skips
 // rows at a page boundary.
+// createdAtField is both the notes column and the indexed document's field.
+const createdAtField = "created_at"
+
 var notesKeyset = []pg.SortKey{
-	{Column: "created_at", Desc: true},
+	{Column: createdAtField, Desc: true},
 	{Column: "id", Desc: true},
 }
 

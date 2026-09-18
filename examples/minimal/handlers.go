@@ -168,7 +168,7 @@ func (a *API) search(w http.ResponseWriter, r *http.Request) {
 		Text:   r.URL.Query().Get("q"),
 		Limit:  int64(page.Limit),
 		Offset: int64(page.Offset),
-		Sort:   []search.SortField{{Field: "created_at", Dir: search.Desc}},
+		Sort:   []search.SortField{{Field: createdAtField, Dir: search.Desc}},
 	})
 	if err != nil {
 		httpx.InternalError(w, r, err)
@@ -187,10 +187,10 @@ func (a *API) search(w http.ResponseWriter, r *http.Request) {
 // Note's JSON tags so DecodeHits can read a hit straight back into a Note.
 func noteDocument(n Note) search.Document {
 	return search.MapDocument{
-		"id":         n.ID,
-		"title":      n.Title,
-		"body":       n.Body,
-		"created_at": n.CreatedAt,
+		"id":           n.ID,
+		"title":        n.Title,
+		"body":         n.Body,
+		createdAtField: n.CreatedAt,
 	}
 }
 

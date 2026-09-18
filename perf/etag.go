@@ -140,7 +140,9 @@ func (b *bufferedResponse) Write(p []byte) (int, error) {
 		b.real.Header()[k] = v
 	}
 	b.real.WriteHeader(b.status)
-	if _, err := b.real.Write(b.body.Bytes()); err != nil {
+	// The bytes are the handler's own response, replayed after buffering; this
+	// writer neither builds nor escapes them.
+	if _, err := b.real.Write(b.body.Bytes()); err != nil { //nolint:gosec // G705: pass-through of the handler's bytes
 		return 0, err
 	}
 	b.body.Reset()

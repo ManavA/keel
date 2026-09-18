@@ -44,16 +44,23 @@ var ErrPaging = errors.New("invalid pagination")
 // does. They are rejected rather than translated: a client paging with a
 // parameter the endpoint ignores re-reads the first page and gets a plausible
 // 200 every time.
+// The pagination parameters this package reads.
+const (
+	paramLimit  = "limit"
+	paramOffset = "offset"
+	paramPage   = "page"
+)
+
 var pagingAliases = map[string]string{
-	"per_page":  "limit",
-	"perPage":   "limit",
-	"per-page":  "limit",
-	"page_size": "limit",
-	"pageSize":  "limit",
-	"pagesize":  "limit",
-	"count":     "limit",
-	"start":     "offset",
-	"skip":      "offset",
+	"per_page":  paramLimit,
+	"perPage":   paramLimit,
+	"per-page":  paramLimit,
+	"page_size": paramLimit,
+	"pageSize":  paramLimit,
+	"pagesize":  paramLimit,
+	"count":     paramLimit,
+	"start":     paramOffset,
+	"skip":      paramOffset,
 }
 
 // ParsePage reads limit, offset and page from a query string.
@@ -95,14 +102,14 @@ func ParsePage(values url.Values, opts PageOptions) (Page, error) {
 	}
 
 	limit := defaultLimit
-	if v, sent, err := intParam(values, "limit", 1, maxLimit); err != nil {
+	if v, sent, err := intParam(values, paramLimit, 1, maxLimit); err != nil {
 		return Page{}, err
 	} else if sent {
 		limit = v
 	}
 
-	_, hasOffset := values["offset"]
-	_, hasPage := values["page"]
+	_, hasOffset := values[paramOffset]
+	_, hasPage := values[paramPage]
 	if hasOffset && hasPage {
 		return Page{}, fmt.Errorf("%w: send either \"offset\" or \"page\", not both — "+
 			"they are two spellings of one position (offset = (page-1) * limit), "+
@@ -112,13 +119,13 @@ func ParsePage(values url.Values, opts PageOptions) (Page, error) {
 	page := Page{Limit: limit}
 	switch {
 	case hasOffset:
-		v, _, err := intParam(values, "offset", 0, maxOffset)
+		v, _, err := intParam(values, paramOffset, 0, maxOffset)
 		if err != nil {
 			return Page{}, err
 		}
 		page.Offset = v
 	case hasPage:
-		v, _, err := intParam(values, "page", 1, maxOffset/limit+1)
+		v, _, err := intParam(values, paramPage, 1, maxOffset/limit+1)
 		if err != nil {
 			return Page{}, err
 		}
@@ -165,7 +172,7 @@ func sortedAliases() []string {
 // caller with every row believing they have the first ten. whole names what
 // does come back, so the message can explain why there is nothing to page.
 func RejectPaging(values url.Values, whole string) error {
-	names := append([]string{"limit", "offset", "page"}, sortedAliases()...)
+	names := append([]string{paramLimit, paramOffset, paramPage}, sortedAliases()...)
 	slices.Sort(names)
 	for _, name := range names {
 		if _, sent := values[name]; sent {

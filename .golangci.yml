@@ -33,9 +33,14 @@ linters:
       - linters: [errcheck]
         source: "json.NewEncoder\\(w\\).Encode"
       # Test helpers assert rather than return, and a test client talking to a
-      # server it started itself needs neither a context nor a body close.
-      - linters: [errcheck, gosec, noctx, bodyclose]
+      # server it started itself needs neither a context nor a body close. A
+      # fixture that repeats a literal is clearer than one that names it.
+      - linters: [errcheck, gosec, noctx, bodyclose, goconst]
         path: _test\.go
+      # These are word lists. The repeated entries are the data, and naming them
+      # would obscure what the lists say.
+      - linters: [goconst]
+        path: (config/secretname|log/redact)\.go
 
 formatters:
   enable:

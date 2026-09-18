@@ -151,7 +151,9 @@ func (g *gzipResponse) flushBuffered() error {
 
 func (g *gzipResponse) writeDecided(p []byte) (int, error) {
 	if g.skip {
-		return g.ResponseWriter.Write(p)
+		// Pass-through of the handler's own bytes; this writer neither builds
+		// nor escapes them.
+		return g.ResponseWriter.Write(p) //nolint:gosec // G705: pass-through of the handler's bytes
 	}
 	return g.gz.Write(p)
 }

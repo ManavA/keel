@@ -190,7 +190,8 @@ func Available() error {
 func removeContainer(name string) {
 	// Its own context: this runs from a signal handler and from Close, and the
 	// test's context may already be gone.
-	cmd := exec.CommandContext(context.Background(), "docker", "rm", "--force", name)
+	// name comes from Options, which is the caller's own test code.
+	cmd := exec.CommandContext(context.Background(), "docker", "rm", "--force", name) //nolint:gosec // G204: argument is the caller's own configuration
 	_ = cmd.Run()
 }
 
