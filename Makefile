@@ -45,9 +45,11 @@ migrations-check:
 	KEEL_REQUIRE_DB=1 go test -count=1 -v \
 		-run 'TestRepositoryMigrations|TestDiscoverMigrationDirs' ./pg/migrate/
 
+# -o /dev/null because `go build ./...` writes each main package's binary into
+# the working directory. This target only needs to know whether it compiles.
 .PHONY: build
 build:
-	go build ./...
+	go build -o /dev/null ./...
 
 # Run examples/minimal against a throwaway Postgres. There is no run-firebase
 # target yet: it would be identical to this one until the auth package lands,

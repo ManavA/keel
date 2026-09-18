@@ -1,5 +1,9 @@
-# Build output
+# Build output. `go build ./...` writes each main package's binary into the
+# working directory, named after its directory — so building from the repo root
+# drops examples/minimal's binary here as ./minimal. `make build` avoids this by
+# writing to /dev/null, and CI fails on any committed file over 1 MiB.
 /bin/
+/minimal
 *.test
 *.out
 

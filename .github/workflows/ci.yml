@@ -54,6 +54,24 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.6.0
+      # A build artifact in the tree is the usual cause, and the tree is the last
+      # place anyone looks. Cheap to check, and it catches any binary rather
+      # than the one name an ignore rule happens to list.
+      - name: No large files committed
+        run: |
+          large=$(git ls-files | while read -r f; do
+            [ -f "$f" ] || continue
+            size=$(wc -c < "$f")
+            if [ "$size" -gt 1048576 ]; then printf '%s\t%s\n' "$size" "$f"; fi
+          done)
+          if [ -n "$large" ]; then
+            echo "committed files over 1 MiB:"
+            echo "$large"
+            echo
+            echo "'go build ./...' writes a main package's binary into the working directory."
+            exit 1
+          fi
+
       - name: gofmt
         run: |
           unformatted="$(gofmt -l .)"

@@ -193,3 +193,73 @@ func TestLocalStore_PutPartialFailure(t *testing.T) {
 		require.Equal(t, "text/original", s.contentType("existing-key.txt"), "a failed overwrite must not destroy the original content type")
 	})
 }
+
+// failRenameAfterN wraps a real rootFS and fails every Rename after the
+// first n have succeeded, which is the only way to reach Put's rename
+// branches: a rename within one directory does not fail on a working
+// filesystem.
+type failRenameAfterN struct {
+	rootFS
+	renamesRemaining int
+}
+
+func (f *failRenameAfterN) Rename(oldname, newname string) error {
+	if f.renamesRemaining <= 0 {
+		return errors.New("simulated rename failure")
+	}
+	f.renamesRemaining--
+	return f.rootFS.Rename(oldname, newname)
+}
+
+func TestLocalStore_PutFirstWriteFailure(t *testing.T) {
+	// The companion to TestLocalStore_PutPartialFailure: that one covers a
+	// failure at the second write, this one at the first, where no temporary
+	// file exists yet to clean up.
+	ctx := context.Background()
+
+	root, err := os.OpenRoot(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = root.Close() })
+
+	s := &LocalStore{root: root, fs: root}
+	require.NoError(t, s.Put(ctx, "key.txt", []byte("original body"), "text/original"))
+
+	s.fs = &failAfterNWrites{rootFS: root, writesRemaining: 0}
+	require.Error(t, s.Put(ctx, "key.txt", []byte("new body"), "text/new"))
+
+	s.fs = root
+	body, err := s.Get(ctx, "key.txt")
+	require.NoError(t, err)
+	require.Equal(t, "original body", string(body))
+	require.Equal(t, "text/original", s.contentType("key.txt"))
+}
+
+func TestLocalStore_PutFirstRenameFailure(t *testing.T) {
+	// Put writes both temporary files before renaming either, so a failure at
+	// the first rename must leave the previous object completely intact —
+	// body and content type both — rather than half replaced.
+	ctx := context.Background()
+
+	root, err := os.OpenRoot(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = root.Close() })
+
+	s := &LocalStore{root: root, fs: root}
+	require.NoError(t, s.Put(ctx, "key.txt", []byte("original body"), "text/original"))
+
+	s.fs = &failRenameAfterN{rootFS: root, renamesRemaining: 0}
+	require.Error(t, s.Put(ctx, "key.txt", []byte("new body"), "text/new"))
+
+	s.fs = root
+	body, err := s.Get(ctx, "key.txt")
+	require.NoError(t, err)
+	require.Equal(t, "original body", string(body), "a failed first rename must not touch the original body")
+	require.Equal(t, "text/original", s.contentType("key.txt"), "a failed first rename must not touch the original content type")
+
+	// And neither temporary file is left behind for a later listing to find.
+	entries, err := os.ReadDir(root.Name())
+	require.NoError(t, err)
+	for _, e := range entries {
+		require.NotContains(t, e.Name(), tmpInfix, "a temporary file survived a failed rename")
+	}
+}
