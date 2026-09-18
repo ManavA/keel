@@ -402,6 +402,9 @@ func TestNotesRequireAuth(t *testing.T) {
 	resp, _ = get(t, ts, "/api/notes/search?q=tile", "")
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 
+	resp, _ = get(t, ts, "/api/notes/00000000-0000-0000-0000-000000000000", "")
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+
 	req, err := http.NewRequestWithContext(context.Background(),
 		http.MethodDelete, ts.srv.URL+"/api/notes/00000000-0000-0000-0000-000000000000", nil)
 	require.NoError(t, err)
@@ -618,16 +621,18 @@ func TestAuthSourcesRefuseTheUnconfigured(t *testing.T) {
 		name string
 		cfg  Config
 	}{
-		{"firebase without a project", Config{AuthSources: []string{"firebase"}}},
-		{"oidc without an issuer", Config{AuthSources: []string{"oidc"}, OIDCAudience: "aud"}},
-		{"oidc without an audience", Config{AuthSources: []string{"oidc"}, OIDCIssuerURL: "https://issuer.example.com"}},
+		{"firebase without a project", Config{AuthSources: []string{"firebase"}, Port: 8080, SiteURL: "http://example.com"}},
+		{"oidc without an issuer", Config{AuthSources: []string{"oidc"}, OIDCAudience: "aud", Port: 8080, SiteURL: "http://example.com"}},
+		{"oidc without an audience", Config{AuthSources: []string{"oidc"}, OIDCIssuerURL: "https://issuer.example.com", Port: 8080, SiteURL: "http://example.com"}},
 		{"firebase and oidc together", Config{
 			AuthSources:       []string{"firebase", "oidc"},
 			FirebaseProjectID: "proj",
 			OIDCIssuerURL:     "https://issuer.example.com",
 			OIDCAudience:      "aud",
+			Port:              8080,
+			SiteURL:           "http://example.com",
 		}},
-		{"an unknown source", Config{AuthSources: []string{"magic"}}},
+		{"an unknown source", Config{AuthSources: []string{"magic"}, Port: 8080, SiteURL: "http://example.com"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Error(t, tt.cfg.Validate())
@@ -654,4 +659,15 @@ func TestBuildAuthServiceNeedsItsSettings(t *testing.T) {
 		Config{AuthSources: []string{"oidc"}, SiteURL: "http://example.com"},
 		slog.Default(), ts.pool, ts.mail)
 	assert.Error(t, err, "oidc without issuer and audience must not build")
+
+	_, err = buildAuthService(ctx,
+		Config{
+			AuthSources:       []string{"firebase", "oidc"},
+			FirebaseProjectID: "proj",
+			OIDCIssuerURL:     "https://issuer.example.com",
+			OIDCAudience:      "aud",
+			SiteURL:           "http://example.com",
+		},
+		slog.Default(), ts.pool, ts.mail)
+	assert.ErrorContains(t, err, "together", "firebase and oidc together must not build")
 }

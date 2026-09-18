@@ -68,6 +68,18 @@ func buildAuthService(ctx context.Context, cfg Config, logger *slog.Logger, pool
 	// (missing settings, both federated sources at once); these checks keep
 	// the constructor honest when it is called with a config that skipped
 	// validation.
+	hasFirebase, hasOIDC := false, false
+	for _, source := range sources {
+		switch source {
+		case auth.SourceFirebase:
+			hasFirebase = true
+		case auth.SourceOIDC:
+			hasOIDC = true
+		}
+	}
+	if hasFirebase && hasOIDC {
+		return nil, fmt.Errorf("firebase and oidc sources cannot be selected together; pick one")
+	}
 	for _, source := range sources {
 		switch source {
 		case auth.SourceFirebase:
