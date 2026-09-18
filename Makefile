@@ -11,7 +11,7 @@ test:
 # skip. pg/testdb needs Docker; nothing else does.
 .PHONY: test-db
 test-db:
-	KEEL_REQUIRE_DB=1 go test -count=1 ./pg/...
+	KEEL_REQUIRE_DB=1 go test -count=1 ./pg/... ./auth/pg/... ./admin/pg/...
 
 .PHONY: lint
 lint:
@@ -52,8 +52,9 @@ build:
 	go build -o /dev/null ./...
 
 # Run examples/minimal against a throwaway Postgres. There is no run-firebase
-# target yet: it would be identical to this one until the auth package lands,
-# and a target that does nothing different is worse than a missing one.
+# target yet: examples/minimal itself does not wire up SourceFirebase, and a
+# target that does nothing different from this one is worse than a missing
+# one.
 EXAMPLE_DB_CONTAINER ?= keel-example-db
 EXAMPLE_DB_PORT      ?= 55432
 EXAMPLE_DB_URL       ?= postgres://keel:keel@127.0.0.1:$(EXAMPLE_DB_PORT)/keel?sslmode=disable

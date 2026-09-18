@@ -40,7 +40,7 @@
 # always-present location first, so the runtime COPY needs no glob and
 # cannot accidentally match something else named with a migrations prefix.
 
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /src
 
