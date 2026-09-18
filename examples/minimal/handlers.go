@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/ManavA/keel/auth"
 	"github.com/ManavA/keel/events"
 	"github.com/ManavA/keel/httpx"
 	"github.com/ManavA/keel/pg"
@@ -27,11 +28,15 @@ type API struct {
 	notes     *Notes
 	index     search.Index
 	publisher events.Publisher
+	auth      *auth.Service
 }
 
-// Routes registers this API under r.
+// Routes registers this API under r. Every notes route requires a session:
+// the caller is whoever the bearer token says they are, and every query is
+// scoped to that account, so one account's notes are invisible to another's.
 func (a *API) Routes(r chi.Router) {
 	r.Route("/api/notes", func(r chi.Router) {
+		r.Use(a.auth.RequireAuth)
 		r.Post("/", a.create)
 		r.Get("/", a.list)
 		// Before the {id} route, or "search" is read as an id.
@@ -63,7 +68,7 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	note, err := a.notes.Create(r.Context(), req.Title, req.Body)
+	note, err := a.notes.Create(r.Context(), auth.UserIDFromContext(r.Context()), req.Title, req.Body)
 	if err != nil {
 		httpx.InternalError(w, r, err)
 		return
@@ -92,7 +97,7 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) get(w http.ResponseWriter, r *http.Request) {
-	note, err := a.notes.Get(r.Context(), chi.URLParam(r, "id"))
+	note, err := a.notes.Get(r.Context(), auth.UserIDFromContext(r.Context()), chi.URLParam(r, "id"))
 	switch {
 	case errors.Is(err, ErrNoteNotFound):
 		httpx.NotFound(w, r)
@@ -112,7 +117,7 @@ func (a *API) get(w http.ResponseWriter, r *http.Request) {
 func (a *API) delete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	err := a.notes.Delete(r.Context(), id)
+	err := a.notes.Delete(r.Context(), auth.UserIDFromContext(r.Context()), id)
 	switch {
 	case errors.Is(err, ErrNoteNotFound):
 		httpx.NotFound(w, r)
@@ -149,7 +154,7 @@ func (a *API) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	notes, next, err := a.notes.List(r.Context(), page.Limit, r.URL.Query().Get("cursor"))
+	notes, next, err := a.notes.List(r.Context(), auth.UserIDFromContext(r.Context()), page.Limit, r.URL.Query().Get("cursor"))
 	if err != nil {
 		httpx.BadRequest(w, r, err)
 		return
@@ -168,7 +173,10 @@ func (a *API) search(w http.ResponseWriter, r *http.Request) {
 		Text:   r.URL.Query().Get("q"),
 		Limit:  int64(page.Limit),
 		Offset: int64(page.Offset),
-		Sort:   []search.SortField{{Field: createdAtField, Dir: search.Desc}},
+		// The index holds every account's notes; the filter keeps a caller
+		// to their own, the same scoping the listing queries apply.
+		Filters: []search.Filter{search.Eq(userIDField, auth.UserIDFromContext(r.Context()))},
+		Sort:    []search.SortField{{Field: createdAtField, Dir: search.Desc}},
 	})
 	if err != nil {
 		httpx.InternalError(w, r, err)
@@ -188,6 +196,7 @@ func (a *API) search(w http.ResponseWriter, r *http.Request) {
 func noteDocument(n Note) search.Document {
 	return search.MapDocument{
 		"id":           n.ID,
+		userIDField:    n.UserID,
 		"title":        n.Title,
 		"body":         n.Body,
 		createdAtField: n.CreatedAt,
