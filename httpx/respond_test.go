@@ -157,3 +157,17 @@ func TestLoggerFallsBackToDefault(t *testing.T) {
 	assert.Same(t, logger, httpx.Logger(httpx.WithLogger(context.Background(), logger)))
 	assert.NotSame(t, logger, httpx.Logger(httpx.WithLogger(context.Background(), nil)))
 }
+
+func TestWithLoggerRefusesANilLogger(t *testing.T) {
+	// A typed-nil *slog.Logger satisfies the type assertion in Logger, and
+	// calling LogAttrs on it panics — in the 500 path, where a panic is worst.
+	// This guard is the only thing standing between that and a crash.
+	var nilLogger *slog.Logger
+	ctx := httpx.WithLogger(context.Background(), nilLogger)
+
+	require.NotNil(t, httpx.Logger(ctx))
+	assert.NotPanics(t, func() {
+		req := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
+		httpx.InternalError(httptest.NewRecorder(), req, errors.New("boom"))
+	})
+}

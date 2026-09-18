@@ -76,6 +76,11 @@ const DefaultTimeout = 30 * time.Second
 //
 // Build your own chain from httpx/middleware if this does not suit; this is the
 // order to copy.
+//
+// One chi behaviour to know about: on a router with no routes registered at
+// all, ServeHTTP goes straight to the NotFound handler without running the
+// middleware chain, so that 404 carries no request id and logs through
+// slog.Default. Register one route and both 404 and 405 behave normally.
 func NewRouter(opts RouterOptions) *chi.Mux {
 	logger := opts.Logger
 	if logger == nil {

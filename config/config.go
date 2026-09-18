@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/joho/godotenv"
@@ -54,6 +55,12 @@ type Options struct {
 
 // Load reads configuration into dest, which must be a non-nil pointer to a
 // struct.
+//
+// An error from reading the environment is returned as text, not wrapped: the
+// underlying envconfig error quotes the offending value, and a secret-shaped
+// one is scrubbed out of the message before it is returned. Keeping %w would
+// keep the unscrubbed text reachable through Unwrap. The cost is that
+// envconfig's error type cannot be inspected with errors.As.
 func Load(dest any) error { return LoadWith(dest, Options{}) }
 
 // LoadWith is Load with explicit options.
@@ -110,13 +117,44 @@ func LoadWith(dest any, opts Options) error {
 // field is unset when the parse failed: the value only exists in the variable
 // the message quoted.
 func scrubSecrets(msg string, v reflect.Value, prefix string) string {
+	var values []string
 	for _, key := range secretEnvKeys(v, prefix) {
 		if value := os.Getenv(key); value != "" {
+			values = append(values, value)
+		}
+	}
+
+	// Longest first. A short secret that is a substring of a longer one would
+	// otherwise consume it, and either replacement could land inside the
+	// placeholder the other had already written.
+	slices.SortFunc(values, func(a, b string) int { return len(b) - len(a) })
+
+	for _, value := range values {
+		// envconfig quotes the offending value, and the strconv error it carries
+		// in "details:" quotes it again with double quotes. Both forms are exact,
+		// so both are replaced whatever the value's length.
+		msg = strings.ReplaceAll(msg, "'"+value+"'", "'"+Placeholder+"'")
+		msg = strings.ReplaceAll(msg, `"`+value+`"`, `"`+Placeholder+`"`)
+
+		// The bare form is replaced only when the value is long enough not to
+		// appear in the message by accident. WEBHOOK_SECRET=t would otherwise
+		// replace every "t" in the sentence, including those inside the
+		// placeholder just inserted, destroying the error this function exists
+		// to keep readable.
+		//
+		// The trade: a one- to five-character secret appearing somewhere other
+		// than inside envconfig's quotes is not scrubbed. That is the right way
+		// round — a secret that short is not protecting anything, and shredding
+		// every message to chase it costs more than it saves.
+		if len(value) >= minScrubbedLength {
 			msg = strings.ReplaceAll(msg, value, Placeholder)
 		}
 	}
 	return msg
 }
+
+// minScrubbedLength is the shortest value scrubbed outside envconfig's quotes.
+const minScrubbedLength = 6
 
 // secretEnvKeys lists the environment variables backing secret-shaped fields.
 func secretEnvKeys(v reflect.Value, prefix string) []string {

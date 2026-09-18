@@ -175,3 +175,18 @@ func TestWithRequestIDIgnoresEmpty(t *testing.T) {
 	assert.Empty(t, log.RequestID(ctx))
 	assert.Empty(t, log.RequestID(context.Background()))
 }
+
+func TestURLPlaceholderIsNotPercentEncoded(t *testing.T) {
+	// url.String percent-encodes the userinfo, so the placeholder would reach
+	// the log as %5Bredacted%5D and a search for the documented word would miss
+	// it. config.RedactURL has the same fix; both need pinning.
+	rec := capture(t, log.Options{}, func(l *slog.Logger) {
+		l.Info("connecting", "database_url", "postgres://app:hunter2@db.internal:5432/main")
+	})
+
+	got, _ := rec["database_url"].(string)
+	assert.Contains(t, got, log.Placeholder)
+	assert.NotContains(t, got, "%5B")
+	assert.NotContains(t, got, "%5D")
+	assert.Equal(t, "postgres://app:[redacted]@db.internal:5432/main", got)
+}

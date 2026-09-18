@@ -338,3 +338,26 @@ func TestOpenRefusesAnEmptyURL(t *testing.T) {
 	_, err = pg.Open(context.Background(), pg.Options{URL: "   "})
 	assert.Error(t, err)
 }
+
+func TestOpenDefaultsMatchPgxpool(t *testing.T) {
+	// pg.Open's MaxConnLifetime and MaxConnIdleTime defaults duplicate
+	// pgxpool's, which makes the third argument of pick unreachable for those
+	// two. That is fine while they agree; this fails if they ever diverge, so
+	// the duplication cannot rot into a silent difference.
+	db := testdb.Shared(t)
+
+	bare, err := pgxpool.ParseConfig(db.URL)
+	require.NoError(t, err)
+
+	pool, err := pg.Open(context.Background(), pg.Options{URL: db.URL})
+	require.NoError(t, err)
+	defer pool.Close()
+
+	assert.Equal(t, bare.MaxConnLifetime, pool.Config().MaxConnLifetime)
+	assert.Equal(t, bare.MaxConnIdleTime, pool.Config().MaxConnIdleTime)
+
+	// ConnectTimeout is the one that genuinely needs a default: pgx leaves it
+	// at zero, which means no timeout at all.
+	assert.Zero(t, bare.ConnConfig.ConnectTimeout)
+	assert.Equal(t, 10*time.Second, pool.Config().ConnConfig.ConnectTimeout)
+}

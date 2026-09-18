@@ -140,6 +140,14 @@ func ping(ctx context.Context, pool *pgxpool.Pool) error {
 
 // pick returns the first of the caller's value, the connection string's value
 // and the default that is set.
+//
+// The MaxConnLifetime and MaxConnIdleTime defaults below duplicate pgxpool's
+// own (one hour and thirty minutes), so for those two the third argument is
+// unreachable today: ParseConfig has already filled the field in. They are
+// written out anyway so this package's defaults are stated rather than
+// inherited, and TestOpenDefaultsMatchPgxpool fails if the two ever diverge.
+// ConnectTimeout is different: pgx leaves it at zero, meaning no timeout, so
+// the default there does apply.
 func pick(fromOptions, fromURL, def time.Duration) time.Duration {
 	switch {
 	case fromOptions > 0:

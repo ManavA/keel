@@ -179,3 +179,45 @@ func TestLoadErrorStillNamesANonSecretValue(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "eighty")
 }
+
+type shortSecretConfig struct {
+	WebhookSecret int `envconfig:"WEBHOOK_SECRET"`
+}
+
+func TestLoadErrorSurvivesAShortSecret(t *testing.T) {
+	// A global replace of a one-character value rewrites every occurrence of
+	// that letter, including the ones inside the placeholder it just inserted,
+	// which destroys the message this scrubbing exists to keep readable.
+	t.Setenv("WEBHOOK_SECRET", "t")
+
+	var cfg shortSecretConfig
+	err := config.LoadWith(&cfg, config.Options{Files: []string{}})
+	require.Error(t, err)
+
+	msg := err.Error()
+	assert.NotContains(t, msg, "'t'", "the quoted value is scrubbed whatever its length")
+	assert.Contains(t, msg, config.Placeholder)
+	assert.Contains(t, msg, "WEBHOOK_SECRET", "the field must still be named")
+	assert.Contains(t, msg, "converting", "the message must still read as a sentence")
+	assert.NotContains(t, msg, `"t"`, "strconv quotes it again in the details")
+	assert.NotContains(t, msg, "[redac[", "the placeholder must not be rewritten into itself")
+}
+
+type twoSecretConfig struct {
+	APIToken      string `envconfig:"API_TOKEN"`
+	WebhookSecret int    `envconfig:"WEBHOOK_SECRET"`
+}
+
+func TestLoadErrorScrubsTheLongestSecretFirst(t *testing.T) {
+	// One secret is a prefix of the other. Replacing the short one first would
+	// leave the tail of the long one in the message.
+	t.Setenv("API_TOKEN", "abcdef")
+	t.Setenv("WEBHOOK_SECRET", "abcdefghijkl")
+
+	var cfg twoSecretConfig
+	err := config.LoadWith(&cfg, config.Options{Files: []string{}})
+	require.Error(t, err)
+
+	assert.NotContains(t, err.Error(), "abcdef")
+	assert.NotContains(t, err.Error(), "ghijkl")
+}

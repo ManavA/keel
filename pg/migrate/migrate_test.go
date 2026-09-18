@@ -292,3 +292,40 @@ func TestRunRefusesAQualifiedLedgerTableName(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not a valid table name")
 }
+
+func TestRunRollsBackAFileWhoseLedgerRowCannotBeWritten(t *testing.T) {
+	// The invariant apply's comment claims: the file and its ledger row share
+	// one transaction. The dangerous case is not a file that fails — Postgres
+	// aborts the transaction and nothing commits either way — but a file that
+	// SUCCEEDS whose ledger insert then fails. Splitting them into two
+	// transactions commits the schema change with nothing recording it, and the
+	// next run applies the file again.
+	//
+	// The ledger is made unwritable between the two statements with a trigger,
+	// since that is the only way to fail the insert without failing the file.
+	pool := freshSchema(t)
+	ctx := context.Background()
+
+	_, err := pool.Exec(ctx, `create table schema_migrations (
+		filename   text primary key,
+		checksum   text,
+		applied_at timestamptz not null default now()
+	)`)
+	require.NoError(t, err)
+
+	_, err = pool.Exec(ctx, `create function reject_ledger() returns trigger as $$
+		begin raise exception 'ledger is unwritable'; end $$ language plpgsql`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `create trigger reject_ledger_trg before insert on schema_migrations
+		for each row execute function reject_ledger()`)
+	require.NoError(t, err)
+
+	_, err = migrate.Run(ctx, pool, migrate.Options{FS: files(map[string]string{
+		"001_survivor.up.sql": `create table survivor (id int primary key);`,
+	})})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "001_survivor.up.sql")
+
+	assert.False(t, tableExists(t, pool, "survivor"),
+		"the file committed without a ledger row, so the next run will apply it again")
+}

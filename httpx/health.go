@@ -33,6 +33,14 @@ type HealthOptions struct {
 	// CacheTTL is how long a result is reused. Default 5 seconds. Readiness is
 	// polled by every prober and load balancer on its own schedule, and without
 	// a cache all of it reaches the database.
+	//
+	// A failed result is cached too, including one caused by Timeout: a
+	// dependency that cannot answer inside the budget this endpoint set is not
+	// ready by that endpoint's own definition, and caching it stops a
+	// struggling dependency being asked again by every prober in turn.
+	//
+	// The one result not cached is a check that failed with context.Canceled.
+	// That is the prober giving up, and it says nothing about the dependency.
 	CacheTTL time.Duration
 
 	// LivenessPath and ReadinessPath default to /healthz and /readyz.

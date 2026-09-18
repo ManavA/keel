@@ -1,7 +1,9 @@
 package httpx_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -169,4 +171,43 @@ type writeCounter struct{ n int }
 func (w *writeCounter) Write(p []byte) (int, error) {
 	w.n += len(p)
 	return len(p), nil
+}
+
+func TestRouterInstallsItsLoggerOnTheRequest(t *testing.T) {
+	// The error helpers read the logger off the request context, and the router
+	// is what puts it there. Building the context by hand in a test would leave
+	// that wiring unchecked.
+	var buf bytes.Buffer
+	logger := log.New(log.Options{Output: &buf})
+
+	r := httpx.NewRouter(httpx.RouterOptions{Logger: logger, SkipRequestLog: true})
+	r.Get("/thing", func(w http.ResponseWriter, req *http.Request) {
+		assert.Same(t, logger, httpx.Logger(req.Context()))
+		httpx.InternalError(w, req, errors.New("handler reason"))
+	})
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/thing", nil))
+
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Contains(t, buf.String(), "handler reason")
+}
+
+func TestRouterNotFoundLogsThroughItsLogger(t *testing.T) {
+	// The 404 and 405 the router answers itself go through the same logger.
+	var buf bytes.Buffer
+	r := httpx.NewRouter(httpx.RouterOptions{
+		Logger:         log.New(log.Options{Output: &buf}),
+		SkipRequestLog: true,
+	})
+	// chi short-circuits to NotFound without running the middleware chain when
+	// no route is registered at all, so register one.
+	r.Get("/thing", func(http.ResponseWriter, *http.Request) {})
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/absent", nil))
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Contains(t, buf.String(), "/absent")
+	assert.Contains(t, buf.String(), log.RequestIDKey)
 }
