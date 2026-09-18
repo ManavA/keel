@@ -108,8 +108,18 @@ jobs:
           # none of it — the job would pass by having nothing to look at.
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v2
+        if: github.event_name == 'pull_request'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: gitleaks tree scan
+        if: github.event_name != 'pull_request'
+        # The action scans a git range ending at a merge-base, which does not
+        # exist when history starts at a root commit — the range errors and the
+        # job fails without scanning anything. A push already carries the full
+        # tree, so scan that instead of a range.
+        run: |
+          go install github.com/zricethezav/gitleaks/v8@v8.24.3
+          "$(go env GOPATH)/bin/gitleaks" detect --source . --no-git --redact --exit-code=2
 
   deploy-scripts:
     runs-on: ubuntu-latest
