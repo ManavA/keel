@@ -128,10 +128,16 @@ type sessionToken struct {
 	} `json:"user"`
 }
 
+// testPassword is the password every test account signs up with. The auth
+// package's own tests cover password rules; here it is a constant because a
+// parameter every caller passes the same value is a lint finding, not
+// flexibility.
+const testPassword = "password123"
+
 // signup registers an account and returns its first session token.
-func signup(t *testing.T, ts *testService, email, password string) sessionToken {
+func signup(t *testing.T, ts *testService, email string) sessionToken {
 	t.Helper()
-	resp, raw := post(t, ts, "/auth/signup", "", `{"email":"`+email+`","password":"`+password+`"}`)
+	resp, raw := post(t, ts, "/auth/signup", "", `{"email":"`+email+`","password":"`+testPassword+`"}`)
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(raw))
 	var session sessionToken
 	require.NoError(t, json.Unmarshal(raw, &session))
@@ -197,7 +203,7 @@ func lastLinkToken(t *testing.T, ts *testService) string {
 
 func TestCreateAndReadANote(t *testing.T) {
 	ts := newTestServer(t)
-	token := signup(t, ts, "reader@example.com", "password123").Token
+	token := signup(t, ts, "reader@example.com").Token
 
 	resp, raw := postNote(t, ts, token, `{"title":"Roof repair","body":"Slate tiles"}`)
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(raw))
@@ -219,7 +225,7 @@ func TestSearchFindsAFreshNote(t *testing.T) {
 	// Indexing happens inside the request, so a note is findable as soon as the
 	// create call returns. If it moved onto the event bus this would go red.
 	ts := newTestServer(t)
-	token := signup(t, ts, "searcher@example.com", "password123").Token
+	token := signup(t, ts, "searcher@example.com").Token
 
 	_, raw := postNote(t, ts, token, `{"title":"Roof repair","body":"Slate tiles, south side"}`)
 	var created Note
@@ -236,7 +242,7 @@ func TestSearchFindsAFreshNote(t *testing.T) {
 
 func TestListPagesByKeyset(t *testing.T) {
 	ts := newTestServer(t)
-	token := signup(t, ts, "pager@example.com", "password123").Token
+	token := signup(t, ts, "pager@example.com").Token
 
 	for _, title := range []string{"one", "two", "three", "four", "five"} {
 		resp, raw := postNote(t, ts, token, `{"title":"`+title+`"}`)
@@ -271,7 +277,7 @@ func TestListPagesByKeyset(t *testing.T) {
 
 func TestDeleteRemovesFromTheIndexToo(t *testing.T) {
 	ts := newTestServer(t)
-	token := signup(t, ts, "deleter@example.com", "password123").Token
+	token := signup(t, ts, "deleter@example.com").Token
 
 	_, raw := postNote(t, ts, token, `{"title":"Boiler service","body":"Annual check"}`)
 	var created Note
@@ -298,7 +304,7 @@ func TestDeleteRemovesFromTheIndexToo(t *testing.T) {
 
 func TestErrorsNeverEchoTheInput(t *testing.T) {
 	ts := newTestServer(t)
-	token := signup(t, ts, "careful@example.com", "password123").Token
+	token := signup(t, ts, "careful@example.com").Token
 
 	tests := []struct {
 		name   string
@@ -362,7 +368,7 @@ func TestErrorsNeverEchoTheInput(t *testing.T) {
 
 func TestCreateRejectsABadBody(t *testing.T) {
 	ts := newTestServer(t)
-	token := signup(t, ts, "particular@example.com", "password123").Token
+	token := signup(t, ts, "particular@example.com").Token
 
 	tests := []struct {
 		name string
@@ -418,7 +424,7 @@ func TestNotesRequireAuth(t *testing.T) {
 func TestAuthFlowEndToEnd(t *testing.T) {
 	ts := newTestServer(t)
 
-	session := signup(t, ts, "owner@example.com", "password123")
+	session := signup(t, ts, "owner@example.com")
 	assert.False(t, session.User.EmailVerified, "a fresh signup must not be verified")
 
 	// The signup mail carries the verification link; following it verifies.
@@ -475,8 +481,8 @@ func TestAuthFlowEndToEnd(t *testing.T) {
 // 404 or empty result the second account gets for rows that do not exist.
 func TestNotesAreScopedToOwner(t *testing.T) {
 	ts := newTestServer(t)
-	tokenA := signup(t, ts, "alice@example.com", "password123").Token
-	tokenB := signup(t, ts, "bob@example.com", "password123").Token
+	tokenA := signup(t, ts, "alice@example.com").Token
+	tokenB := signup(t, ts, "bob@example.com").Token
 
 	_, raw := postNote(t, ts, tokenA, `{"title":"Alice roof","body":"Slate tiles, south side"}`)
 	var created Note
@@ -536,7 +542,7 @@ func TestHealthAndReadiness(t *testing.T) {
 
 func TestReconcileJobRepairsTheIndex(t *testing.T) {
 	ts := newTestServer(t)
-	token := signup(t, ts, "gardener@example.com", "password123").Token
+	token := signup(t, ts, "gardener@example.com").Token
 	ctx := context.Background()
 
 	_, raw := postNote(t, ts, token, `{"title":"Garden fence","body":"Replace two panels"}`)
