@@ -53,7 +53,13 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
       - uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.6.0
+          # Pinned to the earliest release whose binary was itself built with
+          # a go1.26 toolchain (checked directly: `go version` on the
+          # released binary reports go1.25.5 for v2.8.0 and go1.26.0 for
+          # v2.9.0) — golangci-lint refuses to analyze a module whose go.mod
+          # targets a newer Go version than the linter binary was compiled
+          # with, and go.mod here now requires go 1.26.0.
+          version: v2.9.0
       # A build artifact in the tree is the usual cause, and the tree is the last
       # place anyone looks. Cheap to check, and it catches any binary rather
       # than the one name an ignore rule happens to list.
