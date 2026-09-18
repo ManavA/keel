@@ -12,18 +12,36 @@ import (
 // makes only one of them do the work, and the rest wait for its result. The
 // zero value is ready to use.
 //
-// It is a context-aware wrapper over golang.org/x/sync/singleflight, so a
-// caller already using perf's other middleware does not need a second
-// import for this pattern.
+// The underlying call runs with context.Background(), not any one caller's
+// context: several callers with independent contexts and lifetimes can be
+// waiting on the same key, and tying the shared work to one of them would
+// mean that caller's cancellation either kills the work for everyone still
+// waiting, or — if the cancelled caller happened to be the one whose
+// context was in use — surfaces that caller's cancellation error to callers
+// who never cancelled anything. Do still honors each caller's own context
+// for how long that caller personally waits: a caller whose context is
+// cancelled stops waiting immediately and gets its own ctx.Err(), while the
+// underlying call keeps running for whoever else is still waiting on it.
 type SingleFlight struct {
 	group singleflight.Group
 }
 
-// Do calls fn for key unless a call for the same key is already in flight, in
-// which case it waits for that call and shares its result. shared reports
-// whether the result was shared with another caller.
-func (s *SingleFlight) Do(ctx context.Context, key string, fn func(ctx context.Context) (any, error)) (v any, err error, shared bool) {
-	return s.group.Do(key, func() (any, error) { return fn(ctx) })
+// Do calls fn for key unless a call for the same key is already in flight,
+// in which case it waits for that call and shares its result. shared
+// reports whether the result was shared with another caller. If ctx is
+// done before a result is available, Do returns ctx.Err() without waiting
+// further; the underlying call is not affected and other callers waiting on
+// the same key are not woken by this caller's cancellation.
+func (s *SingleFlight) Do(ctx context.Context, key string, fn func(ctx context.Context) (any, error)) (v any, shared bool, err error) {
+	ch := s.group.DoChan(key, func() (any, error) {
+		return fn(context.Background())
+	})
+	select {
+	case res := <-ch:
+		return res.Val, res.Shared, res.Err
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
 }
 
 // Forget tells SingleFlight that key is no longer in flight, so the next Do

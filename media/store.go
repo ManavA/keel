@@ -6,7 +6,9 @@ import (
 	"time"
 )
 
-// ErrNotFound is returned by Get and by a Store's URL when key does not exist.
+// ErrNotFound is returned by Get when key does not exist. URL does not check
+// existence in either implementation this package provides, so it never
+// returns ErrNotFound.
 var ErrNotFound = errors.New("media: object not found")
 
 // Store puts and fetches opaque byte objects under a key, and mints a URL a
@@ -37,6 +39,6 @@ type Store interface {
 	// hint: an implementation backed by a public bucket ignores it and
 	// returns a stable public URL; one backed by a private bucket returns a
 	// signed URL that expires around ttl. ttl <= 0 asks for the
-	// implementation's own default.
+	// implementation's own default. URL does not check that key exists.
 	URL(ctx context.Context, key string, ttl time.Duration) (string, error)
 }

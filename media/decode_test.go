@@ -13,6 +13,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// infiniteReader never returns EOF, standing in for a slow or hostile
+// source that would otherwise be read without bound.
+type infiniteReader struct{ n int64 }
+
+func (r *infiniteReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	r.n += int64(len(p))
+	return len(p), nil
+}
+
 func encodeJPEG(t *testing.T, width, height int) []byte {
 	t.Helper()
 	img := image.NewNRGBA(image.Rect(0, 0, width, height))
@@ -49,6 +61,49 @@ func TestDecode(t *testing.T) {
 		body := encodeJPEG(t, 64, 64)
 		_, err := Decode(bytes.NewReader(body), DecodeOptions{MaxBytes: 10})
 		require.ErrorIs(t, err, ErrTooLarge)
+	})
+
+	t.Run("stops reading at the byte cap instead of draining an unbounded source", func(t *testing.T) {
+		// A source that never returns EOF: without an actual read limit
+		// (not just a post-hoc length check), Decode would try to buffer
+		// this in full before ever comparing it against MaxBytes.
+		cr := &infiniteReader{}
+		_, err := Decode(cr, DecodeOptions{MaxBytes: 100})
+		require.ErrorIs(t, err, ErrTooLarge)
+		require.LessOrEqual(t, cr.n, int64(101), "Decode must stop reading at MaxBytes+1, not consume the whole source")
+	})
+
+	t.Run("rejects a decoded image over the pixel cap", func(t *testing.T) {
+		// A uniform image compresses to a tiny PNG regardless of its
+		// dimensions, reproducing the shape of a decompression bomb: a
+		// small, well-formed file that decodes to a very large pixel
+		// buffer.
+		const width, height = 12000, 12000 // 144,000,000 pixels
+		img := image.NewGray(image.Rect(0, 0, width, height))
+		var buf bytes.Buffer
+		require.NoError(t, png.Encode(&buf, img))
+		t.Logf("bomb PNG is %d bytes for a %dx%d image", buf.Len(), width, height)
+		require.Less(t, buf.Len(), 1<<20, "the fixture must stay a small, legitimately-encoded file for this test to mean anything")
+
+		_, err := Decode(bytes.NewReader(buf.Bytes()), DecodeOptions{})
+		require.ErrorIs(t, err, ErrTooManyPixels)
+	})
+
+	t.Run("accepts a decoded image within a caller-raised pixel cap", func(t *testing.T) {
+		// Just over DefaultMaxPixels (60M) — enough to prove the default
+		// would have rejected it and the raised option accepts it, without
+		// paying for a full 144-megapixel decode in every test run.
+		const width, height = 8000, 7600 // 60,800,000 pixels
+		img := image.NewGray(image.Rect(0, 0, width, height))
+		var buf bytes.Buffer
+		require.NoError(t, png.Encode(&buf, img))
+
+		_, err := Decode(bytes.NewReader(buf.Bytes()), DecodeOptions{})
+		require.ErrorIs(t, err, ErrTooManyPixels, "must be rejected at the default cap first, or this test proves nothing")
+
+		d, err := Decode(bytes.NewReader(buf.Bytes()), DecodeOptions{MaxPixels: width * height})
+		require.NoError(t, err)
+		require.Equal(t, width, d.Image.Bounds().Dx())
 	})
 
 	t.Run("rejects an unsupported content type", func(t *testing.T) {

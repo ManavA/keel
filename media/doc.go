@@ -7,9 +7,11 @@
 // already landed. Fetch failures are split into permanent (the source will
 // never be available again) and transient (retry later), so a permanently
 // missing source is marked as such instead of being retried on every run.
-// Decode enforces a maximum input size and checks the actual content type of
-// the input, not a caller-supplied one, so a misconfigured or hostile source
-// cannot exhaust memory or be decoded as the wrong format.
+// Decode enforces a maximum input size, a maximum decoded pixel count, and
+// checks the actual content type of the input rather than a caller-supplied
+// one. All three are required together: a small, validly-encoded file can
+// still decode to a very large pixel buffer, so the byte limit alone does
+// not bound memory use.
 //
 // Store is the storage interface variants are written through. LocalStore
 // is the default implementation, backed by the local filesystem, with

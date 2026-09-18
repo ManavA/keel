@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,13 +13,13 @@ import (
 
 func TestMemoryStore(t *testing.T) {
 	t.Run("a miss reports not found", func(t *testing.T) {
-		s := NewMemoryStore(10)
+		s := NewMemoryStore(MemoryStoreOptions{})
 		_, ok := s.Get("missing")
 		require.False(t, ok)
 	})
 
 	t.Run("set then get round-trips within ttl", func(t *testing.T) {
-		s := NewMemoryStore(10)
+		s := NewMemoryStore(MemoryStoreOptions{})
 		s.Set("k", Entry{Body: []byte("v")}, time.Minute, nil)
 		entry, ok := s.Get("k")
 		require.True(t, ok)
@@ -26,14 +27,14 @@ func TestMemoryStore(t *testing.T) {
 	})
 
 	t.Run("an entry past its ttl is a miss", func(t *testing.T) {
-		s := NewMemoryStore(10)
+		s := NewMemoryStore(MemoryStoreOptions{})
 		s.Set("k", Entry{Body: []byte("v")}, -time.Second, nil) // already expired
 		_, ok := s.Get("k")
 		require.False(t, ok)
 	})
 
 	t.Run("invalidating a tag removes every entry tagged with it", func(t *testing.T) {
-		s := NewMemoryStore(10)
+		s := NewMemoryStore(MemoryStoreOptions{})
 		s.Set("a", Entry{Body: []byte("a")}, time.Minute, []string{"item:1"})
 		s.Set("b", Entry{Body: []byte("b")}, time.Minute, []string{"item:1", "city:example"})
 		s.Set("c", Entry{Body: []byte("c")}, time.Minute, []string{"city:example"})
@@ -49,20 +50,22 @@ func TestMemoryStore(t *testing.T) {
 	})
 
 	t.Run("invalidating an unused tag is a no-op", func(t *testing.T) {
-		s := NewMemoryStore(10)
+		s := NewMemoryStore(MemoryStoreOptions{})
 		s.Set("a", Entry{Body: []byte("a")}, time.Minute, []string{"item:1"})
 		s.Invalidate("item:does-not-exist")
 		_, ok := s.Get("a")
 		require.True(t, ok)
 	})
 
-	t.Run("exceeding maxEntries evicts the least recently used entry", func(t *testing.T) {
-		s := NewMemoryStore(2)
+	t.Run("exceeding MaxBytes evicts the least recently used entry", func(t *testing.T) {
+		// Each entry here is exactly 1 byte (a single-byte body, no headers),
+		// so MaxBytes: 2 fits exactly two of them.
+		s := NewMemoryStore(MemoryStoreOptions{MaxBytes: 2})
 		s.Set("a", Entry{Body: []byte("a")}, time.Minute, nil)
 		s.Set("b", Entry{Body: []byte("b")}, time.Minute, nil)
 		_, _ = s.Get("a") // touch a, so b becomes the least recently used
 
-		s.Set("c", Entry{Body: []byte("c")}, time.Minute, nil) // pushes the store over 2 entries
+		s.Set("c", Entry{Body: []byte("c")}, time.Minute, nil) // pushes total size over MaxBytes
 
 		_, ok := s.Get("b")
 		require.False(t, ok, "b was least recently used and must have been evicted")
@@ -71,11 +74,18 @@ func TestMemoryStore(t *testing.T) {
 		_, ok = s.Get("c")
 		require.True(t, ok)
 	})
+
+	t.Run("an entry larger than MaxEntryBytes is not stored", func(t *testing.T) {
+		s := NewMemoryStore(MemoryStoreOptions{MaxBytes: 1000, MaxEntryBytes: 4})
+		s.Set("too-big", Entry{Body: []byte("way too large for the per-entry cap")}, time.Minute, nil)
+		_, ok := s.Get("too-big")
+		require.False(t, ok, "an entry over MaxEntryBytes must not be cached at all")
+	})
 }
 
 func TestResponseCache(t *testing.T) {
 	t.Run("a GET response is served from cache on the second call without hitting the handler again", func(t *testing.T) {
-		store := NewMemoryStore(10)
+		store := NewMemoryStore(MemoryStoreOptions{})
 		calls := 0
 		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			calls++
@@ -98,7 +108,7 @@ func TestResponseCache(t *testing.T) {
 	})
 
 	t.Run("a non-2xx response is never cached", func(t *testing.T) {
-		store := NewMemoryStore(10)
+		store := NewMemoryStore(MemoryStoreOptions{})
 		calls := 0
 		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			calls++
@@ -114,7 +124,7 @@ func TestResponseCache(t *testing.T) {
 	})
 
 	t.Run("a POST is never cached even to an otherwise cacheable path", func(t *testing.T) {
-		store := NewMemoryStore(10)
+		store := NewMemoryStore(MemoryStoreOptions{})
 		calls := 0
 		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			calls++
@@ -129,7 +139,7 @@ func TestResponseCache(t *testing.T) {
 	})
 
 	t.Run("a handler's own cache tag is honored for invalidation", func(t *testing.T) {
-		store := NewMemoryStore(10)
+		store := NewMemoryStore(MemoryStoreOptions{})
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			AddCacheTag(r.Context(), "item:1")
 			w.WriteHeader(http.StatusOK)
@@ -148,7 +158,7 @@ func TestResponseCache(t *testing.T) {
 	})
 
 	t.Run("a custom KeyFunc distinguishes requests DefaultKey would conflate", func(t *testing.T) {
-		store := NewMemoryStore(10)
+		store := NewMemoryStore(MemoryStoreOptions{})
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(r.Header.Get("X-Tenant")))
@@ -168,5 +178,196 @@ func TestResponseCache(t *testing.T) {
 
 		require.Equal(t, "a", wA.Body.String())
 		require.Equal(t, "b", wB.Body.String())
+	})
+
+	t.Run("a request carrying Authorization is never served from or written to the cache", func(t *testing.T) {
+		store := NewMemoryStore(MemoryStoreOptions{})
+		calls := 0
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("Bearer " + r.Header.Get("Authorization")))
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+
+		alice := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/me", nil)
+		alice.Header.Set("Authorization", "Bearer alice-token")
+		wAlice := httptest.NewRecorder()
+		wrapped.ServeHTTP(wAlice, alice)
+		require.Empty(t, wAlice.Header().Get("X-Cache"), "an authenticated request must never touch the cache path")
+
+		bob := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/me", nil)
+		bob.Header.Set("Authorization", "Bearer bob-token")
+		wBob := httptest.NewRecorder()
+		wrapped.ServeHTTP(wBob, bob)
+
+		require.Equal(t, 2, calls, "each authenticated request must reach the handler")
+		require.NotEqual(t, wAlice.Body.String(), wBob.Body.String(), "bob must never receive alice's response")
+	})
+
+	t.Run("a request carrying Cookie is never served from or written to the cache", func(t *testing.T) {
+		store := NewMemoryStore(MemoryStoreOptions{})
+		calls := 0
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(r.Header.Get("Cookie")))
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+
+		alice := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/me", nil)
+		alice.Header.Set("Cookie", "session=alice")
+		wrapped.ServeHTTP(httptest.NewRecorder(), alice)
+
+		bob := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/me", nil)
+		bob.Header.Set("Cookie", "session=bob")
+		wBob := httptest.NewRecorder()
+		wrapped.ServeHTTP(wBob, bob)
+
+		require.Equal(t, 2, calls, "each cookie-bearing request must reach the handler")
+		require.Equal(t, "session=bob", wBob.Body.String(), "bob must get his own response, not alice's cached one")
+	})
+
+	t.Run("a response with Set-Cookie is never cached", func(t *testing.T) {
+		store := NewMemoryStore(MemoryStoreOptions{})
+		calls := 0
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			w.Header().Set("Set-Cookie", "session=abc")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/set-cookie", nil)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		require.Equal(t, 2, calls, "a Set-Cookie response must never be replayed to a second caller")
+	})
+
+	t.Run("a response with Cache-Control: private is never cached", func(t *testing.T) {
+		store := NewMemoryStore(MemoryStoreOptions{})
+		calls := 0
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			w.Header().Set("Cache-Control", "private, max-age=60")
+			w.WriteHeader(http.StatusOK)
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/private", nil)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		require.Equal(t, 2, calls)
+	})
+
+	t.Run("a response with Cache-Control: no-store is never cached", func(t *testing.T) {
+		store := NewMemoryStore(MemoryStoreOptions{})
+		calls := 0
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusOK)
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/no-store", nil)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		require.Equal(t, 2, calls)
+	})
+
+	t.Run("a response with Vary: * is never cached", func(t *testing.T) {
+		store := NewMemoryStore(MemoryStoreOptions{})
+		calls := 0
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			w.Header().Set("Vary", "*")
+			w.WriteHeader(http.StatusOK)
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/vary-star", nil)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		require.Equal(t, 2, calls)
+	})
+
+	t.Run("an ordinary Cache-Control value is still cached", func(t *testing.T) {
+		// Control for the private/no-store refusal above: a ordinary
+		// directive must not be mistaken for one of the refused ones.
+		store := NewMemoryStore(MemoryStoreOptions{})
+		calls := 0
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			w.Header().Set("Cache-Control", "public, max-age=60")
+			w.WriteHeader(http.StatusOK)
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/public", nil)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		require.Equal(t, 1, calls, "a public, cacheable response must be served from cache on the second call")
+	})
+
+	t.Run("gzip and identity responses to the same URL are cached and replayed separately", func(t *testing.T) {
+		store := NewMemoryStore(MemoryStoreOptions{})
+		handler := Gzip(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(strings.Repeat("hello ", 200)))
+		}))
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+
+		gzReq := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/text", nil)
+		gzReq.Header.Set("Accept-Encoding", "gzip")
+		gz1 := httptest.NewRecorder()
+		wrapped.ServeHTTP(gz1, gzReq)
+		require.Equal(t, "gzip", gz1.Header().Get("Content-Encoding"))
+
+		gz2 := httptest.NewRecorder()
+		wrapped.ServeHTTP(gz2, gzReq)
+		require.Equal(t, "HIT", gz2.Header().Get("X-Cache"))
+		require.Equal(t, "gzip", gz2.Header().Get("Content-Encoding"), "a replayed gzip entry must still be labelled gzip")
+		require.Equal(t, gz1.Body.Bytes(), gz2.Body.Bytes())
+
+		plainReq := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/text", nil)
+		// No Accept-Encoding: a client that never asked for gzip.
+		plain := httptest.NewRecorder()
+		wrapped.ServeHTTP(plain, plainReq)
+		require.Empty(t, plain.Header().Get("Content-Encoding"), "a client with no Accept-Encoding must never receive raw gzip bytes")
+		require.NotEqual(t, gz1.Body.Bytes(), plain.Body.Bytes())
+		require.Equal(t, strings.Repeat("hello ", 200), plain.Body.String())
+	})
+
+	t.Run("a cache hit replays the original status code, not always 200", func(t *testing.T) {
+		store := NewMemoryStore(MemoryStoreOptions{})
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte("created"))
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/create", nil)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+
+		w := httptest.NewRecorder()
+		wrapped.ServeHTTP(w, req)
+		require.Equal(t, "HIT", w.Header().Get("X-Cache"))
+		require.Equal(t, http.StatusCreated, w.Code, "a cached 201 must replay as 201, not 200")
+	})
+
+	t.Run("a cache hit replays headers beyond Content-Type", func(t *testing.T) {
+		store := NewMemoryStore(MemoryStoreOptions{})
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Custom-Header", "custom-value")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("body"))
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/headers", nil)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+
+		w := httptest.NewRecorder()
+		wrapped.ServeHTTP(w, req)
+		require.Equal(t, "HIT", w.Header().Get("X-Cache"))
+		require.Equal(t, "custom-value", w.Header().Get("X-Custom-Header"))
+		require.Equal(t, "application/json", w.Header().Get("Content-Type"))
 	})
 }

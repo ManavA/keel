@@ -34,7 +34,7 @@ func TestRateLimited_Geocode(t *testing.T) {
 	t.Run("the first call never waits", func(t *testing.T) {
 		clock := &fakeClock{now: time.Unix(0, 0), sleepFires: true}
 		provider := &fakeProvider{coords: &Coordinates{Latitude: 1}}
-		rl := NewRateLimited(provider, time.Second, RateLimitedOptions{now: clock.Now, sleep: clock.Sleep})
+		rl := &RateLimited{provider: provider, interval: time.Second, now: clock.Now, sleep: clock.Sleep}
 
 		_, err := rl.Geocode(ctx, "1 Main St", "Oakland", "CA", "94601")
 		require.NoError(t, err)
@@ -44,7 +44,7 @@ func TestRateLimited_Geocode(t *testing.T) {
 	t.Run("a second call inside the interval waits the remainder", func(t *testing.T) {
 		clock := &fakeClock{now: time.Unix(0, 0), sleepFires: true}
 		provider := &fakeProvider{coords: &Coordinates{Latitude: 1}}
-		rl := NewRateLimited(provider, time.Second, RateLimitedOptions{now: clock.Now, sleep: clock.Sleep})
+		rl := &RateLimited{provider: provider, interval: time.Second, now: clock.Now, sleep: clock.Sleep}
 
 		_, err := rl.Geocode(ctx, "1 Main St", "Oakland", "CA", "94601")
 		require.NoError(t, err)
@@ -60,7 +60,7 @@ func TestRateLimited_Geocode(t *testing.T) {
 	t.Run("a call after the interval has fully elapsed does not wait", func(t *testing.T) {
 		clock := &fakeClock{now: time.Unix(0, 0), sleepFires: true}
 		provider := &fakeProvider{coords: &Coordinates{Latitude: 1}}
-		rl := NewRateLimited(provider, time.Second, RateLimitedOptions{now: clock.Now, sleep: clock.Sleep})
+		rl := &RateLimited{provider: provider, interval: time.Second, now: clock.Now, sleep: clock.Sleep}
 
 		_, err := rl.Geocode(ctx, "1 Main St", "Oakland", "CA", "94601")
 		require.NoError(t, err)
@@ -75,7 +75,7 @@ func TestRateLimited_Geocode(t *testing.T) {
 	t.Run("a cancelled context stops the wait instead of blocking forever", func(t *testing.T) {
 		clock := &fakeClock{now: time.Unix(0, 0), sleepFires: false} // the sleep channel never fires
 		provider := &fakeProvider{coords: &Coordinates{Latitude: 1}}
-		rl := NewRateLimited(provider, time.Second, RateLimitedOptions{now: clock.Now, sleep: clock.Sleep})
+		rl := &RateLimited{provider: provider, interval: time.Second, now: clock.Now, sleep: clock.Sleep}
 
 		_, err := rl.Geocode(ctx, "1 Main St", "Oakland", "CA", "94601")
 		require.NoError(t, err)
@@ -85,5 +85,35 @@ func TestRateLimited_Geocode(t *testing.T) {
 		_, err = rl.Geocode(cancelCtx, "2 Main St", "Oakland", "CA", "94601")
 		require.ErrorIs(t, err, context.Canceled)
 		require.Equal(t, 1, provider.calls, "the underlying provider must not be called once the wait is cancelled")
+	})
+
+	t.Run("a cancelled wait releases its reservation instead of pushing out the next caller", func(t *testing.T) {
+		clock := &fakeClock{now: time.Unix(0, 0), sleepFires: false} // the sleep channel never fires: forces cancellation
+		provider := &fakeProvider{coords: &Coordinates{Latitude: 1}}
+		rl := &RateLimited{provider: provider, interval: time.Second, now: clock.Now, sleep: clock.Sleep}
+
+		// First call: no prior reservation, succeeds immediately.
+		_, err := rl.Geocode(ctx, "1 Main St", "Oakland", "CA", "94601")
+		require.NoError(t, err)
+
+		// Second call: still within the interval (clock has not advanced),
+		// so it must wait — but its context is already cancelled, so it
+		// never actually consumes the wait it reserved.
+		cancelCtx, cancel := context.WithCancel(ctx)
+		cancel()
+		_, err = rl.Geocode(cancelCtx, "2 Main St", "Oakland", "CA", "94601")
+		require.ErrorIs(t, err, context.Canceled)
+
+		// Third call, for real: without releasing the second call's
+		// reservation, this would see the interval as starting from the
+		// cancelled call's (unused) reserved slot and wait a full interval
+		// AGAIN on top of it — double the configured interval.
+		clock.sleepFires = true
+		_, err = rl.Geocode(ctx, "3 Main St", "Oakland", "CA", "94601")
+		require.NoError(t, err)
+
+		require.Len(t, clock.sleptFor, 2, "one wait attempt for the cancelled call, one for the real one")
+		require.Equal(t, time.Second, clock.sleptFor[1],
+			"the third call must wait exactly one interval, not one inflated by the cancelled call's abandoned reservation")
 	})
 }

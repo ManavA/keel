@@ -16,10 +16,27 @@ import (
 // in the hundreds of kilobytes to a few megabytes; this is set well above
 // that and well below a size that would threaten a job's memory limit if a
 // source serves an unexpectedly large file.
+//
+// This bounds the encoded input only. A small, validly-encoded file can
+// still decode to a very large pixel buffer — see DefaultMaxPixels, the
+// separate bound that exists for exactly that case.
 const DefaultMaxBytes = 24 << 20 // 24 MiB
+
+// DefaultMaxPixels caps the decoded image's width times height. A 168 KB
+// PNG can legitimately decode to well over 100 million pixels if it is
+// mostly a uniform color, since PNG's compression has no relationship to
+// decoded size; DefaultMaxBytes does not protect against this at all. Set
+// well above any real photo (a 48-megapixel phone sensor is under 50
+// million pixels) and well below a size that would threaten a job's memory
+// limit once decoded to raw pixels.
+const DefaultMaxPixels = 60_000_000 // 60 megapixels
 
 // ErrTooLarge is returned when a source exceeds Options.MaxBytes.
 var ErrTooLarge = errors.New("media: source exceeds max bytes")
+
+// ErrTooManyPixels is returned when a source's decoded dimensions exceed
+// Options.MaxPixels.
+var ErrTooManyPixels = errors.New("media: source exceeds max pixels")
 
 // ErrUnsupportedType is returned when the sniffed content type is not in
 // Options.AllowedTypes.
@@ -32,15 +49,19 @@ var ErrUnsupportedType = errors.New("media: unsupported content type")
 var DefaultAllowedTypes = []string{"image/jpeg", "image/png", "image/gif"}
 
 // DecodeOptions configures Decode. The zero value is a working default:
-// 24MiB cap, JPEG/PNG/GIF only.
+// 24MiB byte cap, 60-megapixel decoded-size cap, JPEG/PNG/GIF only.
 type DecodeOptions struct {
 	MaxBytes     int64
+	MaxPixels    int64
 	AllowedTypes []string
 }
 
 func (o DecodeOptions) withDefaults() DecodeOptions {
 	if o.MaxBytes <= 0 {
 		o.MaxBytes = DefaultMaxBytes
+	}
+	if o.MaxPixels <= 0 {
+		o.MaxPixels = DefaultMaxPixels
 	}
 	if o.AllowedTypes == nil {
 		o.AllowedTypes = DefaultAllowedTypes
@@ -80,6 +101,18 @@ func Decode(r io.Reader, opts DecodeOptions) (*Decoded, error) {
 	contentType := sniff(body)
 	if !allowedType(contentType, opts.AllowedTypes) {
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedType, contentType)
+	}
+
+	// image.DecodeConfig reads only the header — width and height — without
+	// allocating a pixel buffer, so a decoded-size bomb is caught before the
+	// expensive full decode below ever runs.
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("media: decode header: %w", err)
+	}
+	pixels := int64(cfg.Width) * int64(cfg.Height)
+	if pixels > opts.MaxPixels {
+		return nil, fmt.Errorf("%w: %dx%d = %d pixels, limit %d", ErrTooManyPixels, cfg.Width, cfg.Height, pixels, opts.MaxPixels)
 	}
 
 	// imaging.Decode (not image.Decode) reads and applies the EXIF

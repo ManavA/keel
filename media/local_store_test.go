@@ -2,8 +2,9 @@ package media
 
 import (
 	"context"
-	"errors"
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -46,20 +47,38 @@ func TestLocalStore(t *testing.T) {
 		require.Equal(t, "https://cdn.example.test/a/b.jpg", url)
 	})
 
-	t.Run("a key that tries to escape the root is neutralized, not followed", func(t *testing.T) {
-		// filepath.Clean("/" + key) collapses the leading ".." segments against
-		// the synthetic root before Join ever sees them, so the write lands
-		// inside root rather than at /etc/passwd. This asserts the outcome
-		// that matters — nothing was written outside root — rather than
-		// requiring a particular error, which the defense-in-depth HasPrefix
-		// check in resolve() exists to catch if that collapsing behavior ever
-		// changes.
+	t.Run("a key that tries to escape the root with ../ is neutralized, not followed", func(t *testing.T) {
+		// path.Clean("/" + key) collapses the leading ".." segments against
+		// the synthetic root before os.Root ever sees them, so the write
+		// lands inside root rather than at /etc/passwd. This asserts the
+		// outcome that matters — nothing was written outside root — rather
+		// than requiring a particular error.
 		require.NoError(t, s.Put(ctx, "../../etc/passwd", []byte("x"), "text/plain"))
 		body, err := s.Get(ctx, "../../etc/passwd")
 		require.NoError(t, err)
 		require.Equal(t, []byte("x"), body)
 		_, statErr := os.Stat("/etc/passwd.tmp")
 		require.True(t, os.IsNotExist(statErr), "must never have touched a real /etc path")
+	})
+
+	t.Run("concurrent Puts of the same key do not collide on a shared temp name", func(t *testing.T) {
+		const n = 20
+		var wg sync.WaitGroup
+		errs := make([]error, n)
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				errs[i] = s.Put(ctx, "hammered.jpg", []byte("value"), "image/jpeg")
+			}(i)
+		}
+		wg.Wait()
+		for _, err := range errs {
+			require.NoError(t, err)
+		}
+		body, err := s.Get(ctx, "hammered.jpg")
+		require.NoError(t, err)
+		require.Equal(t, []byte("value"), body)
 	})
 }
 
@@ -68,13 +87,45 @@ func TestNewLocalStore_RejectsEmptyRoot(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestLocalStore_PathEscapeControl is the control for the path-traversal
-// guard: a key that does NOT try to escape must be accepted, proving the
-// check discriminates rather than rejecting everything.
+// TestLocalStore_PathEscapeControl is the control for the traversal guard: a
+// key that does NOT try to escape must be accepted, proving the escape
+// tests discriminate rather than everything simply failing.
 func TestLocalStore_PathEscapeControl(t *testing.T) {
 	s, err := NewLocalStore(t.TempDir(), "")
 	require.NoError(t, err)
-	err = s.Put(context.Background(), "safe/nested/key.jpg", []byte("x"), "image/jpeg")
+	require.NoError(t, s.Put(context.Background(), "safe/nested/key.jpg", []byte("x"), "image/jpeg"))
+	body, err := s.Get(context.Background(), "safe/nested/key.jpg")
 	require.NoError(t, err)
-	require.False(t, errors.Is(err, ErrNotFound))
+	require.Equal(t, []byte("x"), body)
+}
+
+// TestLocalStore_SymlinkEscape reproduces the exploit a plain path check
+// cannot catch: a symlink placed inside the store's root pointing at a
+// directory outside it. cleanKey's ".." collapsing never sees this, since
+// the key itself ("link/secret.txt") contains no traversal segments at
+// all — the escape happens when the filesystem resolves "link". os.Root is
+// the actual protection here.
+func TestLocalStore_SymlinkEscape(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	outsideDir := t.TempDir()
+
+	secretPath := filepath.Join(outsideDir, "secret.txt")
+	require.NoError(t, os.WriteFile(secretPath, []byte("TOP SECRET"), 0o644))
+	require.NoError(t, os.Symlink(outsideDir, filepath.Join(rootDir, "link")))
+
+	s, err := NewLocalStore(rootDir, "")
+	require.NoError(t, err)
+
+	t.Run("Get refuses to read through the symlink", func(t *testing.T) {
+		_, err := s.Get(ctx, "link/secret.txt")
+		require.Error(t, err)
+	})
+
+	t.Run("Put refuses to write through the symlink", func(t *testing.T) {
+		err := s.Put(ctx, "link/planted.txt", []byte("pwned"), "text/plain")
+		require.Error(t, err)
+		_, statErr := os.Stat(filepath.Join(outsideDir, "planted.txt"))
+		require.True(t, os.IsNotExist(statErr), "must never have written outside the root")
+	})
 }

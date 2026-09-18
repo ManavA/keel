@@ -91,6 +91,15 @@ func deriveOne(key string) Deriver {
 	}
 }
 
+func deriveTwo(largeKey, thumbKey string) Deriver {
+	return func(_ context.Context, body []byte) ([]DerivedVariant, error) {
+		return []DerivedVariant{
+			{Name: "large", Key: largeKey, Body: body, ContentType: "application/octet-stream"},
+			{Name: "thumb", Key: thumbKey, Body: body, ContentType: "application/octet-stream"},
+		}, nil
+	}
+}
+
 func TestRun(t *testing.T) {
 	ctx := context.Background()
 
@@ -106,6 +115,25 @@ func TestRun(t *testing.T) {
 		require.Len(t, results, 1)
 		require.True(t, results[0].Skipped)
 		require.Equal(t, 0, fetcher.callCount(), "a fully-done item must not be fetched at all")
+	})
+
+	t.Run("a partially-done item re-derives everything but only re-Puts the variants not already done", func(t *testing.T) {
+		fetcher := &fakeFetcher{body: []byte("source")}
+		st := newFakeStore()
+		rec := newFakeRecorder()
+		rec.done["item-partial"] = map[string]bool{"large": true} // thumb is not done
+
+		items := []Item{{
+			Key:              "item-partial",
+			SourceURL:        "https://example.test/p.jpg",
+			ExpectedVariants: []string{"large", "thumb"},
+		}}
+		results := Run(ctx, items, fetcher, deriveTwo("item-partial/large.jpg", "item-partial/thumb.jpg"), st, rec, Options{})
+
+		require.False(t, results[0].Skipped, "not every expected variant is done, so the item must not be skipped entirely")
+		require.NotContains(t, st.puts, "item-partial/large.jpg", "an already-done variant must not be re-written to the store")
+		require.Contains(t, st.puts, "item-partial/thumb.jpg", "the not-yet-done variant must still be stored")
+		require.ElementsMatch(t, []string{"large", "thumb"}, results[0].Stored)
 	})
 
 	t.Run("an item with no ExpectedVariants is never skipped, even if Recorder reports variants done", func(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -102,5 +103,79 @@ func TestETag(t *testing.T) {
 		ETag(handlerWithBody("b")).ServeHTTP(w2, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
 
 		require.NotEqual(t, w1.Header().Get("ETag"), w2.Header().Get("ETag"))
+	})
+
+	t.Run("the tag is weak", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		ETag(handlerWithBody("hello")).ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
+		require.True(t, strings.HasPrefix(w.Header().Get("ETag"), `W/"`))
+	})
+
+	t.Run("a handler's own headers survive on a 200, not just Content-Type", func(t *testing.T) {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-Custom-Header", "custom-value")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("hello"))
+		})
+		w := httptest.NewRecorder()
+		ETag(handler).ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
+		require.Equal(t, "custom-value", w.Header().Get("X-Custom-Header"))
+	})
+
+	t.Run("a handler's own headers survive on a non-2xx response too", func(t *testing.T) {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-Custom-Header", "custom-value")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("not found"))
+		})
+		w := httptest.NewRecorder()
+		ETag(handler).ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
+		require.Equal(t, "custom-value", w.Header().Get("X-Custom-Header"))
+	})
+
+	t.Run("composed as ETag(Gzip(h)), a gzip and a non-gzip request get different tags", func(t *testing.T) {
+		body := strings.Repeat("x", 2000) // over Gzip's MinCompressBytes
+		handler := ETag(Gzip(handlerWithBody(body)))
+
+		plain := httptest.NewRecorder()
+		handler.ServeHTTP(plain, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
+
+		gz := httptest.NewRecorder()
+		gzReq := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil)
+		gzReq.Header.Set("Accept-Encoding", "gzip")
+		handler.ServeHTTP(gz, gzReq)
+
+		require.NotEmpty(t, plain.Header().Get("ETag"))
+		require.NotEmpty(t, gz.Header().Get("ETag"))
+		require.NotEqual(t, plain.Header().Get("ETag"), gz.Header().Get("ETag"),
+			"identity and gzip representations of the same content must not share a validator")
+	})
+
+	t.Run("a response over MaxETagBufferBytes streams directly with no ETag", func(t *testing.T) {
+		body := strings.Repeat("x", MaxETagBufferBytes+1)
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-Custom-Header", "custom-value")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(body))
+		})
+		w := httptest.NewRecorder()
+		ETag(handler).ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
+
+		require.Empty(t, w.Header().Get("ETag"), "a response over the buffer cap must not be held in memory to compute a tag")
+		require.Equal(t, "custom-value", w.Header().Get("X-Custom-Header"), "headers set before the cap was hit must still reach the client")
+		require.Equal(t, body, w.Body.String(), "the full body must still arrive even without an ETag")
+	})
+
+	t.Run("Flush after the buffer cap forwards to the real ResponseWriter", func(t *testing.T) {
+		body := strings.Repeat("x", MaxETagBufferBytes+1)
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(body))
+			w.(http.Flusher).Flush() // must not panic: bufferedResponse must implement Flusher
+		})
+		w := httptest.NewRecorder()
+		require.NotPanics(t, func() {
+			ETag(handler).ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
+		})
 	})
 }

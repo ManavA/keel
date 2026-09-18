@@ -3,6 +3,7 @@ package geocode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -142,12 +143,12 @@ func (p *MapboxProvider) lookup(ctx context.Context, query, types string) (*Coor
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("geocode: build request: %w", err)
+		return nil, fmt.Errorf("geocode: build request: %w", sanitizeTransportErr(err))
 	}
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("geocode: request: %w", err)
+		return nil, fmt.Errorf("geocode: request failed: %w", sanitizeTransportErr(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -178,6 +179,20 @@ func (p *MapboxProvider) lookup(ctx context.Context, query, types string) (*Coor
 	}
 
 	return &Coordinates{Longitude: center[0], Latitude: center[1]}, nil
+}
+
+// sanitizeTransportErr removes the request URL from a transport-level
+// error. The access token is sent as a query parameter (Mapbox's API does
+// not accept it as a header), and both http.NewRequestWithContext (via
+// url.Parse) and http.Client.Do return a *url.Error whose Error() method
+// renders the full request URL, token included. Every transport failure
+// would otherwise put the token into whatever log records the error.
+func sanitizeTransportErr(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return uerr.Err
+	}
+	return err
 }
 
 type mapboxResponse struct {

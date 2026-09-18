@@ -12,7 +12,7 @@ import (
 // BenchmarkResponseCache_Hit measures the cost of a cache hit: no handler
 // call, just the Store lookup and copying the buffered body onto the wire.
 func BenchmarkResponseCache_Hit(b *testing.B) {
-	store := NewMemoryStore(0)
+	store := NewMemoryStore(MemoryStoreOptions{})
 	body := strings.Repeat("x", 2048)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -34,7 +34,7 @@ func BenchmarkResponseCache_Hit(b *testing.B) {
 // BenchmarkResponseCache_Miss measures the cost this middleware adds on top
 // of a handler that always misses — the buffering and Store.Set overhead.
 func BenchmarkResponseCache_Miss(b *testing.B) {
-	store := NewMemoryStore(0)
+	store := NewMemoryStore(MemoryStoreOptions{})
 	body := strings.Repeat("x", 2048)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

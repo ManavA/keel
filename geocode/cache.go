@@ -25,10 +25,22 @@ type Store interface {
 // correctly; doing it partially here risks merging two different addresses
 // under one cache key, which returns a wrong answer instead of a cache
 // miss.
+//
+// Each field is escaped before joining, so a literal "|" inside a field
+// (an address line that happens to contain one) cannot shift where one
+// field ends and the next begins: without escaping, ("a|b", "c") and
+// ("a", "b|c") would both join to the same string.
 func NormalizeKey(address, city, state, postalCode string) string {
 	fields := []string{address, city, state, postalCode}
 	for i, f := range fields {
-		fields[i] = strings.Join(strings.Fields(strings.ToLower(f)), " ")
+		fields[i] = normalizeField(f)
 	}
 	return strings.Join(fields, "|")
+}
+
+func normalizeField(f string) string {
+	f = strings.Join(strings.Fields(strings.ToLower(f)), " ")
+	f = strings.ReplaceAll(f, `\`, `\\`)
+	f = strings.ReplaceAll(f, `|`, `\|`)
+	return f
 }

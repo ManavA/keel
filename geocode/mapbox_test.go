@@ -117,6 +117,34 @@ func TestMapboxProvider_Geocode(t *testing.T) {
 		require.GreaterOrEqual(t, calls, 2, "both the address and postcode tiers must have been tried")
 	})
 
+	t.Run("returns an error, not nil-nil, when every tier fails outright", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		p := newTestProvider(t, srv)
+		coords, err := p.Geocode(context.Background(), "123 Main St", "Oakland", "CA", "94601")
+		require.Nil(t, coords)
+		require.Error(t, err, "a real failure on every tier must surface as an error, not be reported the same as a clean no-match")
+	})
+
+	t.Run("the access token never appears in a transport error", func(t *testing.T) {
+		const token = "pk.SECRET-SHOULD-NEVER-LEAK-TOKEN"
+
+		// A server that is immediately closed guarantees a real connection
+		// failure (not just a non-200 status) from http.Client.Do, which is
+		// the case whose error embeds the full request URL.
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		base := srv.URL + "/"
+		srv.Close()
+
+		p := NewMapboxProvider(token, MapboxOptions{BaseURL: base})
+		_, err := p.Geocode(context.Background(), "123 Main St", "Oakland", "CA", "94601")
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), token, "a transport failure must never put the access token into the error text")
+	})
+
 	t.Run("query is escaped for special characters", func(t *testing.T) {
 		var gotPath string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

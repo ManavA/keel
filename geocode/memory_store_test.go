@@ -57,6 +57,14 @@ func TestNormalizeKey(t *testing.T) {
 			a2: "124 Main St", c2: "Springfield", s2: "CA", z2: "94000",
 			wantSame: false,
 		},
+		{
+			// Without escaping the field separator, ("a|b", "c") and
+			// ("a", "b|c") both join to the literal string "a|b|c||".
+			name: "a literal | in one field does not shift the field boundary",
+			a1:   "a|b", c1: "c", s1: "", z1: "",
+			a2: "a", c2: "b|c", s2: "", z2: "",
+			wantSame: false,
+		},
 	}
 
 	for _, tt := range tests {
