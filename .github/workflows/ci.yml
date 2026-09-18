@@ -111,7 +111,7 @@ jobs:
       # through the module proxy, so the build is checksum-verified.
       - name: Install gitleaks
         run: |
-          go install github.com/gitleaks/gitleaks/v8@v8.24.3
+          go install github.com/zricethezav/gitleaks/v8@v8.24.3
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
       # Always the full history, never the push's base..head range. The
       # gitleaks action derives that range from the push payload, and after a
