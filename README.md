@@ -93,6 +93,9 @@ Postgres. Run it with `make run-local`.
 | `media` | Object storage and image derivatives, local filesystem or Google Cloud Storage |
 | `geocode` | Address to coordinate lookup with a degrade chain, Mapbox or a no-op default |
 | `perf` | Response caching, ETag, gzip, and singleflight middleware for HTTP handlers |
+| `auth` | Authentication composable across local, Firebase and generic OIDC sources; sessions, verification, password reset (`auth/pg` for Postgres) |
+| `admin` | Administrative session auth, a CORS-scoped router, and a helper for keeping admin-only fields out of public responses (`admin/pg` for Postgres) |
+| `textpolicy` | One normalize-then-match guard for generated and forwarded text, with no domain-specific rules of its own |
 
 ## Configuration
 
@@ -128,6 +131,7 @@ configuration and falls back to an in-process default:
 | `jobs` | in-process scheduler | Cloud Run triggers (`jobs/cloudrun`) |
 | `media` | local filesystem (`LocalStore`) | Google Cloud Storage (`GCSStore`) |
 | `geocode` | `NoopProvider` — reports no result rather than a fabricated one | Mapbox |
+| `auth` | `local` — email, password, verification, reset, sessions, all in-memory (`auth/pg` for Postgres) | `firebase` (ID tokens), `oidc` (any issuer) |
 
 ## Testing
 

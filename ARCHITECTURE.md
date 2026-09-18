@@ -40,6 +40,12 @@ mail/            transactional email
 media/           object storage and image derivatives
 geocode/         address to coordinate lookup
 perf/            response caching, ETag, gzip, and singleflight middleware
+auth/            authentication sources, sessions, tokens
+  pg/              the Postgres-backed user, session and token stores
+textpolicy/      one normalize-then-match guard for generated and forwarded text
+admin/           administrative session auth and a CORS-scoped router
+  pg/              the Postgres-backed admin store
+  cmd/seed/        a runnable command that seeds the first admin account
 scripts/         developer and CI scripts
 deploy/          deployment templates and checks
 examples/
@@ -49,25 +55,22 @@ docs/
   testing.md
 ```
 
-Three packages are planned, with the layout fixed in advance so work on them can
-happen in parallel:
-
-```
-auth/        authentication sources, sessions, tokens
-admin/       administrative endpoints and their auth
-textpolicy/  one guard for generated and forwarded text
-```
-
 ## Import layers
 
 Nothing enforces this at build time, so it is written down. A package may import
 anything strictly below it.
 
 1. **`config`, `log`, `httpx/buildinfo`** — no keel imports at all.
-2. **`httpx`, `pg`, `events`** — may use level 1.
+2. **`httpx`, `pg`, `events`, `textpolicy`** — may use level 1.
 3. **`pg/migrate`, `pg/testdb`, `search`, `mail`, `jobs`, `media`, `geocode`,
    `perf`** — may use levels 1 and 2. Each owns a dependency on something
    outside the process.
+4. **`auth`, `admin`** — may use levels 1 through 3, including each other's
+   level-3 dependencies (`pg`, `httpx`), but not each other: they sit at the
+   same level on purpose, so an admin endpoint can never reach through `auth`
+   for a shortcut around its own session auth, or vice versa. `auth/pg` and
+   `admin/pg` are each their owning package's Postgres-backed store, at the
+   same level as the package that owns them.
 
 `examples/minimal` sits outside the layers and imports whatever it needs.
 
