@@ -8,10 +8,11 @@
 // configuration rather than by a rewrite.
 //
 // What it shows: configuration read and logged safely, a logger every layer
-// reaches, migrations applied from embedded files, an HTTP API with keyset
-// paging and generic errors, liveness and readiness that check the right
-// things, a background job whose result is computed from what it counted, and a
-// shutdown that finishes the requests already in flight.
+// reaches, migrations applied from embedded files, password auth with
+// verification, reset and DB sessions mounted next to the API, an HTTP API
+// with keyset paging and generic errors, liveness and readiness that check
+// the right things, a background job whose result is computed from what it
+// counted, and a shutdown that finishes the requests already in flight.
 package main
 
 import (
@@ -31,6 +32,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/ManavA/keel/auth"
+	authpg "github.com/ManavA/keel/auth/pg"
 	"github.com/ManavA/keel/config"
 	"github.com/ManavA/keel/events"
 	"github.com/ManavA/keel/httpx"
@@ -77,6 +80,13 @@ func run() int {
 		// alert matches nothing.
 		logger = keellog.New(keellog.Options{Cloud: true})
 		slog.SetDefault(logger)
+	} else {
+		// Debug in development only: the mail sender logs verification and
+		// reset links at Debug, which is what makes the signup flow walkable
+		// from the terminal. Those links are credentials, so production stays
+		// at Info where they are never written.
+		logger = keellog.New(keellog.Options{Level: slog.LevelDebug})
+		slog.SetDefault(logger)
 	}
 
 	for _, field := range config.Redacted(&cfg) {
@@ -120,7 +130,17 @@ func run() int {
 
 	notes := NewNotes(pool)
 	bus := events.NewInMemoryBus(events.InMemoryBusOptions{Logger: logger})
-	sender := mail.NewLogSender(mail.LogSenderOptions{Logger: logger})
+	// In development the verification and reset links are logged, so the
+	// signup flow can be walked through from the terminal. Outside
+	// development only the fact of the send is logged: the link is a
+	// credential, and credentials do not belong in production logs.
+	sender := mail.NewLogSender(mail.LogSenderOptions{Logger: logger, LogBodies: cfg.Env == "development"})
+
+	authSvc, err := buildAuthService(ctx, cfg, logger, pool, sender)
+	if err != nil {
+		logger.Error("wire auth", "error", err)
+		return 1
+	}
 
 	// One subscriber, for the side effect that may be missed. The in-memory bus
 	// is at-most-once, which is the right fit for a notification and the wrong
@@ -146,10 +166,10 @@ func run() int {
 		go scheduler.Run(ctx)
 	}
 
-	api := &API{notes: notes, index: index, publisher: bus}
+	api := &API{notes: notes, index: index, publisher: bus, auth: authSvc}
 	srv := httpx.NewServer(httpx.ServerOptions{
 		Addr:            cfg.Addr(),
-		Handler:         newRouter(cfg, logger, api, pool, index),
+		Handler:         newRouter(cfg, logger, api, authSvc, pool, index),
 		ShutdownTimeout: cfg.ShutdownTimeout,
 		Logger:          logger,
 	})
@@ -162,7 +182,7 @@ func run() int {
 	return 0
 }
 
-func newRouter(cfg Config, logger *slog.Logger, api *API, pool *pgxpool.Pool, index search.Index) chi.Router {
+func newRouter(cfg Config, logger *slog.Logger, api *API, authSvc *auth.Service, pool *pgxpool.Pool, index search.Index) chi.Router {
 	r := httpx.NewRouter(httpx.RouterOptions{
 		Logger: logger,
 		RealIP: middleware.RealIPOptions{TrustedProxies: cfg.TrustedProxies},
@@ -192,6 +212,12 @@ func newRouter(cfg Config, logger *slog.Logger, api *API, pool *pgxpool.Pool, in
 		ExposeCheckErrors: false,
 	}))
 
+	// The auth package owns its routes; they live under /auth so the example
+	// stays one service with two concerns rather than two services. chi's
+	// Mount does not strip the prefix, so StripPrefix does — the auth
+	// package's own doc comment calls for exactly this.
+	r.Mount("/auth", http.StripPrefix("/auth", authSvc.Router()))
+
 	api.Routes(r)
 	return r
 }
@@ -199,13 +225,23 @@ func newRouter(cfg Config, logger *slog.Logger, api *API, pool *pgxpool.Pool, in
 // applyMigrations runs the embedded migrations, tolerating checksum drift
 // because a branch under development edits its own migrations constantly. A
 // deployment that wants drift to stop the rollout drops the errors.Is check.
+//
+// The auth package's tables go first: everything the example stores about an
+// account assumes they exist. Both runs share the ledger table, so each file
+// is still applied exactly once.
 func applyMigrations(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) error {
+	if err := applyMigrationFS(ctx, pool, logger, authpg.MigrationsFS, "migrations"); err != nil {
+		return err
+	}
 	sub, err := fs.Sub(migrationFiles, "migrations")
 	if err != nil {
 		return err
 	}
+	return applyMigrationFS(ctx, pool, logger, sub, "")
+}
 
-	result, err := migrate.Run(ctx, pool, migrate.Options{FS: sub, Logger: logger})
+func applyMigrationFS(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, fsys fs.FS, dir string) error {
+	result, err := migrate.Run(ctx, pool, migrate.Options{FS: fsys, Dir: dir, Logger: logger})
 	if err != nil && !errors.Is(err, migrate.ErrChecksumDrift) {
 		return err
 	}
