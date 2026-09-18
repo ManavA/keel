@@ -3,8 +3,7 @@
 ## Package independence
 
 Every package is usable on its own. A package may depend on the standard
-library, on third-party libraries, and on keel packages below it in the layering
-below. It may not depend on a sibling at the same level.
+library, on third-party libraries, and on keel packages below it in the layering. It may not depend on a sibling at the same level.
 
 There is no root package. Importing `github.com/ManavA/keel` gets you nothing,
 because nothing is declared there.
@@ -118,9 +117,9 @@ every request.
 
 ## Scope
 
-keel is not a framework and not a data layer. There is no lifecycle to adopt and
-no plugin registry. `pg` provides a pool, a transaction helper and paging;
-queries and repositories belong to the service.
+keel is a set of packages with no lifecycle to adopt and no plugin registry.
+`pg` provides a pool, a transaction helper and paging; queries and repositories
+belong to the service.
 
 Some things were considered and left out:
 

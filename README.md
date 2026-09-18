@@ -16,7 +16,7 @@ Go 1.26 or later. Docker is needed only by `pg/testdb`.
 
 ## Quick start
 
-A service needing Postgres and nothing else:
+A service that uses Postgres and nothing else:
 
 ```go
 package main
@@ -133,20 +133,9 @@ configuration and falls back to an in-process default:
 | `events` | in-memory bus (`InMemoryBus`) | Cloud Pub/Sub (`events/pubsub`) |
 | `jobs` | in-process scheduler | Cloud Run triggers (`jobs/cloudrun`) |
 | `media` | local filesystem (`LocalStore`) | Google Cloud Storage (`GCSStore`) |
-| `geocode` | `NoopProvider` — reports no result rather than a fabricated one | Mapbox |
+| `geocode` | `NoopProvider` returns nil when it has no result | Mapbox |
 | `auth` | `local` — email, password, verification, reset, sessions, all in-memory (`auth/pg` for Postgres) | `firebase` (ID tokens), `oidc` (any issuer) |
 | `idempotency` | in-memory (`MemoryStore`) | Postgres (`idempotency/pg`) |
-
-## Testing
-
-```
-make test               # everything that needs no Docker
-make test-db            # database-backed packages, Docker required
-make migrations-check   # replay every migrations directory in the module
-```
-
-`pg/testdb` starts a real Postgres in Docker for tests. `KEEL_REQUIRE_DB=1`
-turns a missing Docker from a skip into a failure. See `docs/testing.md`.
 
 ## Deployment
 
@@ -160,7 +149,16 @@ shutdown, pool sizing and build identification.
 ## Contributing
 
 See `CONTRIBUTING.md`. `ARCHITECTURE.md` describes the package layout and the
-import rules.
+import rules. Tests run with:
+
+```
+make test               # everything that needs no Docker
+make test-db            # database-backed packages, Docker required
+make migrations-check   # replay every migrations directory in the module
+```
+
+`pg/testdb` starts a real Postgres in Docker for tests. `KEEL_REQUIRE_DB=1`
+turns a missing Docker from a skip into a failure. See `docs/testing.md`.
 
 ## License
 
