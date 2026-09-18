@@ -7,9 +7,6 @@ on:
 
 permissions:
   contents: read
-  # gitleaks-action reads the pull request's commit list to work out the range
-  # to scan, so contents:read alone fails it with 403 on every PR.
-  pull-requests: read
 
 env:
   GO_VERSION: "1.26"
@@ -107,9 +104,27 @@ jobs:
           # gitleaks scans history, and a shallow clone silently scans almost
           # none of it — the job would pass by having nothing to look at.
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # Pinned so every run scans with the same rules. Installed from source
+      # through the module proxy, so the build is checksum-verified.
+      - name: Install gitleaks
+        run: |
+          go install github.com/gitleaks/gitleaks/v8@v8.24.3
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+      # Always the full history, never the push's base..head range. The
+      # gitleaks action derives that range from the push payload, and after a
+      # force-push the range does not resolve (its base is the new root, which
+      # has no parent): gitleaks then scans zero bytes and fails the job. A
+      # full scan has no range to resolve, fails on leaks, and fails when the
+      # scan itself errors, so the gate stays closed in every failure mode.
+      - name: Scan full history
+        run: |
+          # A scan of an empty clone reports no leaks and exits 0. The
+          # checkout above always provides history; refuse to pass without it.
+          test "$(git rev-list --count HEAD)" -gt 0
+          gitleaks detect --source . --config .gitleaks.toml --verbose --exit-code=1
 
   deploy-scripts:
     runs-on: ubuntu-latest
