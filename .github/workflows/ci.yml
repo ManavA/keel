@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: read
+  # gitleaks-action reads the pull request's commit list to work out the range
+  # to scan, so contents:read alone fails it with 403 on every PR.
+  pull-requests: read
 
 env:
   GO_VERSION: "1.25"
