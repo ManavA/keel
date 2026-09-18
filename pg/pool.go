@@ -2,7 +2,8 @@
 // configured pgx pool, a transaction helper, and paging that does not silently
 // ignore the caller.
 //
-// It is not a query builder and not an ORM. Repositories are yours.
+// It stops at the pool, transactions, and paging. Queries and repositories
+// belong to the service.
 package pg
 
 import (

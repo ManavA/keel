@@ -121,7 +121,6 @@ func (p *PostgresIndex) EnsureSchema(ctx context.Context) error {
 	return nil
 }
 
-// Health pings the connection.
 func (p *PostgresIndex) Health(ctx context.Context) error {
 	return p.conn.Ping(ctx)
 }

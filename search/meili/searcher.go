@@ -245,8 +245,7 @@ func (s *Searcher) RemoveDocuments(ctx context.Context, ids []string) error {
 	return nil
 }
 
-// PruneStale removes every indexed document whose id is not in keep, and
-// returns how many it deleted.
+// PruneStale removes every indexed document whose id is not in keep.
 //
 // A sync path that only ever ADDS documents leaves behind every document
 // that later stops qualifying — deleted upstream, expired, opted out —
