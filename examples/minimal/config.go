@@ -5,17 +5,18 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/ManavA/keel/app"
 )
 
 // Config is everything this service reads from its environment.
 //
-// Only DATABASE_URL is required, which is what lets the service come up under a
-// compose file holding an app and a Postgres and nothing else.
+// The lifecycle-owned settings — PORT, DATABASE_URL and the rest — come from
+// the embedded app.Config. Only DATABASE_URL is required, which is what lets
+// the service come up under a compose file holding an app and a database and
+// nothing else.
 type Config struct {
-	Port int    `envconfig:"PORT" default:"8080"`
-	Env  string `envconfig:"ENV" default:"development"`
-
-	DatabaseURL string `envconfig:"DATABASE_URL" required:"true"`
+	app.Config
 
 	// Convenient for one instance and wrong for several: there is no advisory
 	// lock, so two instances starting at once can both reach the same pending
@@ -33,6 +34,7 @@ type Config struct {
 	// Read even though only "local" works without further configuration, so a
 	// deployment can be written against the variable and is refused rather
 	// than ignored when it names something this build cannot do.
+
 	AuthSources []string `envconfig:"AUTH_SOURCES" default:"local"`
 
 	// Base URL used to build the verification and password-reset links mailed
@@ -66,14 +68,6 @@ type Config struct {
 	// How often the search index is rebuilt from the notes table. Zero disables
 	// the job.
 	ReconcileInterval time.Duration `envconfig:"RECONCILE_INTERVAL" default:"15m"`
-
-	// Keep under the platform's own termination grace period, or the platform
-	// kills the shutdown partway through.
-	ShutdownTimeout time.Duration `envconfig:"SHUTDOWN_TIMEOUT" default:"20s"`
-
-	// Every prober and load balancer polls on its own schedule, and without a
-	// cache all of it reaches the database.
-	ReadinessCacheTTL time.Duration `envconfig:"READINESS_CACHE_TTL" default:"5s"`
 }
 
 var supportedAuthSources = []string{"local", "firebase", "oidc"}
@@ -82,8 +76,8 @@ var supportedAuthSources = []string{"local", "firebase", "oidc"}
 // honour stops the process at startup rather than at the first request that
 // needs it.
 func (c *Config) Validate() error {
-	if c.Port < 1 || c.Port > 65535 {
-		return fmt.Errorf("PORT must be between 1 and 65535, got %d", c.Port)
+	if err := c.Config.Validate(); err != nil {
+		return err
 	}
 	for _, source := range c.AuthSources {
 		if !slices.Contains(supportedAuthSources, source) {
@@ -109,7 +103,3 @@ func (c *Config) Validate() error {
 	}
 	return nil
 }
-
-// Addr binds every interface: binding 127.0.0.1 inside a container makes the
-// service unreachable from outside it, with nothing in the logs to say why.
-func (c *Config) Addr() string { return fmt.Sprintf(":%d", c.Port) }

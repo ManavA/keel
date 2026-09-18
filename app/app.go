@@ -321,10 +321,7 @@ func (a *App) Open(ctx context.Context) error {
 	a.schedule = scheduler
 	a.haveJobs = len(a.opts.Jobs) > 0
 
-	addr := a.opts.Addr
-	if addr == "" {
-		addr = ":8080"
-	}
+	addr := defaultAddr(a.opts.Addr)
 	a.server = httpx.NewServer(httpx.ServerOptions{
 		Addr:            addr,
 		Handler:         r,
@@ -348,10 +345,32 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.Open(ctx); err != nil {
 		return err
 	}
-	if a.haveJobs {
-		go a.schedule.Run(ctx)
+	if !a.haveJobs {
+		return a.server.ListenAndServe(ctx)
 	}
-	return a.server.ListenAndServe(ctx)
+	schedDone := make(chan struct{})
+	go func() {
+		defer close(schedDone)
+		a.schedule.Run(ctx)
+	}()
+	err := a.server.ListenAndServe(ctx)
+	// The scheduler stops when ctx is cancelled, but a job already running
+	// keeps going until it finishes. Wait for it, so Close does not release
+	// the pool from under a running job — bounded by ShutdownTimeout, so a
+	// hung job still cannot hold shutdown open past the platform's grace
+	// period.
+	timeout := a.opts.ShutdownTimeout
+	if timeout <= 0 {
+		timeout = httpx.DefaultShutdownTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-schedDone:
+	case <-timer.C:
+		a.logger.Warn("shutdown timed out waiting for jobs, continuing without them")
+	}
+	return err
 }
 
 // Close releases the pool. Safe to call before Open and more than once.
@@ -372,6 +391,16 @@ func (a *App) requestLogSkip() func(*http.Request) bool {
 	return func(r *http.Request) bool {
 		return r.URL.Path == "/healthz" || r.URL.Path == "/readyz"
 	}
+}
+
+// defaultAddr is the listen address: an explicit Addr, or ":8080", which
+// binds every interface. Binding 127.0.0.1 inside a container makes the
+// service unreachable from outside it, with nothing in the logs to say why.
+func defaultAddr(addr string) string {
+	if addr == "" {
+		return ":8080"
+	}
+	return addr
 }
 
 // corsOptions selects the policy: configured origins, or nothing. An empty

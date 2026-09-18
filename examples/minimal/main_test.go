@@ -19,7 +19,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ManavA/keel/app"
+	authpg "github.com/ManavA/keel/auth/pg"
 	"github.com/ManavA/keel/events"
+	"github.com/ManavA/keel/httpx"
 	keellog "github.com/ManavA/keel/log"
 	mailtesting "github.com/ManavA/keel/mail/testing"
 	"github.com/ManavA/keel/pg"
@@ -36,10 +39,11 @@ func TestMain(m *testing.M) {
 	os.Exit(testdb.RunMain(m, testdb.Options{}))
 }
 
-// testService is the example the way run() builds it, wrapped in an httptest
-// server with its own schema so tests do not collide. mail captures every
-// verification and reset link instead of logging it, so the auth flows can be
-// walked end to end without an inbox.
+// testService is the example the way run() builds it — an app holding the
+// pool, migrations, routes and checks, with auth mounted — wrapped in an
+// httptest server with its own schema so tests do not collide. mail captures
+// every verification and reset link instead of logging it, so the auth flows
+// can be walked end to end without an inbox.
 type testService struct {
 	srv  *httptest.Server
 	pool *pgxpool.Pool
@@ -66,15 +70,36 @@ func newTestServer(t *testing.T) *testService {
 	require.NoError(t, err)
 	admin.Close()
 
-	pool, err := pg.Open(ctx, pg.Options{URL: db.URL + "&search_path=" + schema})
-	require.NoError(t, err)
-
 	// The same migrations run() applies, auth tables first: a drift between
 	// what the binary migrates and what the tests migrate would go green here
 	// and fail there.
-	require.NoError(t, applyMigrations(ctx, pool, slog.Default()))
+	//
+	// Routes are registered after Open, not in the options: api.Routes needs
+	// the auth service for its session middleware, and the auth service needs
+	// the pool, which only exists after Open.
+	api := &API{}
+	var index search.Index
 
-	index := search.NewPostgresIndex(search.PostgresIndexOptions{
+	a := app.New(app.Options{
+		Logger:      slog.Default(),
+		DatabaseURL: db.URL + "&search_path=" + schema,
+		Migrations: []app.MigrationSource{
+			{FS: authpg.MigrationsFS, Dir: "migrations"},
+			{FS: migrationFiles, Dir: "migrations"},
+		},
+		Checks: map[string]httpx.Check{
+			"search": func(ctx context.Context) error { return index.Health(ctx) },
+		},
+		// A tiny readiness cache so a test can observe a dependency going away.
+		// The default is five seconds, which is right in production and too slow
+		// to assert against.
+		ReadinessCacheTTL: time.Millisecond,
+	})
+	require.NoError(t, a.Open(ctx))
+	t.Cleanup(a.Close)
+
+	pool := a.Pool()
+	pgIndex := search.NewPostgresIndex(search.PostgresIndexOptions{
 		Pool: pool,
 		Config: search.PostgresConfig{
 			Table:            searchTable,
@@ -82,18 +107,19 @@ func newTestServer(t *testing.T) *testService {
 			TextSearchConfig: "english",
 		},
 	})
-	require.NoError(t, index.EnsureSchema(ctx))
+	require.NoError(t, pgIndex.EnsureSchema(ctx))
+	index = pgIndex
 
 	recorder := mailtesting.New()
-	// A tiny readiness cache so a test can observe a dependency going away.
-	// The default is five seconds, which is right in production and too slow
-	// to assert against. The auth rate limit is generous for the same reason:
-	// production's 15 requests a minute is right for a login route and wrong
-	// for a test that signs up several accounts.
+	// The auth rate limit is generous: production's 15 requests a minute is
+	// right for a login route and wrong for a test that signs up several
+	// accounts.
 	cfg := Config{
-		Port:                  8080,
-		Env:                   "development",
-		ReadinessCacheTTL:     time.Millisecond,
+		Config: app.Config{
+			Port:              8080,
+			Env:               "development",
+			ReadinessCacheTTL: time.Millisecond,
+		},
 		SiteURL:               "http://example.com",
 		AuthRateLimitRequests: 10000,
 		AuthRateLimitWindow:   time.Minute,
@@ -101,8 +127,17 @@ func newTestServer(t *testing.T) *testService {
 	authSvc, err := buildAuthService(ctx, cfg, slog.Default(), pool, recorder)
 	require.NoError(t, err)
 
-	api := &API{notes: NewNotes(pool), index: index, publisher: events.NewNoopPublisher(), auth: authSvc}
-	srv := httptest.NewServer(newRouter(cfg, slog.Default(), api, authSvc, pool, index))
+	api.notes = NewNotes(pool)
+	api.index = index
+	api.publisher = events.NewNoopPublisher()
+	api.auth = authSvc
+	api.Routes(a.Router())
+
+	// The auth package owns its routes; they live under /auth the way run()
+	// mounts them.
+	a.Router().Mount("/auth", http.StripPrefix("/auth", authSvc.Router()))
+
+	srv := httptest.NewServer(a.Router())
 
 	ts := &testService{srv: srv, pool: pool, mail: recorder}
 	t.Cleanup(ts.close)
@@ -621,25 +656,25 @@ func TestAuthSourcesRefuseTheUnconfigured(t *testing.T) {
 		name string
 		cfg  Config
 	}{
-		{"firebase without a project", Config{AuthSources: []string{"firebase"}, Port: 8080, SiteURL: "http://example.com"}},
-		{"oidc without an issuer", Config{AuthSources: []string{"oidc"}, OIDCAudience: "aud", Port: 8080, SiteURL: "http://example.com"}},
-		{"oidc without an audience", Config{AuthSources: []string{"oidc"}, OIDCIssuerURL: "https://issuer.example.com", Port: 8080, SiteURL: "http://example.com"}},
+		{"firebase without a project", Config{AuthSources: []string{"firebase"}, Config: app.Config{Port: 8080}, SiteURL: "http://example.com"}},
+		{"oidc without an issuer", Config{AuthSources: []string{"oidc"}, OIDCAudience: "aud", Config: app.Config{Port: 8080}, SiteURL: "http://example.com"}},
+		{"oidc without an audience", Config{AuthSources: []string{"oidc"}, OIDCIssuerURL: "https://issuer.example.com", Config: app.Config{Port: 8080}, SiteURL: "http://example.com"}},
 		{"firebase and oidc together", Config{
 			AuthSources:       []string{"firebase", "oidc"},
 			FirebaseProjectID: "proj",
 			OIDCIssuerURL:     "https://issuer.example.com",
 			OIDCAudience:      "aud",
-			Port:              8080,
+			Config:            app.Config{Port: 8080},
 			SiteURL:           "http://example.com",
 		}},
-		{"an unknown source", Config{AuthSources: []string{"magic"}, Port: 8080, SiteURL: "http://example.com"}},
+		{"an unknown source", Config{AuthSources: []string{"magic"}, Config: app.Config{Port: 8080}, SiteURL: "http://example.com"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Error(t, tt.cfg.Validate())
 		})
 	}
 
-	valid := Config{AuthSources: []string{"local"}, SiteURL: "http://example.com", Port: 8080}
+	valid := Config{AuthSources: []string{"local"}, SiteURL: "http://example.com", Config: app.Config{Port: 8080}}
 	assert.NoError(t, valid.Validate())
 }
 

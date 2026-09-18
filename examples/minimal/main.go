@@ -8,11 +8,12 @@
 // configuration rather than by a rewrite.
 //
 // What it shows: configuration read and logged safely, a logger every layer
-// reaches, migrations applied from embedded files, password auth with
-// verification, reset and DB sessions mounted next to the API, an HTTP API
-// with keyset paging and generic errors, liveness and readiness that check
-// the right things, a background job whose result is computed from what it
-// counted, and a shutdown that finishes the requests already in flight.
+// reaches, an app holding the pool, migrations, routes, checks and jobs,
+// password auth with verification, reset and DB sessions mounted next to the
+// API, an HTTP API with keyset paging and generic errors, liveness and
+// readiness that check the right things, a background job whose result is
+// computed from what it counted, and a shutdown that finishes the requests
+// already in flight.
 package main
 
 import (
@@ -20,29 +21,21 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/ManavA/keel/auth"
+	"github.com/ManavA/keel/app"
 	authpg "github.com/ManavA/keel/auth/pg"
 	"github.com/ManavA/keel/config"
 	"github.com/ManavA/keel/events"
 	"github.com/ManavA/keel/httpx"
-	"github.com/ManavA/keel/httpx/middleware"
 	"github.com/ManavA/keel/jobs"
 	keellog "github.com/ManavA/keel/log"
 	"github.com/ManavA/keel/mail"
-	"github.com/ManavA/keel/pg"
-	"github.com/ManavA/keel/pg/migrate"
 	"github.com/ManavA/keel/search"
 )
 
@@ -74,7 +67,7 @@ func run() int {
 	}
 
 	cfg.Env = strings.TrimSpace(cfg.Env)
-	if cfg.Env != "development" {
+	if cfg.Cloud() {
 		// Cloud Logging reads a "severity" field and ignores slog's "level",
 		// so without this every entry is DEFAULT severity and a severity-based
 		// alert matches nothing.
@@ -98,21 +91,59 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := pg.Open(ctx, pg.Options{URL: cfg.DatabaseURL, Logger: logger})
-	if err != nil {
-		logger.Error("open database", "error", err)
-		return 1
-	}
-	defer pool.Close()
+	// The API and the index hold what the handlers and the job need, filled
+	// in after Open: the pool only exists then, while Checks and Jobs are
+	// registered on the options before it. The closures below read these
+	// variables when they run — requests and job ticks happen after the
+	// wiring — never when they are registered.
+	//
+	// Routes are registered after Open too, on the app's router: api.Routes
+	// requires the auth service for its session middleware, and the auth
+	// service needs the pool, which only exists after Open.
+	api := &API{}
+	var index search.Index
+	var notes *Notes
 
+	opts := app.Options{
+		Logger:            logger,
+		Addr:              cfg.Addr(),
+		DatabaseURL:       cfg.DatabaseURL,
+		TrustedProxies:    cfg.TrustedProxies,
+		CORSOrigins:       cfg.CORSOrigins,
+		ShutdownTimeout:   cfg.ShutdownTimeout,
+		ReadinessCacheTTL: cfg.ReadinessCacheTTL,
+		Checks: map[string]httpx.Check{
+			"search": func(ctx context.Context) error { return index.Health(ctx) },
+		},
+	}
 	if cfg.MigrateOnStart {
-		if err := applyMigrations(ctx, pool, logger); err != nil {
-			logger.Error("apply migrations", "error", err)
-			return 1
+		// The auth package's tables go first: everything the example stores
+		// about an account assumes they exist. Both sources share the ledger
+		// table, so each file is still applied exactly once.
+		opts.Migrations = []app.MigrationSource{
+			{FS: authpg.MigrationsFS, Dir: "migrations"},
+			{FS: migrationFiles, Dir: "migrations"},
 		}
 	}
+	if cfg.ReconcileInterval > 0 {
+		opts.Jobs = []jobs.Entry{{
+			Name:     "reconcile-search-index",
+			Interval: cfg.ReconcileInterval,
+			Func: func(ctx context.Context) (jobs.Outcome, error) {
+				return reconcileSearchIndex(notes, index)(ctx)
+			},
+		}}
+	}
 
-	index := search.NewPostgresIndex(search.PostgresIndexOptions{
+	a := app.New(opts)
+	if err := a.Open(ctx); err != nil {
+		logger.Error("open app", "error", err)
+		return 1
+	}
+	defer a.Close()
+
+	pool := a.Pool()
+	pgIndex := search.NewPostgresIndex(search.PostgresIndexOptions{
 		Pool: pool,
 		Config: search.PostgresConfig{
 			Table:            searchTable,
@@ -123,12 +154,13 @@ func run() int {
 	})
 	// Creates the table and its index if they are absent, and does nothing
 	// otherwise, so it is safe on every start.
-	if err := index.EnsureSchema(ctx); err != nil {
+	if err := pgIndex.EnsureSchema(ctx); err != nil {
 		logger.Error("prepare search index", "error", err)
 		return 1
 	}
+	index = pgIndex
 
-	notes := NewNotes(pool)
+	notes = NewNotes(pool)
 	bus := events.NewInMemoryBus(events.InMemoryBusOptions{Logger: logger})
 	// In development the verification and reset links are logged, so the
 	// signup flow can be walked through from the terminal. Outside
@@ -142,6 +174,18 @@ func run() int {
 		return 1
 	}
 
+	api.notes = notes
+	api.index = index
+	api.publisher = bus
+	api.auth = authSvc
+	api.Routes(a.Router())
+
+	// The auth package owns its routes; they live under /auth so the example
+	// stays one service with two concerns rather than two services. chi's
+	// Mount does not strip the prefix, so StripPrefix does — the auth
+	// package's own doc comment calls for exactly this.
+	a.Router().Mount("/auth", http.StripPrefix("/auth", authSvc.Router()))
+
 	// One subscriber, for the side effect that may be missed. The in-memory bus
 	// is at-most-once, which is the right fit for a notification and the wrong
 	// fit for anything the API's own responses depend on.
@@ -152,105 +196,12 @@ func run() int {
 		}
 	}()
 
-	if cfg.ReconcileInterval > 0 {
-		scheduler := jobs.NewScheduler(jobs.SchedulerOptions{Logger: logger})
-		err := scheduler.Register(jobs.Entry{
-			Name:     "reconcile-search-index",
-			Interval: cfg.ReconcileInterval,
-			Func:     reconcileSearchIndex(notes, index),
-		})
-		if err != nil {
-			logger.Error("register reconcile job", "error", err)
-			return 1
-		}
-		go scheduler.Run(ctx)
-	}
-
-	api := &API{notes: notes, index: index, publisher: bus, auth: authSvc}
-	srv := httpx.NewServer(httpx.ServerOptions{
-		Addr:            cfg.Addr(),
-		Handler:         newRouter(cfg, logger, api, authSvc, pool, index),
-		ShutdownTimeout: cfg.ShutdownTimeout,
-		Logger:          logger,
-	})
-
-	if err := srv.ListenAndServe(ctx); err != nil {
+	if err := a.Run(ctx); err != nil {
 		logger.Error("server stopped", "error", err)
 		return 1
 	}
 	logger.Info("stopped cleanly")
 	return 0
-}
-
-func newRouter(cfg Config, logger *slog.Logger, api *API, authSvc *auth.Service, pool *pgxpool.Pool, index search.Index) chi.Router {
-	r := httpx.NewRouter(httpx.RouterOptions{
-		Logger: logger,
-		RealIP: middleware.RealIPOptions{TrustedProxies: cfg.TrustedProxies},
-		RequestLog: middleware.RequestLogOptions{
-			// The health endpoints are polled continuously and would bury
-			// everything else.
-			Skip: func(r *http.Request) bool {
-				return r.URL.Path == "/healthz" || r.URL.Path == "/readyz"
-			},
-			SlowRequest: time.Second,
-		},
-	})
-
-	if len(cfg.CORSOrigins) > 0 {
-		r.Use(middleware.CORS(middleware.CORSOptions{AllowedOrigins: cfg.CORSOrigins}))
-	}
-
-	r.Mount("/", httpx.Health(httpx.HealthOptions{
-		Logger:   logger,
-		CacheTTL: cfg.ReadinessCacheTTL,
-		Checks: map[string]httpx.Check{
-			"database": pg.HealthCheck(pool),
-			"search":   index.Health,
-		},
-		// The errors name hosts and databases, and this endpoint is reachable
-		// from wherever the service is.
-		ExposeCheckErrors: false,
-	}))
-
-	// The auth package owns its routes; they live under /auth so the example
-	// stays one service with two concerns rather than two services. chi's
-	// Mount does not strip the prefix, so StripPrefix does — the auth
-	// package's own doc comment calls for exactly this.
-	r.Mount("/auth", http.StripPrefix("/auth", authSvc.Router()))
-
-	api.Routes(r)
-	return r
-}
-
-// applyMigrations runs the embedded migrations, tolerating checksum drift
-// because a branch under development edits its own migrations constantly. A
-// deployment that wants drift to stop the rollout drops the errors.Is check.
-//
-// The auth package's tables go first: everything the example stores about an
-// account assumes they exist. Both runs share the ledger table, so each file
-// is still applied exactly once.
-func applyMigrations(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) error {
-	if err := applyMigrationFS(ctx, pool, logger, authpg.MigrationsFS, "migrations"); err != nil {
-		return err
-	}
-	sub, err := fs.Sub(migrationFiles, "migrations")
-	if err != nil {
-		return err
-	}
-	return applyMigrationFS(ctx, pool, logger, sub, "")
-}
-
-func applyMigrationFS(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, fsys fs.FS, dir string) error {
-	result, err := migrate.Run(ctx, pool, migrate.Options{FS: fsys, Dir: dir, Logger: logger})
-	if err != nil && !errors.Is(err, migrate.ErrChecksumDrift) {
-		return err
-	}
-	if len(result.Changed) > 0 {
-		logger.Warn("migrations changed since they were applied",
-			"migrations", result.Changed,
-			"note", "the new content will not run; use migrate.Replay to find out whether it would apply")
-	}
-	return nil
 }
 
 // notifyOnNoteCreated is the subscriber. It sends through whatever Sender was

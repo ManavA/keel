@@ -43,7 +43,9 @@ var testMigrations = fstest.MapFS{
 }
 
 // openTestApp opens an app against the shared database in its own schema, so
-// tests writing rows or ledger entries do not collide.
+// tests writing rows or ledger entries do not collide. It sets only
+// DatabaseURL, the one documented-required field, so every default stays
+// under test; a test needing anything else says so through mutate.
 func openTestApp(t *testing.T, mutate func(*Options)) *App {
 	t.Helper()
 
@@ -58,9 +60,7 @@ func openTestApp(t *testing.T, mutate func(*Options)) *App {
 	adminPool.Close()
 
 	opts := Options{
-		Logger:      slog.Default(),
 		DatabaseURL: db.URL + "&search_path=" + schema,
-		Migrations:  []MigrationSource{{FS: testMigrations, Dir: "migrations"}},
 	}
 	if mutate != nil {
 		mutate(&opts)
@@ -88,6 +88,8 @@ func get(t *testing.T, h http.Handler, path string) (*httptest.ResponseRecorder,
 }
 
 func TestZeroValueStartServesHealth(t *testing.T) {
+	// Only DatabaseURL is set, by the helper: this is the documented zero
+	// value, a working Postgres-only service.
 	a := openTestApp(t, nil)
 
 	rec, _ := get(t, a.Router(), "/healthz")
@@ -96,6 +98,12 @@ func TestZeroValueStartServesHealth(t *testing.T) {
 	rec, raw := get(t, a.Router(), "/readyz")
 	require.Equal(t, http.StatusOK, rec.Code, string(raw))
 	assert.Contains(t, string(raw), `"database":"ok"`)
+}
+
+func TestMigrationsApplyBeforeServing(t *testing.T) {
+	a := openTestApp(t, func(o *Options) {
+		o.Migrations = []MigrationSource{{FS: testMigrations, Dir: "migrations"}}
+	})
 
 	// The migration ran: the ledger and the probe table exist in this schema.
 	var table string
@@ -103,6 +111,36 @@ func TestZeroValueStartServesHealth(t *testing.T) {
 		`select tablename from pg_tables where schemaname = current_schema() and tablename = 'probe'`).Scan(&table)
 	require.NoError(t, err)
 	assert.Equal(t, "probe", table)
+}
+
+func TestDefaultAddrIs8080(t *testing.T) {
+	// Empty Addr binds every interface on 8080: binding 127.0.0.1 inside a
+	// container is unreachable from outside it, so the default must stay the
+	// bare port. A unit test rather than a bind, so it holds on a machine
+	// with 8080 already taken.
+	assert.Equal(t, ":8080", defaultAddr(""))
+	assert.Equal(t, "127.0.0.1:0", defaultAddr("127.0.0.1:0"), "an explicit Addr passes through")
+}
+
+func TestCloseReleasesThePool(t *testing.T) {
+	db := testdb.Shared(t)
+	ctx := context.Background()
+
+	a := New(Options{DatabaseURL: db.URL})
+	require.NoError(t, a.Open(ctx))
+	pool := a.Pool()
+	require.NotNil(t, pool)
+
+	a.Close()
+	assert.Nil(t, a.Pool(), "Close must release the pool")
+	_, err := pool.Acquire(ctx)
+	assert.Error(t, err, "Close must close the pool, not just forget it")
+
+	// Safe before Open and more than once.
+	assert.NotPanics(t, func() {
+		New(Options{}).Close()
+		a.Close()
+	})
 }
 
 func TestGracefulShutdown(t *testing.T) {
@@ -141,6 +179,199 @@ func TestGracefulShutdown(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return after its context was cancelled")
 	}
+}
+
+func TestJobsRunAndDrainOnShutdown(t *testing.T) {
+	// A job in flight when the context is cancelled must finish before Run
+	// returns: Close releases the pool, and returning early would pull the
+	// pool out from under the running job.
+	started := make(chan struct{})
+	finished := make(chan struct{}, 1)
+	a := openTestApp(t, func(o *Options) {
+		o.Addr = "127.0.0.1:0"
+		o.ShutdownTimeout = 10 * time.Second
+		o.Jobs = []jobs.Entry{{
+			Name:     "drain",
+			Interval: time.Hour, // runs once immediately, then never again
+			Func: func(context.Context) (jobs.Outcome, error) {
+				close(started)
+				// Longer than the shutdown sequence takes: without the
+				// drain wait, Run returns while this is still running.
+				time.Sleep(time.Second)
+				finished <- struct{}{}
+				return jobs.Outcome{Attempted: 1, Succeeded: 1}, nil
+			},
+		}}
+	})
+	require.NoError(t, a.Listen())
+	addr := a.Addr()
+	require.NotEmpty(t, addr)
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- a.Run(ctx) }()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		resp, err := http.Get("http://" + addr + "/healthz") //nolint:noctx,bodyclose // a shutdown test, not a handler test
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server never accepted traffic")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The scheduler runs each entry once immediately, so by now the job is
+	// inside its sleep.
+	<-started
+	stop()
+	select {
+	case err := <-runErr:
+		assert.NoError(t, err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("Run did not return after its context was cancelled")
+	}
+	select {
+	case <-finished:
+	default:
+		t.Fatal("Run returned before the in-flight job finished")
+	}
+}
+
+func TestRequestLogSkipDefaultAndOverride(t *testing.T) {
+	a := New(Options{})
+	skip := a.requestLogSkip()
+	require.NotNil(t, skip, "the default must exist: probers poll continuously")
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		assert.True(t, skip(req), "%s must stay out of the request log", path)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/notes", nil)
+	assert.False(t, skip(req), "anything else must still be logged")
+
+	custom := func(*http.Request) bool { return true }
+	a = New(Options{RequestLogSkip: custom})
+	assert.True(t, a.requestLogSkip()(req), "an explicit predicate replaces the default")
+}
+
+func TestCORSDisabledByDefault(t *testing.T) {
+	assert.Nil(t, corsOptions(nil), "no origins must not reach go-chi/cors, which reads empty as every origin")
+	assert.Nil(t, corsOptions([]string{}))
+
+	opts := corsOptions([]string{"https://app.example.com"})
+	require.NotNil(t, opts)
+	assert.Equal(t, []string{"https://app.example.com"}, opts.AllowedOrigins)
+}
+
+func TestReadinessCheckErrorVisibility(t *testing.T) {
+	// A driver error names the host and database, and readiness is reachable
+	// from wherever the service is — so the error text stays out unless the
+	// caller opts in.
+	t.Run("hidden by default", func(t *testing.T) {
+		a := openTestApp(t, func(o *Options) {
+			o.ReadinessCacheTTL = time.Millisecond
+			o.Checks = map[string]httpx.Check{
+				"downstream": func(ctx context.Context) error { return errDownstream },
+			}
+		})
+		rec, raw := get(t, a.Router(), "/readyz")
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code, string(raw))
+		assert.NotContains(t, string(raw), "downstream unreachable")
+	})
+
+	t.Run("exposed when asked", func(t *testing.T) {
+		a := openTestApp(t, func(o *Options) {
+			o.ReadinessCacheTTL = time.Millisecond
+			o.ExposeCheckErrors = true
+			o.Checks = map[string]httpx.Check{
+				"downstream": func(ctx context.Context) error { return errDownstream },
+			}
+		})
+		rec, raw := get(t, a.Router(), "/readyz")
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code, string(raw))
+		assert.Contains(t, string(raw), "downstream unreachable")
+	})
+}
+
+func TestCustomMountPaths(t *testing.T) {
+	svc, err := auth.NewService(auth.Options{})
+	require.NoError(t, err)
+	adminSvc, err := admin.NewService(admin.Options{
+		Users:  admin.NewMemoryAdminStore(),
+		Secret: "test-secret-long-enough",
+	})
+	require.NoError(t, err)
+
+	a := openTestApp(t, func(o *Options) {
+		o.Auth = Mount{Handler: svc.Router(), Path: "/identity"}
+		o.Admin = Mount{Handler: adminSvc.Router(), Path: "/ops"}
+	})
+	srv := httptest.NewServer(a.Router())
+	defer srv.Close()
+
+	// The custom paths reach the handlers: a short password answers 400 from
+	// signup itself, an unknown admin 401 from login.
+	resp, err := http.Post(srv.URL+"/identity/signup", //nolint:noctx // a mount test, not a handler test
+		"application/json", strings.NewReader(`{"email":"a@example.com","password":"x"}`))
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	resp2, err := http.Post(srv.URL+"/ops/login", //nolint:noctx // a mount test, not a handler test
+		"application/json", strings.NewReader(`{"email":"nobody@example.com","password":"wrong-password"}`))
+	require.NoError(t, err)
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp2.StatusCode)
+
+	// The defaults serve nothing now.
+	resp3, err := http.Post(srv.URL+"/auth/signup", //nolint:noctx // a mount test, not a handler test
+		"application/json", strings.NewReader(`{"email":"a@example.com","password":"x"}`))
+	require.NoError(t, err)
+	defer func() { _ = resp3.Body.Close() }()
+	assert.Equal(t, http.StatusNotFound, resp3.StatusCode)
+}
+
+func TestRoutesRegisterAfterMounts(t *testing.T) {
+	// Open registers health, then the mounts, then Routes: everything below
+	// must serve at once, and an unknown path must answer with the router's
+	// JSON 404 rather than a mount's plain-text one.
+	svc, err := auth.NewService(auth.Options{})
+	require.NoError(t, err)
+
+	a := openTestApp(t, func(o *Options) {
+		o.Auth = Mount{Handler: svc.Router()}
+		o.Routes = func(r chi.Router) {
+			r.Get("/api/hello", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte("hello"))
+			})
+		}
+	})
+
+	rec, _ := get(t, a.Router(), "/healthz")
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	rec, _ = get(t, a.Router(), "/api/hello")
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	srv := httptest.NewServer(a.Router())
+	defer srv.Close()
+	resp, err := http.Post(srv.URL+"/auth/signup", //nolint:noctx // a mount test, not a handler test
+		"application/json", strings.NewReader(`{"email":"a@example.com","password":"x"}`))
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	rec, raw := get(t, a.Router(), "/missing")
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Contains(t, string(raw), "request_id")
 }
 
 func TestMiddlewareDefaults(t *testing.T) {

@@ -127,7 +127,8 @@ the request id leads to.
 ## Layout
 
 ```
-main.go        wiring: configuration, logger, pool, migrations, auth, index, router, jobs
+main.go        wiring: configuration, logger, and an app holding the pool,
+               migrations, auth, routes, checks and jobs
 config.go      the environment this service reads, and what it refuses
 auth.go        the auth service: DB-backed local accounts, optional Firebase/OIDC
 notes.go       the notes table, including the keyset page

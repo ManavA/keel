@@ -1,7 +1,7 @@
 # minimal
 
 A notes API built out of keel, wiring config, log, httpx, pg, migrate, search,
-jobs, events and mail. It needs Postgres and nothing else.
+jobs, events, mail and auth. It needs Postgres and nothing else.
 
 ## Running it
 
@@ -19,13 +19,23 @@ DATABASE_URL='postgres://user:pass@localhost:5432/db?sslmode=disable' go run ./e
 ```
 curl -s localhost:8080/readyz
 
-curl -s -X POST localhost:8080/api/notes \
+TOKEN=$(curl -s -X POST localhost:8080/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"password123"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+
+curl -s localhost:8080/api/notes \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"title":"Roof repair quote","body":"Slate tiles, south side"}'
 
-curl -s 'localhost:8080/api/notes?limit=2'
-curl -s 'localhost:8080/api/notes/search?q=tile'
+curl -s 'localhost:8080/api/notes?limit=2' -H "Authorization: Bearer $TOKEN"
+curl -s 'localhost:8080/api/notes/search?q=tile' -H "Authorization: Bearer $TOKEN"
 ```
+
+Every notes request needs the bearer token from signup or login; without one
+the API answers 401. In development the verification link is written to the
+service log, so the signup → verify → login flow can be walked through from
+the terminal (see `SITE_URL` below).
 
 ## Configuration
 
@@ -41,7 +51,15 @@ compose file holding an app and a database.
 | `MIGRATE_ON_START` | `true` | Apply pending migrations before serving |
 | `TRUSTED_PROXIES` | empty | CIDRs of proxies in front; empty ignores forwarding headers |
 | `CORS_ORIGINS` | empty | Browser origins allowed to call the API; empty allows none |
-| `AUTH_SOURCES` | `local` | Refused unless `local` |
+| `AUTH_SOURCES` | `local` | Which auth sources the service accepts: `local`, `firebase`, `oidc` |
+| `SITE_URL` | `http://localhost:8080` | Base URL for the verification and reset links mailed to users |
+| `AUTH_TOKEN_TTL` | auth default (7 days) | How long an issued session token stays valid |
+| `AUTH_RATE_LIMIT_REQUESTS` | auth default (15) | Requests per window allowed per IP on the auth routes |
+| `AUTH_RATE_LIMIT_WINDOW` | auth default (1 minute) | The window those requests are counted in |
+| `FIREBASE_PROJECT_ID` | empty | Required to select the `firebase` source |
+| `OIDC_ISSUER_URL` | empty | Required to select the `oidc` source |
+| `OIDC_AUDIENCE` | empty | Required to select the `oidc` source |
+| `OIDC_JWKS_URL` | empty | Overrides OIDC discovery when set |
 | `RECONCILE_INTERVAL` | `15m` | How often the search index is rebuilt; `0` disables it |
 | `SHUTDOWN_TIMEOUT` | `20s` | How long a graceful shutdown waits |
 | `READINESS_CACHE_TTL` | `5s` | How long a readiness result is reused |
@@ -49,9 +67,33 @@ compose file holding an app and a database.
 The configuration is logged at startup through `config.Redacted`, so
 `DATABASE_URL` appears with its host intact and its password replaced.
 
-There is no authentication. `AUTH_SOURCES` is read and refuses anything but
-`local`, so a deployment can be written against the variable today and fails
-loudly rather than ignoring a value this build cannot honour.
+## Authentication
+
+The `local` source works with nothing but the database: email and password
+accounts, verification and password-reset links, and opaque sessions whose
+tokens are hashed before they are stored. The auth routes live under `/auth`
+(signup, login, verify-email, forgot/reset-password, resend-verification,
+refresh, logout, delete-account); the auth package's own docs describe each
+one. Verification and reset links go through the same mail sender as the
+note notifications — the log in development, a real provider when one is
+configured — built from `SITE_URL`, which must therefore be reachable from
+an inbox rather than from this process.
+
+`firebase` and `oidc` are selected through `AUTH_SOURCES` and need only
+their settings (`FIREBASE_PROJECT_ID`, or `OIDC_ISSUER_URL` plus
+`OIDC_AUDIENCE`); the two cannot be selected together, because one service
+holds one identity-token verifier. Each composes with `local`: a federated
+sign-in with a verified email links to the existing local account for that
+address instead of opening a second one.
+
+Every note belongs to the account that created it, and every notes query —
+listing, search and all — is scoped to the caller, so one account's notes
+are invisible to another's. Search stays correct because the index carries
+the owner alongside each document and filters on it. One limit is stated
+rather than hidden: the notes table does not hold a foreign key to the auth
+tables (each migrations directory replays on its own in CI, and a constraint
+reaching across directories would fail that replay), so deleting an account
+leaves its notes behind instead of removing them.
 
 ## How the pieces fit
 
@@ -85,8 +127,10 @@ the request id leads to.
 ## Layout
 
 ```
-main.go        wiring: configuration, logger, pool, migrations, index, router, jobs
+main.go        wiring: configuration, logger, and an app holding the pool,
+               migrations, auth, routes, checks and jobs
 config.go      the environment this service reads, and what it refuses
+auth.go        the auth service: DB-backed local accounts, optional Firebase/OIDC
 notes.go       the notes table, including the keyset page
 handlers.go    the HTTP API
 migrations/    embedded, so the binary carries its own schema
