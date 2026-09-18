@@ -19,17 +19,21 @@ type ErrorBody struct {
 	RequestID string `json:"request_id,omitempty"`
 }
 
-// JSON writes v as a JSON response with the given status.
+// JSON writes v as a JSON response with the given status. A nil v writes the
+// status and no body.
 //
 // A nil slice is written as [] rather than null, because `null.length` throws
 // in the browser clients that consume list endpoints.
 func JSON(w http.ResponseWriter, status int, v any) {
+	if v == nil {
+		// No Content-Type: an empty body labelled application/json is what a
+		// strict client rejects.
+		w.WriteHeader(status)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 
-	if v == nil {
-		return
-	}
 	// The status line has already gone out, so the only error Encode can return
 	// now is the client having hung up.
 	_ = json.NewEncoder(w).Encode(normalizeNilSlice(v))
@@ -53,6 +57,10 @@ func NoContent(w http.ResponseWriter) { w.WriteHeader(http.StatusNoContent) }
 // the request id. The caller sees "not found"; the log has the error, the path
 // and the id tying them together.
 //
+// It logs through the logger on the request context, which NewRouter puts there
+// — so a service that configured its own logger, or extra redaction keys, gets
+// them applied here too. Without one it falls back to slog.Default.
+//
 //   - 404, never 403, for an identifier that belongs to someone else. A 403
 //     confirms the record exists, which is what the request was trying to
 //     establish.
@@ -70,7 +78,7 @@ func Error(w http.ResponseWriter, r *http.Request, status int, err error) {
 	if status >= http.StatusInternalServerError {
 		level = slog.LevelError
 	}
-	slog.Default().LogAttrs(r.Context(), level, "request failed",
+	Logger(r.Context()).LogAttrs(r.Context(), level, "request failed",
 		slog.Int("status", status),
 		slog.String("method", r.Method),
 		slog.String("path", r.URL.Path),

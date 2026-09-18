@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/ManavA/keel/log"
@@ -69,6 +71,15 @@ func RequestLog(opts RequestLogOptions) func(http.Handler) http.Handler {
 	}
 }
 
+// credentialParams are query parameter names that carry a single-use
+// credential but do not read as one to log.IsSecretKey: an OAuth "code", the
+// "signature" on a pre-signed URL, a "reset" link's token, a one-time password.
+//
+// They are handled here rather than in log's word list because "code" and
+// "state" are ordinary log attribute names — a status code, a job state — and
+// hiding those would make the request log worse.
+var credentialParams = []string{"code", "signature", "sig", "otp", "reset"}
+
 // RedactQuery renders query parameters with credential-shaped values replaced.
 // Exported for handlers that log a URL of their own.
 func RedactQuery(values url.Values) string {
@@ -77,7 +88,7 @@ func RedactQuery(values url.Values) string {
 	}
 	safe := make(url.Values, len(values))
 	for name, vs := range values {
-		if log.IsSecretKey(name) {
+		if log.IsSecretKey(name) || slices.Contains(credentialParams, strings.ToLower(name)) {
 			safe[name] = []string{log.Placeholder}
 			continue
 		}

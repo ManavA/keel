@@ -61,8 +61,8 @@ func sanitizeRequestID(raw string) string {
 
 func newRequestID() string {
 	var b [12]byte
-	// crypto/rand.Read does not fail on any supported platform; since Go 1.24
-	// it panics rather than returning an error, so there is nothing to handle.
-	rand.Read(b[:]) //nolint:errcheck // documented never to fail
+	// crypto/rand.Read is documented never to fail: since Go 1.24 it panics
+	// rather than returning an error, so there is nothing to handle here.
+	_, _ = rand.Read(b[:]) //nolint:gosec // G104 duplicates errcheck, and the error cannot occur
 	return hex.EncodeToString(b[:])
 }

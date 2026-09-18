@@ -133,3 +133,20 @@ func TestRequired(t *testing.T) {
 		})
 	}
 }
+
+func TestStartPublishesOnLoopbackOnly(t *testing.T) {
+	// The package doc's claim is about the container's binding, and the URL
+	// string says nothing about it: publishing on 0.0.0.0 would leave db.URL
+	// reading 127.0.0.1 while the database is reachable from the network.
+	db := testdb.New(t, testdb.Options{})
+
+	out, err := exec.Command("docker", "port", db.Name, "5432").Output()
+	require.NoError(t, err)
+
+	bindings := strings.Fields(strings.TrimSpace(string(out)))
+	require.NotEmpty(t, bindings, "the container publishes nothing on 5432")
+	for _, binding := range bindings {
+		assert.True(t, strings.HasPrefix(binding, "127.0.0.1:"),
+			"published on %q, which is reachable from outside this machine", binding)
+	}
+}

@@ -7,8 +7,10 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -17,9 +19,13 @@ import (
 
 // Options configures Open. Only URL is required.
 type Options struct {
-	// URL is a Postgres connection string. Settings in the URL are applied
-	// first and the fields below override them, so a deployment can tune the
-	// pool through the environment without a code change.
+	// URL is a Postgres connection string, and must not be empty: libpq's
+	// defaults would otherwise send the service at a local Unix socket and
+	// report a failure that names neither the configuration nor the host.
+	//
+	// Settings in the URL are honoured, and the fields below override them
+	// where set, so a deployment can tune the pool through the environment
+	// without a code change.
 	URL string
 
 	// MaxConns defaults to pgx's own default, the greater of 4 and the number of
@@ -60,6 +66,9 @@ func Open(ctx context.Context, opts Options) (*pgxpool.Pool, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if strings.TrimSpace(opts.URL) == "" {
+		return nil, errors.New("pg: Options.URL is empty")
+	}
 
 	cfg, err := pgxpool.ParseConfig(opts.URL)
 	if err != nil {
@@ -72,9 +81,14 @@ func Open(ctx context.Context, opts Options) (*pgxpool.Pool, error) {
 	if opts.MinConns > 0 {
 		cfg.MinConns = opts.MinConns
 	}
-	cfg.MaxConnLifetime = orDuration(opts.MaxConnLifetime, time.Hour)
-	cfg.MaxConnIdleTime = orDuration(opts.MaxConnIdleTime, 30*time.Minute)
-	cfg.ConnConfig.ConnectTimeout = orDuration(opts.ConnectTimeout, 10*time.Second)
+	// Each of these is applied only when it was asked for, and defaulted only
+	// when neither the caller nor the URL set it. Assigning unconditionally
+	// would overwrite pool_max_conn_lifetime, pool_max_conn_idle_time and
+	// connect_timeout from the connection string, silently, so a deployment
+	// tuning them through the environment would see no effect.
+	cfg.MaxConnLifetime = pick(opts.MaxConnLifetime, cfg.MaxConnLifetime, time.Hour)
+	cfg.MaxConnIdleTime = pick(opts.MaxConnIdleTime, cfg.MaxConnIdleTime, 30*time.Minute)
+	cfg.ConnConfig.ConnectTimeout = pick(opts.ConnectTimeout, cfg.ConnConfig.ConnectTimeout, 10*time.Second)
 	if opts.AfterConnect != nil {
 		cfg.AfterConnect = opts.AfterConnect
 	}
@@ -124,9 +138,15 @@ func ping(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
-func orDuration(v, def time.Duration) time.Duration {
-	if v <= 0 {
+// pick returns the first of the caller's value, the connection string's value
+// and the default that is set.
+func pick(fromOptions, fromURL, def time.Duration) time.Duration {
+	switch {
+	case fromOptions > 0:
+		return fromOptions
+	case fromURL > 0:
+		return fromURL
+	default:
 		return def
 	}
-	return v
 }

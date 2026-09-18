@@ -118,7 +118,9 @@ func Start(ctx context.Context, opts Options) (*DB, error) {
 	}
 
 	logf("testdb: starting %s as %s on port %d", image, name, port)
-	run := exec.CommandContext(ctx, "docker", "run", "--detach", "--rm",
+	// The arguments come from Options, which is the caller's own test code, not
+	// from anything a request or a file could reach.
+	run := exec.CommandContext(ctx, "docker", "run", "--detach", "--rm", //nolint:gosec // G204: arguments are the caller's own configuration
 		"--name", name,
 		"--env", "POSTGRES_USER="+user,
 		"--env", "POSTGRES_PASSWORD="+password,

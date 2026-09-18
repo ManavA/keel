@@ -3,6 +3,7 @@ package testdb
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -83,9 +84,18 @@ func RunMain(m *testing.M, opts Options) int {
 
 	code := m.Run()
 	db.Close()
+	return verdict(code, shared.uses.Load(), os.Stderr)
+}
 
-	if code == 0 && shared.uses.Load() == 0 {
-		fmt.Fprintf(os.Stderr,
+// verdict turns the run's exit code and the number of tests that used the
+// database into the code RunMain returns.
+//
+// Separated from RunMain so it can be tested. The guard exists to stop a
+// silently-skipped suite reading as green, and a guard with no test of its own
+// is the thing it is guarding against.
+func verdict(code int, uses int64, stderr io.Writer) int {
+	if code == 0 && uses == 0 {
+		_, _ = fmt.Fprint(stderr,
 			"testdb: FAILED — this package started a database and no test used "+
 				"it, so nothing that needs one was verified.\n")
 		return 1

@@ -3,6 +3,8 @@ version: "2"
 linters:
   enable:
     - bodyclose
+    - errcheck
+    - gosec
     - copyloopvar
     - errorlint
     - goconst

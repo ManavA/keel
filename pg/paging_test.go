@@ -27,8 +27,8 @@ func TestParsePage(t *testing.T) {
 		{"nothing sent takes the defaults", "", pg.Page{Limit: 20}},
 		{"limit", "limit=50", pg.Page{Limit: 50}},
 		{"offset", "limit=10&offset=30", pg.Page{Limit: 10, Offset: 30}},
-		{"page is offset in units of limit", "limit=10&page=3", pg.Page{Limit: 10, Offset: 30}},
-		{"page zero is the first page", "limit=10&page=0", pg.Page{Limit: 10}},
+		{"page one is the first page", "limit=10&page=1", pg.Page{Limit: 10}},
+		{"page is 1-based, in units of limit", "limit=10&page=4", pg.Page{Limit: 10, Offset: 30}},
 		{"surrounding whitespace is tolerated", "limit=%2050%20", pg.Page{Limit: 50}},
 	}
 
@@ -75,6 +75,13 @@ func TestParsePageRejections(t *testing.T) {
 			contains: "page",
 		},
 		{
+			// 1-based, so page=0 is a caller who believes it is 0-based and
+			// would otherwise silently get the first page under a wrong name.
+			name:     "page zero",
+			query:    "limit=10&page=0",
+			contains: `"page" must be a whole number between 1`,
+		},
+		{
 			name:     "a parameter sent twice",
 			query:    "limit=10&limit=50",
 			contains: "sent 2 times",
@@ -97,6 +104,17 @@ func TestParsePageDefaults(t *testing.T) {
 	assert.Equal(t, pg.Page{Limit: 20}, got)
 
 	_, err = pg.ParsePage(query(t, "limit=201"), pg.PageOptions{})
+	assert.Error(t, err)
+}
+
+func TestParsePageClampsTheDefaultToTheCeiling(t *testing.T) {
+	// Serving 500 rows to a caller who sent nothing while refusing limit=500
+	// would be two answers to the same question.
+	got, err := pg.ParsePage(url.Values{}, pg.PageOptions{DefaultLimit: 500, MaxLimit: 200})
+	require.NoError(t, err)
+	assert.Equal(t, 200, got.Limit)
+
+	_, err = pg.ParsePage(query(t, "limit=500"), pg.PageOptions{DefaultLimit: 500, MaxLimit: 200})
 	assert.Error(t, err)
 }
 

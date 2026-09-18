@@ -169,3 +169,20 @@ func TestReadyRespectsAnAlreadyCancelledContext(t *testing.T) {
 	cancel()
 	assert.Error(t, testdb.Ready(ctx, &scripted{startTimes: []time.Time{at(1)}}, 0))
 }
+
+func TestReadyReprobesAfterTheGap(t *testing.T) {
+	// A restart during the gap can break the query as well as move the start
+	// time. Reading the clock alone after the gap would report ready against a
+	// database that is no longer accepting connections.
+	probe := &scripted{
+		accept:     []error{nil, errors.New("gone"), nil},
+		startTimes: []time.Time{at(100)},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, testdb.Ready(ctx, probe, 0))
+	assert.GreaterOrEqual(t, probe.acceptCalls, 3,
+		"ready was declared without re-running the query after the gap")
+}

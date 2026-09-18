@@ -59,8 +59,9 @@ const DefaultTimeout = 30 * time.Second
 // NewRouter returns a chi router with the middleware stack in the order each
 // piece needs.
 //
-//  1. RequestID, so everything after it, including panic recovery, can name the
-//     request.
+//  1. The router's logger onto the request context, then RequestID, so
+//     everything after them — including panic recovery and the response
+//     helpers — can log through the right logger and name the request.
 //  2. GetHead. chi answers HEAD with 405 on a route registered for GET, while
 //     RFC 9110 requires HEAD wherever GET is served; uptime checks and CDNs use
 //     it.
@@ -83,6 +84,9 @@ func NewRouter(opts RouterOptions) *chi.Mux {
 
 	r := chi.NewRouter()
 
+	// First, so that everything below — including the response helpers reached
+	// from a handler — logs through this router's logger.
+	r.Use(withLogger(logger))
 	r.Use(middleware.RequestID(opts.RequestID))
 	r.Use(chimw.GetHead)
 	r.Use(middleware.RealIP(opts.RealIP))

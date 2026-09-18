@@ -20,7 +20,9 @@ type Page struct {
 
 // PageOptions bounds what ParsePage will accept.
 type PageOptions struct {
-	// DefaultLimit is used when the caller sends no limit. Default 20.
+	// DefaultLimit is used when the caller sends no limit. Default 20, and
+	// clamped to MaxLimit: serving 500 rows to a caller who sent nothing while
+	// refusing limit=500 would be two answers to the same question.
 	DefaultLimit int
 
 	// MaxLimit is the largest page this endpoint will serve. Default 200.
@@ -56,6 +58,11 @@ var pagingAliases = map[string]string{
 
 // ParsePage reads limit, offset and page from a query string.
 //
+// `page` is 1-based: page=1 is the first page, and page=0 is an error. The
+// alternative reads as an off-by-one to every caller, and a client asking for
+// the first page and silently getting the second is the failure this function
+// exists to prevent. `offset` is 0-based, as an offset is.
+//
 // A pagination parameter that cannot be acted on is an error, never a silent
 // default. An absent parameter still takes the default, since asking for no
 // particular page is a legitimate request.
@@ -76,6 +83,9 @@ func ParsePage(values url.Values, opts PageOptions) (Page, error) {
 	if maxOffset <= 0 {
 		maxOffset = 1_000_000
 	}
+	if defaultLimit > maxLimit {
+		defaultLimit = maxLimit
+	}
 
 	for _, alias := range sortedAliases() {
 		if _, sent := values[alias]; sent {
@@ -95,7 +105,7 @@ func ParsePage(values url.Values, opts PageOptions) (Page, error) {
 	_, hasPage := values["page"]
 	if hasOffset && hasPage {
 		return Page{}, fmt.Errorf("%w: send either \"offset\" or \"page\", not both — "+
-			"they are two spellings of one position (offset = page * limit), "+
+			"they are two spellings of one position (offset = (page-1) * limit), "+
 			"and honouring one silently discards the other", ErrPaging)
 	}
 
@@ -108,11 +118,11 @@ func ParsePage(values url.Values, opts PageOptions) (Page, error) {
 		}
 		page.Offset = v
 	case hasPage:
-		v, _, err := intParam(values, "page", 0, maxOffset/limit)
+		v, _, err := intParam(values, "page", 1, maxOffset/limit+1)
 		if err != nil {
 			return Page{}, err
 		}
-		page.Offset = v * limit
+		page.Offset = (v - 1) * limit
 	}
 	return page, nil
 }
@@ -193,9 +203,13 @@ type Keyset struct {
 	Limit int
 }
 
-// identifier is what a column name may look like. Postgres has no placeholder
-// for an identifier, so column names are concatenated into SQL and must be
-// checked rather than trusted.
+// identifier is what a column name may look like, optionally table-qualified.
+// Postgres has no placeholder for an identifier, so column names are
+// concatenated into SQL and must be checked rather than trusted.
+//
+// It is a syntax check, not an authorisation one: password_hash matches. A
+// handler that forwards a caller's ?sort= needs its own allowlist of columns
+// that may be ordered on.
 var identifier = regexp.MustCompile(`^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?$`)
 
 // OrderBy renders the ORDER BY clause, without the keywords.

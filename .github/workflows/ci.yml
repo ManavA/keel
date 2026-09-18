@@ -24,6 +24,14 @@ jobs:
       - name: Test
         run: go test -race -count=1 ./...
 
+      # The same suite again with a missing Docker turned into a failure. A
+      # database-backed test that skips itself is indistinguishable from one
+      # that passes, and the runner has Docker, so there is nothing to skip.
+      - name: Database-backed tests
+        env:
+          KEEL_REQUIRE_DB: "1"
+        run: go test -count=1 ./pg/...
+
   lint:
     runs-on: ubuntu-latest
     steps:

@@ -7,10 +7,11 @@ all: fmt test lint vuln
 test:
 	go test ./...
 
-# Database-backed tests. pg/testdb needs Docker; nothing else does.
+# Database-backed tests, with a missing Docker made a failure rather than a
+# skip. pg/testdb needs Docker; nothing else does.
 .PHONY: test-db
 test-db:
-	go test -tags=docker ./pg/...
+	KEEL_REQUIRE_DB=1 go test -count=1 ./pg/...
 
 .PHONY: lint
 lint:

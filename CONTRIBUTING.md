@@ -51,8 +51,9 @@ Where a check could pass without exercising what it names, add the case that
 must fail and confirm you have seen it fail. `pg/testdb`'s readiness tests are
 built this way.
 
-Database-backed tests use `pg/testdb`. They may skip when Docker is unavailable;
-`KEEL_REQUIRE_DB=1` turns the skip into a failure, and CI sets it.
+Database-backed tests use `pg/testdb`. They may skip when Docker is unavailable.
+`KEEL_REQUIRE_DB=1` turns that skip into a failure; `make test-db` sets it, and
+so does the "Database-backed tests" job in `.github/workflows/ci.yml`.
 
 ## Commits
 

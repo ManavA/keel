@@ -83,7 +83,12 @@ func LoadWith(dest any, opts Options) error {
 	}
 
 	if err := envconfig.Process(opts.Prefix, dest); err != nil {
-		return fmt.Errorf("config: read environment: %w", err)
+		// envconfig quotes the offending value in its message, which for a
+		// non-string secret field ("converting 's3cr3t' to type int") puts the
+		// credential in whatever the caller does with the error. The wrapping
+		// is dropped along with it: the text is what leaks, so the text is what
+		// must not be carried forward.
+		return fmt.Errorf("config: read environment: %s", scrubSecrets(err.Error(), v.Elem(), opts.Prefix))
 	}
 
 	trimSecrets(v.Elem())
@@ -96,6 +101,53 @@ func LoadWith(dest any, opts Options) error {
 		}
 	}
 	return nil
+}
+
+// scrubSecrets replaces any secret-shaped environment value that appears in msg
+// with the redaction placeholder.
+//
+// It works from the environment rather than from the struct because the struct
+// field is unset when the parse failed: the value only exists in the variable
+// the message quoted.
+func scrubSecrets(msg string, v reflect.Value, prefix string) string {
+	for _, key := range secretEnvKeys(v, prefix) {
+		if value := os.Getenv(key); value != "" {
+			msg = strings.ReplaceAll(msg, value, Placeholder)
+		}
+	}
+	return msg
+}
+
+// secretEnvKeys lists the environment variables backing secret-shaped fields.
+func secretEnvKeys(v reflect.Value, prefix string) []string {
+	var keys []string
+	t := v.Type()
+	for i := range t.NumField() {
+		field := t.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		fv := v.Field(i)
+		if fv.Kind() == reflect.Pointer && !fv.IsNil() {
+			fv = fv.Elem()
+		}
+		if fv.Kind() == reflect.Struct && fv.Type().PkgPath() != "time" {
+			keys = append(keys, secretEnvKeys(fv, prefix)...)
+			continue
+		}
+		if !isSecretField(field) {
+			continue
+		}
+		name := field.Tag.Get("envconfig")
+		if name == "" {
+			name = strings.ToUpper(field.Name)
+		}
+		if prefix != "" {
+			name = strings.ToUpper(prefix) + "_" + name
+		}
+		keys = append(keys, name, strings.ToUpper(name))
+	}
+	return keys
 }
 
 // trimSecrets strips surrounding whitespace from every string field that holds
@@ -117,6 +169,8 @@ func trimSecrets(v reflect.Value) {
 			trimSecrets(fv.Elem())
 		case fv.Kind() == reflect.Struct:
 			trimSecrets(fv)
+		// Strings only: there is no whitespace to trim off an int or a
+		// duration. Redacted covers the other kinds.
 		case fv.Kind() == reflect.String && (isSecretField(field) || isURLField(field)):
 			fv.SetString(strings.TrimSpace(fv.String()))
 		}
@@ -148,27 +202,18 @@ func isSecretField(f reflect.StructField) bool {
 	return IsSecretName(f.Name) || IsSecretName(f.Tag.Get("envconfig"))
 }
 
-// secretWords are the substrings that make a name look like a credential.
-var secretWords = []string{"secret", "token", "password", "passwd", "credential", "apikey", "api_key", "privatekey", "private_key"}
-
-// IsSecretName reports whether a name — a field name, an environment variable,
-// a log attribute key — looks like it holds a credential. Case and separators
-// are ignored, so SecretKey, SECRET_KEY and secret-key all match.
+// IsSecretName reports whether a name — a field name, an environment variable —
+// looks like it holds a credential. Case and separators are ignored, so
+// SecretKey, SECRET_KEY and secret-key all match, and so does the camelCase
+// spelling.
 //
-// "key" on its own is not on the list: sort keys, cache keys and idempotency
-// keys are worth reading in a log line, and hiding them all to catch API_KEY
-// makes the rule more trouble than it is worth.
+// The rule matches whole segments of the name rather than substrings, so
+// api_key and client_secret are credentials while sort_key, cache_key and
+// tokens_used are not. log.IsSecretKey applies the same rule to log attribute
+// keys, over the same word lists; the two are separate so that neither
+// bottom-layer package imports the other, and identical so a field and the log
+// key named after it are treated alike. TestSecretNameAgreement in each package
+// pins them to the same table.
 func IsSecretName(name string) bool {
-	n := strings.Map(func(r rune) rune {
-		if r == '_' || r == '-' || r == '.' || r == ' ' {
-			return -1
-		}
-		return r
-	}, strings.ToLower(name))
-	for _, w := range secretWords {
-		if strings.Contains(n, strings.ReplaceAll(w, "_", "")) {
-			return true
-		}
-	}
-	return false
+	return isSecretSegments(segments(name))
 }

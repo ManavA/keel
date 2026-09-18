@@ -383,3 +383,137 @@ func TestRecorderReadFromReportsTheError(t *testing.T) {
 
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
 }
+
+func TestCORSZeroValueAllowsNothing(t *testing.T) {
+	// go-chi/cors reads an empty AllowedOrigins as ["*"], so an unset origin
+	// list would otherwise turn a deployment's policy into every origin.
+	h := middleware.CORS(middleware.CORSOptions{})(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Origin", "https://evil.example.com")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code, "the request still reaches the handler")
+	assert.Empty(t, rec.Header().Get("Access-Control-Allow-Origin"),
+		"no origin is allowed, so the browser must get no allow header")
+}
+
+func TestCORSEmptyConfiguredListAllowsNothing(t *testing.T) {
+	h := middleware.CORS(middleware.CORSOptions{
+		AllowedOrigins: []string{},
+		ExposedHeaders: []string{"X-Total-Count"},
+	})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	assert.Empty(t, rec.Header().Get("Access-Control-Allow-Origin"))
+	assert.Empty(t, rec.Header().Get("Access-Control-Expose-Headers"))
+}
+
+func TestCORSRefusesWildcardWithCredentials(t *testing.T) {
+	assert.Panics(t, func() {
+		middleware.CORS(middleware.CORSOptions{
+			AllowedOrigins:   []string{"*"},
+			AllowCredentials: true,
+		})
+	}, "browsers reject this pairing, so it must not be allowed to deploy")
+
+	assert.NotPanics(t, func() {
+		middleware.CORS(middleware.CORSOptions{AllowedOrigins: []string{"*"}})
+	})
+	assert.NotPanics(t, func() {
+		middleware.CORS(middleware.CORSOptions{
+			AllowedOrigins:   []string{"https://app.example.com"},
+			AllowCredentials: true,
+		})
+	})
+}
+
+func TestRateLimitRefusesAConfigurationThatWouldDoNothing(t *testing.T) {
+	// A forgotten Window makes httprate admit everything, which is a limiter
+	// that never says it is not working.
+	tests := []struct {
+		name string
+		opts middleware.RateLimitOptions
+	}{
+		{"nothing set", middleware.RateLimitOptions{}},
+		{"window forgotten", middleware.RateLimitOptions{Requests: 1}},
+		{"requests forgotten", middleware.RateLimitOptions{Window: time.Minute}},
+		{"negative window", middleware.RateLimitOptions{Requests: 1, Window: -time.Second}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Panics(t, func() { middleware.RateLimit(tt.opts) })
+		})
+	}
+
+	assert.NotPanics(t, func() {
+		middleware.RateLimit(middleware.RateLimitOptions{Requests: 1, Window: time.Minute})
+	})
+}
+
+func TestRedactQueryCoversSingleUseCredentials(t *testing.T) {
+	// The spellings the request-log doc claims to cover: an OAuth code, a
+	// pre-signed URL's signature, a reset link, a one-time password.
+	got := middleware.RedactQuery(url.Values{
+		"code":      {"oauth-code"},
+		"signature": {"sig-value"},
+		"sig":       {"short-sig"},
+		"otp":       {"123456"},
+		"reset":     {"reset-token"},
+		"token":     {"bearer-value"},
+		"page":      {"2"},
+		"status":    {"open"},
+	})
+
+	for _, leaked := range []string{"oauth-code", "sig-value", "short-sig", "123456", "reset-token", "bearer-value"} {
+		assert.NotContains(t, got, leaked)
+	}
+	assert.Contains(t, got, "page=2")
+	assert.Contains(t, got, "status=open")
+}
+
+func TestRecorderKeepsTheResponseWriterUsable(t *testing.T) {
+	// A wrapper implementing only ResponseWriter removes streaming, breaks
+	// websocket upgrades and turns io.Copy into a byte-by-byte loop.
+	var (
+		sawFlusher  bool
+		sawHijacker bool
+		deadlineErr error
+	)
+
+	srv := httptest.NewServer(middleware.RequestLog(middleware.RequestLogOptions{
+		Logger: log.New(log.Options{Output: io.Discard}),
+	})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		f, ok := w.(http.Flusher)
+		sawFlusher = ok
+		if ok {
+			_, _ = w.Write([]byte("chunk"))
+			f.Flush()
+		}
+		_, sawHijacker = w.(http.Hijacker)
+		// SetReadDeadline is not on our wrapper, so it can only be reached
+		// through Unwrap.
+		deadlineErr = http.NewResponseController(w).SetReadDeadline(time.Now().Add(time.Minute))
+	})))
+	defer srv.Close()
+
+	resp, err := srv.Client().Get(srv.URL)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	assert.Equal(t, "chunk", string(body))
+	assert.True(t, sawFlusher, "Flush delegation is gone, which breaks streaming responses")
+	assert.True(t, sawHijacker, "Hijack delegation is gone, which breaks websocket upgrades")
+	assert.NoError(t, deadlineErr, "Unwrap is gone, so http.ResponseController cannot reach the real writer")
+}

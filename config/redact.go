@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"reflect"
+	"strings"
 )
 
 // Placeholder is what a redacted value is replaced with.
@@ -48,7 +49,12 @@ func RedactURL(raw string) string {
 		}
 	}
 	u.RawQuery = redactQuery(u.RawQuery)
-	return u.String()
+	// url.String percent-encodes the userinfo and the query, so the placeholder
+	// would appear as %5Bredacted%5D and a search for the documented word would
+	// miss it.
+	return strings.ReplaceAll(
+		strings.ReplaceAll(u.String(), url.PathEscape(Placeholder), Placeholder),
+		url.QueryEscape(Placeholder), Placeholder)
 }
 
 // redactQuery masks the value of any query parameter whose name looks like a
@@ -71,6 +77,32 @@ func redactQuery(rawQuery string) string {
 		}
 	}
 	return values.Encode()
+}
+
+// redactValue hides a secret field's value while still saying whether it is
+// set, and how many entries a collection holds. A count is not a credential and
+// it answers the question a startup log is asked: did the deployment supply
+// these at all.
+func redactValue(v reflect.Value) string {
+	switch v.Kind() {
+	case reflect.String:
+		return Redact(v.String())
+	case reflect.Slice, reflect.Array, reflect.Map:
+		if v.Len() == 0 {
+			return Unset
+		}
+		return fmt.Sprintf("%s (%d entries)", Placeholder, v.Len())
+	case reflect.Pointer, reflect.Interface:
+		if v.IsNil() {
+			return Unset
+		}
+		return redactValue(v.Elem())
+	default:
+		if v.IsZero() {
+			return Unset
+		}
+		return Placeholder
+	}
 }
 
 // Field is one configuration value, ready to log.
@@ -120,10 +152,12 @@ func redactedFields(v reflect.Value, prefix string) []Field {
 			continue
 		}
 
-		secret := fv.Kind() == reflect.String && isSecretField(sf)
 		switch {
-		case secret:
-			out = append(out, Field{Name: name, Value: Redact(fv.String()), Secret: true})
+		case isSecretField(sf):
+			// Whatever the kind. A []string of API keys and a
+			// map[string]string of credentials are both secrets, and requiring
+			// a string field would print them in full.
+			out = append(out, Field{Name: name, Value: redactValue(fv), Secret: true})
 		case fv.Kind() == reflect.String && isURLField(sf):
 			out = append(out, Field{Name: name, Value: RedactURL(fv.String()), Secret: true})
 		default:

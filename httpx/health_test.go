@@ -216,3 +216,83 @@ func TestHealthRejectsNonGET(t *testing.T) {
 }
 
 func init() { slog.SetDefault(log.New(log.Options{Output: io.Discard})) }
+
+func TestReadinessDoesNotCacheADisconnectedProber(t *testing.T) {
+	// A prober that hangs up mid-check makes every check return
+	// context.Canceled. Deriving the check context from the request, and then
+	// caching the result, takes the instance out of rotation for CacheTTL with
+	// a perfectly healthy database.
+	var ran atomic.Int32
+	h := httpx.Health(httpx.HealthOptions{
+		Logger:   log.New(log.Options{Output: io.Discard}),
+		CacheTTL: time.Hour,
+		Checks: map[string]httpx.Check{
+			"database": func(ctx context.Context) error {
+				ran.Add(1)
+				// Fails only if the request's cancellation reached it.
+				return ctx.Err()
+			},
+		},
+	})
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/readyz", nil).WithContext(cancelled))
+	assert.Equal(t, http.StatusOK, first.Code,
+		"the checks must run on a context detached from the request")
+
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	assert.Equal(t, http.StatusOK, second.Code)
+	assert.Equal(t, int32(1), ran.Load(), "a healthy result is still cached")
+}
+
+func TestReadinessDoesNotCacheACancelledCheck(t *testing.T) {
+	// The second guard: a check that reports context.Canceled says nothing
+	// about the dependency, so the answer must not be remembered.
+	var calls atomic.Int32
+	h := httpx.Health(httpx.HealthOptions{
+		Logger:   log.New(log.Options{Output: io.Discard}),
+		CacheTTL: time.Hour,
+		Checks: map[string]httpx.Check{
+			"database": func(context.Context) error {
+				if calls.Add(1) == 1 {
+					return context.Canceled
+				}
+				return nil
+			},
+		},
+	})
+
+	first, _ := get(t, h, "/readyz")
+	assert.Equal(t, http.StatusServiceUnavailable, first.Code)
+
+	second, _ := get(t, h, "/readyz")
+	assert.Equal(t, http.StatusOK, second.Code, "the cancelled result must not have been cached")
+	assert.Equal(t, int32(2), calls.Load())
+}
+
+func TestReadinessCachesARealTimeout(t *testing.T) {
+	// A deadline is evidence about the dependency, unlike a cancellation, so it
+	// is cached like any other failure.
+	var calls atomic.Int32
+	h := httpx.Health(httpx.HealthOptions{
+		Logger:   log.New(log.Options{Output: io.Discard}),
+		CacheTTL: time.Hour,
+		Timeout:  10 * time.Millisecond,
+		Checks: map[string]httpx.Check{
+			"slow": func(ctx context.Context) error {
+				calls.Add(1)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		},
+	})
+
+	first, _ := get(t, h, "/readyz")
+	assert.Equal(t, http.StatusServiceUnavailable, first.Code)
+	second, _ := get(t, h, "/readyz")
+	assert.Equal(t, http.StatusServiceUnavailable, second.Code)
+	assert.Equal(t, int32(1), calls.Load())
+}

@@ -216,3 +216,125 @@ func count(t *testing.T, pool *pgxpool.Pool, table string) int {
 	require.NoError(t, pool.QueryRow(context.Background(), "select count(*) from "+table).Scan(&n))
 	return n
 }
+
+// failingRollbackTx makes Rollback fail so that InTx's joining of the two
+// errors can be observed. There is no way to provoke it from a real
+// transaction that is otherwise behaving.
+type failingRollbackTx struct {
+	pgx.Tx
+	err error
+}
+
+// The real rollback still runs, so the connection goes back to the pool; only
+// the reported outcome is a failure.
+func (t failingRollbackTx) Rollback(ctx context.Context) error {
+	_ = t.Tx.Rollback(ctx)
+	return t.err
+}
+
+type failingRollbackPool struct {
+	*pgxpool.Pool
+	err error
+}
+
+func (p failingRollbackPool) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := p.Pool.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return failingRollbackTx{Tx: tx, err: p.err}, nil
+}
+
+func TestInTxJoinsARollbackFailureToTheOriginalError(t *testing.T) {
+	pool := openPool(t)
+
+	rollbackErr := errors.New("rollback exploded")
+	fnErr := errors.New("the real reason")
+
+	err := pg.InTx(context.Background(), failingRollbackPool{Pool: pool, err: rollbackErr},
+		func(pgx.Tx) error { return fnErr })
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, fnErr, "fn's error is what the caller needs and must survive")
+	assert.ErrorIs(t, err, rollbackErr, "the rollback failure is real and must not be dropped")
+}
+
+func TestInTxDoesNotRollBackAfterACommit(t *testing.T) {
+	// A rollback after a successful commit returns pgx.ErrTxClosed, and
+	// reporting it turns every successful transaction into a failure.
+	pool := openPool(t)
+	table := scratchTable(t, pool)
+
+	err := pg.InTx(context.Background(), failingRollbackPool{Pool: pool, err: errors.New("must not be called")},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(context.Background(), "insert into "+table+" (id) values (1)")
+			return err
+		})
+	require.NoError(t, err)
+	assert.Equal(t, 1, count(t, pool, table))
+}
+
+func TestOpenKeepsPoolSettingsFromTheURL(t *testing.T) {
+	// Assigning the defaults unconditionally overwrites what the connection
+	// string set, so a deployment tuning these through the environment sees no
+	// effect and nothing says why.
+	db := testdb.Shared(t)
+	url := db.URL +
+		"&pool_max_conns=7" +
+		"&pool_max_conn_lifetime=15m" +
+		"&pool_max_conn_idle_time=2m" +
+		"&connect_timeout=25"
+
+	pool, err := pg.Open(context.Background(), pg.Options{URL: url})
+	require.NoError(t, err)
+	defer pool.Close()
+
+	cfg := pool.Config()
+	assert.EqualValues(t, 7, cfg.MaxConns)
+	assert.Equal(t, 15*time.Minute, cfg.MaxConnLifetime)
+	assert.Equal(t, 2*time.Minute, cfg.MaxConnIdleTime)
+	assert.Equal(t, 25*time.Second, cfg.ConnConfig.ConnectTimeout)
+}
+
+func TestOpenOptionsOverrideTheURL(t *testing.T) {
+	db := testdb.Shared(t)
+	url := db.URL + "&pool_max_conn_lifetime=15m&pool_max_conn_idle_time=2m&connect_timeout=25"
+
+	pool, err := pg.Open(context.Background(), pg.Options{
+		URL:             url,
+		MaxConnLifetime: 45 * time.Minute,
+		MaxConnIdleTime: 9 * time.Minute,
+		ConnectTimeout:  3 * time.Second,
+	})
+	require.NoError(t, err)
+	defer pool.Close()
+
+	cfg := pool.Config()
+	assert.Equal(t, 45*time.Minute, cfg.MaxConnLifetime)
+	assert.Equal(t, 9*time.Minute, cfg.MaxConnIdleTime)
+	assert.Equal(t, 3*time.Second, cfg.ConnConfig.ConnectTimeout)
+}
+
+func TestOpenDefaultsWhenNeitherSetsThem(t *testing.T) {
+	db := testdb.Shared(t)
+
+	pool, err := pg.Open(context.Background(), pg.Options{URL: db.URL})
+	require.NoError(t, err)
+	defer pool.Close()
+
+	cfg := pool.Config()
+	assert.Equal(t, time.Hour, cfg.MaxConnLifetime)
+	assert.Equal(t, 30*time.Minute, cfg.MaxConnIdleTime)
+	assert.Equal(t, 10*time.Second, cfg.ConnConfig.ConnectTimeout)
+}
+
+func TestOpenRefusesAnEmptyURL(t *testing.T) {
+	// libpq's defaults would otherwise aim the service at a local Unix socket
+	// and report a failure that names neither the configuration nor the host.
+	_, err := pg.Open(context.Background(), pg.Options{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "URL is empty")
+
+	_, err = pg.Open(context.Background(), pg.Options{URL: "   "})
+	assert.Error(t, err)
+}

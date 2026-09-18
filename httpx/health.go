@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -133,14 +134,17 @@ func (h *healthHandler) ready(w http.ResponseWriter, r *http.Request) {
 
 func (h *healthHandler) evaluate(ctx context.Context) (healthResponse, bool) {
 	h.mu.Lock()
-	if time.Since(h.cachedAt) < h.cacheTTL && !h.cachedAt.IsZero() {
+	if !h.cachedAt.IsZero() && time.Since(h.cachedAt) < h.cacheTTL {
 		resp, ok := h.cached, h.cachedOK
 		h.mu.Unlock()
 		return resp, ok
 	}
 	h.mu.Unlock()
 
-	resp, ok := h.run(ctx)
+	resp, ok, cacheable := h.run(ctx)
+	if !cacheable {
+		return resp, ok
+	}
 
 	h.mu.Lock()
 	h.cached, h.cachedOK, h.cachedAt = resp, ok, time.Now()
@@ -148,12 +152,20 @@ func (h *healthHandler) evaluate(ctx context.Context) (healthResponse, bool) {
 	return resp, ok
 }
 
-func (h *healthHandler) run(ctx context.Context) (healthResponse, bool) {
-	ctx, cancel := context.WithTimeout(ctx, h.timeout)
+// run executes the checks. The result is cacheable unless a check failed
+// because a context was cancelled.
+func (h *healthHandler) run(ctx context.Context) (resp healthResponse, healthy, cacheable bool) {
+	// Detached from the request. Deriving the check context from r.Context()
+	// means one prober hanging up mid-check makes every check return
+	// context.Canceled, and that result is then served from the cache to
+	// healthy probers for the rest of CacheTTL — a client disconnect taking the
+	// instance out of rotation with nothing wrong with it.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), h.timeout)
 	defer cancel()
 
 	results := make(map[string]string, len(h.checks))
-	healthy := true
+	healthy = true
+	cacheable = true
 
 	// Sequential, in name order. Checks are few and cached, and a fixed order
 	// makes the failure log reproducible.
@@ -165,6 +177,11 @@ func (h *healthHandler) run(ctx context.Context) (healthResponse, bool) {
 				results[name] = "down: " + err.Error()
 			}
 			healthy = false
+			// A cancellation says nothing about the dependency, so it must not
+			// be remembered. A deadline does, and is cached like any failure.
+			if errors.Is(err, context.Canceled) {
+				cacheable = false
+			}
 			continue
 		}
 		results[name] = "ok"
@@ -174,7 +191,7 @@ func (h *healthHandler) run(ctx context.Context) (healthResponse, bool) {
 	if !healthy {
 		status = "degraded"
 	}
-	return healthResponse{Status: status, Build: buildinfo.Get(), Checks: results}, healthy
+	return healthResponse{Status: status, Build: buildinfo.Get(), Checks: results}, healthy, cacheable
 }
 
 func sortedKeys(m map[string]Check) []string {

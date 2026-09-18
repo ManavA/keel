@@ -165,7 +165,7 @@ func TestRunReportsAChangedFile(t *testing.T) {
 	edited["002_users_name.up.sql"] += "\n-- edited after it was applied"
 
 	result, err := migrate.Run(ctx, pool, migrate.Options{FS: files(edited)})
-	require.NoError(t, err)
+	require.ErrorIs(t, err, migrate.ErrChecksumDrift)
 	assert.Equal(t, []string{"002_users_name.up.sql"}, result.Changed)
 	assert.Empty(t, result.Applied, "the ledger keys on the name, so the new content does not run")
 }
@@ -222,4 +222,73 @@ func tableExists(t *testing.T, pool *pgxpool.Pool, name string) bool {
 		`select exists (select 1 from information_schema.tables
 		 where table_schema = current_schema() and table_name = $1)`, name).Scan(&exists))
 	return exists
+}
+
+func TestRunWritesNoLedgerRowForAFailedMigration(t *testing.T) {
+	// The file and its ledger row share one transaction. If the file's error
+	// were swallowed inside that transaction, the row would commit and the
+	// migration would be recorded as applied without having run.
+	pool := freshSchema(t)
+	ctx := context.Background()
+
+	_, err := migrate.Run(ctx, pool, migrate.Options{FS: files(map[string]string{
+		"001_bad.up.sql": `create table b (id int references missing_table(id));`,
+	})})
+	require.Error(t, err)
+
+	var rows int
+	require.NoError(t, pool.QueryRow(ctx,
+		"select count(*) from schema_migrations where filename = '001_bad.up.sql'").Scan(&rows))
+	assert.Zero(t, rows, "a migration that failed must not be recorded as applied")
+}
+
+func TestRunReportsChecksumDriftAsAnError(t *testing.T) {
+	// The deploy-time call site is `if _, err := migrate.Run(...); err != nil`,
+	// and it has to be able to tell drift from a clean run.
+	pool := freshSchema(t)
+	ctx := context.Background()
+
+	_, err := migrate.Run(ctx, pool, migrate.Options{FS: files(baseMigrations)})
+	require.NoError(t, err)
+
+	edited := map[string]string{}
+	for name, content := range baseMigrations {
+		edited[name] = content
+	}
+	edited["002_users_name.up.sql"] += "\n-- edited after it was applied"
+
+	result, err := migrate.Run(ctx, pool, migrate.Options{FS: files(edited)})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, migrate.ErrChecksumDrift)
+	assert.Contains(t, err.Error(), "002_users_name.up.sql")
+	assert.Equal(t, []string{"002_users_name.up.sql"}, result.Changed,
+		"the result is still filled in, so a caller that tolerates drift can see what drifted")
+}
+
+func TestLoadRefusesAMixOfPrefixedAndUnprefixedFiles(t *testing.T) {
+	// An unprefixed file sorts wherever the alphabet puts it among the
+	// numbered ones, which is the same hazard as a mixed prefix width.
+	_, err := migrate.Load(files(map[string]string{
+		"001_a.up.sql": "select 1;",
+		"init.up.sql":  "select 2;",
+	}), "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "init.up.sql")
+
+	// The control: all-unprefixed is a consistent, if unusual, convention.
+	_, err = migrate.Load(files(map[string]string{
+		"a.up.sql": "select 1;",
+		"b.up.sql": "select 2;",
+	}), "")
+	assert.NoError(t, err)
+}
+
+func TestRunRefusesAQualifiedLedgerTableName(t *testing.T) {
+	pool := freshSchema(t)
+	_, err := migrate.Run(context.Background(), pool, migrate.Options{
+		FS:    files(baseMigrations),
+		Table: "public.schema_migrations",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a valid table name")
 }

@@ -18,7 +18,8 @@ import (
 // ReplayOptions configures Replay.
 type ReplayOptions struct {
 	// Previous is the migration set as it was at an earlier revision, which is
-	// the state a long-lived development or staging database may be in.
+	// the state a long-lived development or staging database may be in. Nil
+	// means the empty set, which is what a repository's first revision has.
 	Previous    fs.FS
 	PreviousDir string
 
@@ -62,9 +63,15 @@ func Replay(ctx context.Context, db pg.Beginner, opts ReplayOptions) (ReplayResu
 		logger = slog.Default()
 	}
 
-	previous, err := Load(opts.Previous, opts.PreviousDir)
-	if err != nil {
-		return ReplayResult{}, fmt.Errorf("migrate: previous revision: %w", err)
+	// A nil Previous is the empty set, not an error: a repository's first
+	// revision has no earlier migrations to replay from.
+	var previous []File
+	if opts.Previous != nil {
+		var err error
+		previous, err = Load(opts.Previous, opts.PreviousDir)
+		if err != nil {
+			return ReplayResult{}, fmt.Errorf("migrate: previous revision: %w", err)
+		}
 	}
 	current, err := Load(opts.Current, opts.CurrentDir)
 	if err != nil {

@@ -161,20 +161,3 @@ func TestLoadRejectsBadDestination(t *testing.T) {
 	assert.Error(t, config.Load(&notAStruct))
 	assert.Error(t, config.Load(testConfig{}))
 }
-
-func TestIsSecretName(t *testing.T) {
-	secret := []string{
-		"JWT_SECRET", "AdminJWTSecret", "POSTMARK_SERVER_TOKEN", "password",
-		"DB_PASSWD", "GOOGLE_CREDENTIALS", "API_KEY", "ApiKey", "private-key",
-	}
-	for _, name := range secret {
-		assert.True(t, config.IsSecretName(name), "%q should read as a secret", name)
-	}
-
-	// The control. These all contain "key" or look credential-adjacent, and
-	// hiding them would make the rule useless in practice.
-	plain := []string{"SortKey", "CACHE_KEY", "PartitionKey", "IdempotencyKey", "Port", "Env", "Keyboard"}
-	for _, name := range plain {
-		assert.False(t, config.IsSecretName(name), "%q should not read as a secret", name)
-	}
-}

@@ -22,7 +22,8 @@ paging. Queries and repositories are yours.
 ## Every external service is optional
 
 Each package that talks to something outside the process has an in-process
-default, so a project with nothing but Postgres gets a complete backend:
+default, so a project with nothing but Postgres gets a complete backend. These
+land with the packages themselves:
 
 | Package | In-process default | Optional backends |
 |---|---|---|
@@ -44,6 +45,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 
@@ -80,7 +82,10 @@ func main() {
 		Checks: map[string]httpx.Check{"database": pg.HealthCheck(pool)},
 	}))
 
-	srv := httpx.NewServer(httpx.ServerOptions{Addr: ":8080", Handler: r})
+	srv := httpx.NewServer(httpx.ServerOptions{
+		Addr:    fmt.Sprintf(":%d", cfg.Port),
+		Handler: r,
+	})
 	if err := srv.ListenAndServe(ctx); err != nil {
 		slog.Error("server stopped", "error", err)
 		os.Exit(1)
@@ -88,8 +93,8 @@ func main() {
 }
 ```
 
-`examples/minimal` is a runnable version of this with authentication added. It
-runs in two shapes:
+`examples/minimal` will be a runnable version of this with authentication added,
+in two shapes:
 
 ```
 make run-local      # Postgres only
@@ -97,6 +102,8 @@ make run-firebase   # the same app with AUTH_SOURCES=local,firebase
 ```
 
 ## Package map
+
+Available now:
 
 | Package | What it provides |
 |---|---|
@@ -107,6 +114,11 @@ make run-firebase   # the same app with AUTH_SOURCES=local,firebase
 | `pg` | pgx v5 pool, transaction helper, offset and keyset paging |
 | `pg/migrate` | Migration runner with a ledger, and a replay check |
 | `pg/testdb` | Docker Postgres harness for tests |
+
+Planned, and landing on their own branches:
+
+| Package | What it will provide |
+|---|---|
 | `search` | Search over Postgres or Meilisearch |
 | `jobs` | Scheduled and one-shot background work, with run records |
 | `events` | Publish and subscribe, in memory or over Pub/Sub |
@@ -122,9 +134,9 @@ make run-firebase   # the same app with AUTH_SOURCES=local,firebase
 
 ## Documentation
 
-`ARCHITECTURE.md` describes the layout and the import rules. `docs/deploy.md`
-covers running a keel service on a container platform. `docs/testing.md` covers
-the database harness.
+`ARCHITECTURE.md` describes the layout, the import rules, and what was
+deliberately left out of the extraction. `docs/deploy.md` and `docs/testing.md`
+arrive with the remaining packages.
 
 ## Requirements
 

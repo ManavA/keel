@@ -1,6 +1,8 @@
 package httpx_test
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -125,4 +127,33 @@ func TestNotFoundAndUnauthorizedReadDifferently(t *testing.T) {
 	httpx.NotFound(notFound, httptest.NewRequest(http.MethodGet, "/", nil))
 	assert.Equal(t, http.StatusNotFound, notFound.Code)
 	assert.NotEqual(t, http.StatusForbidden, notFound.Code)
+}
+
+func TestJSONNilBodyHasNoContentType(t *testing.T) {
+	// An empty body labelled application/json is what a strict client rejects.
+	rec := httptest.NewRecorder()
+	httpx.JSON(rec, http.StatusAccepted, nil)
+	assert.Empty(t, rec.Header().Get("Content-Type"))
+}
+
+func TestErrorLogsThroughTheContextLogger(t *testing.T) {
+	// ARCHITECTURE.md: a package that logs uses the logger the service
+	// configured. Here that arrives on the request context.
+	var buf bytes.Buffer
+	logger := log.New(log.Options{Output: &buf})
+
+	req := httptest.NewRequest(http.MethodGet, "/thing", nil)
+	req = req.WithContext(httpx.WithLogger(req.Context(), logger))
+	httpx.InternalError(httptest.NewRecorder(), req, errors.New("the reason"))
+
+	assert.Contains(t, buf.String(), "the reason")
+	assert.Contains(t, buf.String(), "/thing")
+}
+
+func TestLoggerFallsBackToDefault(t *testing.T) {
+	assert.NotNil(t, httpx.Logger(context.Background()))
+	assert.NotNil(t, httpx.Logger(nil)) //nolint:staticcheck // a nil context must not panic here
+	logger := log.New(log.Options{Output: io.Discard})
+	assert.Same(t, logger, httpx.Logger(httpx.WithLogger(context.Background(), logger)))
+	assert.NotSame(t, logger, httpx.Logger(httpx.WithLogger(context.Background(), nil)))
 }

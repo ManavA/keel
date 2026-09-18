@@ -214,3 +214,17 @@ func TestLoad(t *testing.T) {
 func TestDownName(t *testing.T) {
 	assert.Equal(t, "001_x.down.sql", migrate.DownName("001_x.up.sql"))
 }
+
+func TestReplayAcceptsANilPreviousRevision(t *testing.T) {
+	// A repository's first revision has no earlier migrations to replay from.
+	pool := freshSchema(t)
+
+	result, err := migrate.Replay(context.Background(), pool, migrate.ReplayOptions{
+		Current: files(map[string]string{
+			"001_a.up.sql":   `create table if not exists a (id int primary key);`,
+			"001_a.down.sql": `drop table if exists a;`,
+		}),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"001_a.up.sql"}, result.ChangedOrAdded)
+}

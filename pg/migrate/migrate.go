@@ -87,13 +87,27 @@ type Result struct {
 	Skipped []string
 
 	// Changed names migrations whose file no longer matches the checksum
-	// recorded when they were applied. Reported rather than refused: the usual
-	// cause is an unmerged branch being edited. The case that matters is a file
-	// edited after an environment already ran the earlier version, where the
-	// ledger's name check means the new content never runs. Replay reproduces
-	// that deliberately.
+	// recorded when they were applied. Run returns ErrChecksumDrift when this
+	// is non-empty, after applying everything pending.
 	Changed []string
 }
+
+// ErrChecksumDrift reports that a migration file no longer matches the checksum
+// recorded when it was applied. Run returns it after applying everything
+// pending, so a deploy step written as `if _, err := migrate.Run(...); err != nil`
+// stops instead of running the application against a schema its own migrations
+// no longer describe.
+//
+// Drift is normal on a branch that is still being edited. A caller that expects
+// it checks for this error and carries on:
+//
+//	result, err := migrate.Run(ctx, pool, opts)
+//	if err != nil && !errors.Is(err, migrate.ErrChecksumDrift) {
+//		return err
+//	}
+//
+// Replay is the check that says whether the edited file would actually apply.
+var ErrChecksumDrift = errors.New("migrate: a migration changed after it was applied")
 
 // migrationName matches a migration file and captures its sortable prefix.
 var migrationName = regexp.MustCompile(`^(\d+)[_-]`)
@@ -108,7 +122,7 @@ func Run(ctx context.Context, db pg.Beginner, opts Options) (Result, error) {
 	if table == "" {
 		table = DefaultTable
 	}
-	if !identifier.MatchString(table) {
+	if !tableName.MatchString(table) {
 		return Result{}, fmt.Errorf("migrate: %q is not a valid table name", table)
 	}
 
@@ -163,7 +177,20 @@ func Run(ctx context.Context, db pg.Beginner, opts Options) (Result, error) {
 		"applied", len(result.Applied),
 		"already_applied", len(result.Skipped),
 	)
+	if len(result.Changed) > 0 {
+		return result, fmt.Errorf("%w: %s (the ledger already names %s, so the new content will not run; "+
+			"use Replay to find out whether it would apply)",
+			ErrChecksumDrift, strings.Join(result.Changed, ", "),
+			plural(len(result.Changed), "this file", "these files"))
+	}
 	return result, nil
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // apply runs one migration and records it, in a single transaction, so a
@@ -299,8 +326,12 @@ func Load(fsys fs.FS, dir string) ([]File, error) {
 		return nil, fmt.Errorf("migrate: read %q: %w", dir, err)
 	}
 
-	var files []File
-	width := 0
+	var (
+		files      []File
+		width      int
+		prefixed   string
+		unprefixed string
+	)
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, UpSuffix) {
@@ -308,6 +339,7 @@ func Load(fsys fs.FS, dir string) ([]File, error) {
 		}
 
 		if m := migrationName.FindStringSubmatch(name); m != nil {
+			prefixed = name
 			if width == 0 {
 				width = len(m[1])
 			} else if len(m[1]) != width {
@@ -315,6 +347,8 @@ func Load(fsys fs.FS, dir string) ([]File, error) {
 					"pad them all to the same width or they will not sort into the order you meant",
 					name, len(m[1]), width)
 			}
+		} else {
+			unprefixed = name
 		}
 
 		content, err := fs.ReadFile(fsys, path.Join(dir, name))
@@ -329,6 +363,14 @@ func Load(fsys fs.FS, dir string) ([]File, error) {
 		})
 	}
 
+	// A file with no numeric prefix sorts by its bare name, which puts it
+	// wherever the alphabet happens to put it among the numbered ones.
+	if prefixed != "" && unprefixed != "" {
+		return nil, fmt.Errorf("migrate: %q has no numeric prefix while %q does; "+
+			"give every migration a zero-padded prefix or the run order is whatever the alphabet decides",
+			unprefixed, prefixed)
+	}
+
 	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
 	return files, nil
 }
@@ -338,7 +380,11 @@ func DownName(upName string) string {
 	return strings.TrimSuffix(upName, UpSuffix) + DownSuffix
 }
 
-var identifier = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
+// tableName is what a ledger table may be called. Unqualified on purpose: a
+// schema-qualified name would have to be quoted correctly in five statements,
+// and the search_path is the right place to choose a schema. Named differently
+// from pg.identifier, which permits one dot for a table-qualified column.
+var tableName = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
 
 func short(checksum string) string {
 	if len(checksum) <= 12 {

@@ -30,6 +30,12 @@ type RealIPOptions struct {
 
 	// Header defaults to X-Forwarded-For. X-Real-IP carries a single address
 	// rather than a list, which this also handles.
+	//
+	// RFC 7239 `Forwarded:` is not supported. Its entries are `for=1.2.3.4`
+	// pairs, which do not parse as addresses here, so setting Header to it
+	// leaves RemoteAddr alone rather than producing wrong answers — but a
+	// deployment behind a proxy that emits only `Forwarded` gets no client
+	// address at all.
 	Header string
 }
 
@@ -46,6 +52,10 @@ type RealIPOptions struct {
 // When the header is not trusted, because no trusted proxies are configured or
 // the connection came from an address that is not one of them, RemoteAddr is
 // left unchanged.
+//
+// The rewritten RemoteAddr carries port 0. The client's source port is not in
+// the header to recover, and it is what would correlate a NAT'd client against
+// the proxy's own logs.
 func RealIP(opts RealIPOptions) func(http.Handler) http.Handler {
 	header := opts.Header
 	if header == "" {
@@ -80,8 +90,15 @@ func clientIP(headers []string, trusted []*net.IPNet) string {
 	for i := len(entries) - 1; i >= 0; i-- {
 		ip := parseIP(entries[i])
 		if ip == nil {
-			// Skip rather than stop, so a proxy that writes a hostname does not
-			// hide the entries behind it.
+			// Skip rather than stop, so a proxy that writes a hostname or the
+			// literal "unknown" does not hide the entries behind it.
+			//
+			// The trade: with `9.9.9.9, not-an-ip` from a trusted peer the
+			// answer falls back to a client-supplied entry. A proxy that
+			// appends a real address makes that unreachable, so this is
+			// hardening rather than a hole — but stopping here would be the
+			// stricter reading, at the cost of breaking proxies that write
+			// "unknown".
 			continue
 		}
 		if inAny(ip, trusted) {
