@@ -39,3 +39,24 @@ secrets:
 .PHONY: build
 build:
 	go build ./...
+
+# Run examples/minimal against a throwaway Postgres. There is no run-firebase
+# target yet: it would be identical to this one until the auth package lands,
+# and a target that does nothing different is worse than a missing one.
+EXAMPLE_DB_CONTAINER ?= keel-example-db
+EXAMPLE_DB_PORT      ?= 55432
+EXAMPLE_DB_URL       ?= postgres://keel:keel@127.0.0.1:$(EXAMPLE_DB_PORT)/keel?sslmode=disable
+
+.PHONY: run-local
+run-local:
+	@docker rm -f $(EXAMPLE_DB_CONTAINER) >/dev/null 2>&1 || true
+	docker run -d --rm --name $(EXAMPLE_DB_CONTAINER) \
+		-e POSTGRES_USER=keel -e POSTGRES_PASSWORD=keel -e POSTGRES_DB=keel \
+		-p 127.0.0.1:$(EXAMPLE_DB_PORT):5432 postgres:16-alpine >/dev/null
+	@printf 'waiting for postgres'
+	@until docker exec $(EXAMPLE_DB_CONTAINER) pg_isready -U keel >/dev/null 2>&1; do \
+		printf '.'; sleep 1; \
+	done; echo ' ready'
+	@echo 'serving on :8080 — ctrl-c to stop, the database is removed on exit'
+	@trap 'docker rm -f $(EXAMPLE_DB_CONTAINER) >/dev/null 2>&1 || true' EXIT INT TERM; \
+		DATABASE_URL='$(EXAMPLE_DB_URL)' go run ./examples/minimal

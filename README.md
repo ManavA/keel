@@ -27,14 +27,16 @@ land with the packages themselves:
 
 | Package | In-process default | Optional backends |
 |---|---|---|
+| `search` | Postgres full-text (`PostgresIndex`) | Meilisearch (`search/meili`) |
+| `mail` | a sender that writes to the log (`LogSender`) | Postmark |
+| `events` | in-memory bus (`InMemoryBus`) | Cloud Pub/Sub (`events/pubsub`) |
+| `jobs` | in-process scheduler | Cloud Run triggers (`jobs/cloudrun`) |
 | `auth` | `local` — email and password, verification, reset, sessions in Postgres | `firebase` (ID tokens), `oidc` (any issuer) |
-| `search` | Postgres full-text | Meilisearch |
-| `mail` | a sender that writes to the log | Postmark |
-| `events` | in-memory | Cloud Pub/Sub |
 | `media` | local filesystem | Google Cloud Storage |
 
 Adding a service is configuration, not a rewrite: `AUTH_SOURCES=local,firebase`
-enables Firebase alongside the local source rather than replacing it.
+will enable Firebase alongside the local source rather than replacing it. The
+last two rows land with their packages.
 
 ## Quick start
 
@@ -93,13 +95,16 @@ func main() {
 }
 ```
 
-`examples/minimal` will be a runnable version of this with authentication added,
-in two shapes:
+`examples/minimal` is a runnable service built the same way, with a small API
+over a `notes` table. It needs Postgres and nothing else:
 
 ```
 make run-local      # Postgres only
-make run-firebase   # the same app with AUTH_SOURCES=local,firebase
 ```
+
+A `run-firebase` shape, the same application with `AUTH_SOURCES=local,firebase`,
+arrives with the `auth` package. It is not listed as a target until it does
+something different from `run-local`.
 
 ## Package map
 
@@ -114,15 +119,15 @@ Available now:
 | `pg` | pgx v5 pool, transaction helper, offset and keyset paging |
 | `pg/migrate` | Migration runner with a ledger, and a replay check |
 | `pg/testdb` | Docker Postgres harness for tests |
+| `search` | A document index over Postgres, or Meilisearch (`search/meili`) |
+| `jobs` | Scheduled and one-shot background work, with run outcomes (`jobs/cloudrun`) |
+| `events` | Publish and subscribe, in memory or over Pub/Sub (`events/pubsub`) |
+| `mail` | Transactional email over a log sender or Postmark |
 
 Planned, and landing on their own branches:
 
 | Package | What it will provide |
 |---|---|
-| `search` | Search over Postgres or Meilisearch |
-| `jobs` | Scheduled and one-shot background work, with run records |
-| `events` | Publish and subscribe, in memory or over Pub/Sub |
-| `mail` | Transactional email |
 | `auth` | Authentication with pluggable sources, sessions, verification |
 | `admin` | Administrative endpoints and their separate authentication |
 | `textpolicy` | One guard for generated and forwarded text |
@@ -135,8 +140,10 @@ Planned, and landing on their own branches:
 ## Documentation
 
 `ARCHITECTURE.md` describes the layout, the import rules, and what was
-deliberately left out of the extraction. `docs/deploy.md` and `docs/testing.md`
-arrive with the remaining packages.
+deliberately left out of the extraction. `docs/deploy.md` covers running a keel
+service on a container platform. `docs/testing.md` covers the database harness
+and what a green test run does and does not prove. `CHANGELOG.md` records what
+changed between versions.
 
 ## Requirements
 

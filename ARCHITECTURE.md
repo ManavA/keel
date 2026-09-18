@@ -28,16 +28,26 @@ httpx/       HTTP server, router, middleware, responses, health
 pg/          pgx v5 pool, transactions, paging
   migrate/     migration runner and replay check
   testdb/      Docker Postgres harness for tests
+search/      a document index over Postgres, or Meilisearch
+  meili/       the Meilisearch implementation
+jobs/        background work and run outcomes
+  cloudrun/    triggering another job over Cloud Run
+events/      publish and subscribe
+  pubsub/      the Cloud Pub/Sub transport
+mail/        transactional email
+  testing/     a Recorder for tests
+  deliverycheck/  reconciling delivery claims against a provider
+examples/
+  minimal/   a runnable service over Postgres and nothing else
+docs/
+  deploy.md
+  testing.md
 ```
 
 The rest of the layout is planned and arrives with the extraction branches. It
 is fixed in advance so that work on it can happen in parallel:
 
 ```
-search/      search over Postgres or a search index
-jobs/        background work and run records
-events/      publish and subscribe
-mail/        transactional email
 auth/        authentication sources, sessions, tokens
 admin/       administrative endpoints and their auth
 textpolicy/  one guard for generated and forwarded text
@@ -46,11 +56,6 @@ geocode/     address to coordinate lookup
 perf/        timing, budgets, profiling
 scripts/     developer and CI scripts
 deploy/      deployment templates and checks
-examples/
-  minimal/   a runnable service wiring config, log, httpx, pg and auth
-docs/
-  deploy.md
-  testing.md
 ```
 
 ## Layers
