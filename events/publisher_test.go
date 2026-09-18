@@ -63,7 +63,7 @@ func TestMarshal_StructIsJSONEncoded(t *testing.T) {
 }
 
 // TestMarshal_NoopAndInMemoryBusEncodeIdentically is the regression test
-// for the independent review's finding: NoopPublisher used to call
+// NoopPublisher used to call
 // json.Marshal directly while InMemoryBus special-cased []byte, so the same
 // event encoded two different ways depending which implementation
 // published it. Both now call Marshal, so this asserts they agree.

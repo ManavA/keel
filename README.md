@@ -1,46 +1,22 @@
 # keel
 
-A Go toolkit for the parts of a web backend that are the same in every project:
-loading configuration, setting up a logger, running an HTTP server that shuts
-down cleanly, talking to Postgres, running migrations, and testing against a
-real database.
+Reusable Go packages for building a web backend: configuration, structured
+logging, HTTP serving, Postgres access and migrations, search, background jobs,
+events and transactional email. Each package is usable on its own, and every
+package that talks to an external service ships an in-process default, so a
+project running only Postgres gets a complete backend.
 
-The packages were extracted from a production service. Where a design choice
-here differs from the obvious one, the package documentation says why in a
-sentence.
+## Install
 
-## What it is not
+```
+go get github.com/ManavA/keel
+```
 
-keel is not a framework. There is no root package, no plugin registry and no
-lifecycle to adopt. You can take `httpx` without `pg`, or `pg/testdb` on its
-own. Packages meet through interfaces the caller supplies, not through imports
-of each other.
-
-It is not a data layer either. `pg` gives you a pool, a transaction helper and
-paging. Queries and repositories are yours.
-
-## Every external service is optional
-
-Each package that talks to something outside the process has an in-process
-default, so a project with nothing but Postgres gets a complete backend. These
-land with the packages themselves:
-
-| Package | In-process default | Optional backends |
-|---|---|---|
-| `search` | Postgres full-text (`PostgresIndex`) | Meilisearch (`search/meili`) |
-| `mail` | a sender that writes to the log (`LogSender`) | Postmark |
-| `events` | in-memory bus (`InMemoryBus`) | Cloud Pub/Sub (`events/pubsub`) |
-| `jobs` | in-process scheduler | Cloud Run triggers (`jobs/cloudrun`) |
-| `auth` | `local` — email and password, verification, reset, sessions in Postgres | `firebase` (ID tokens), `oidc` (any issuer) |
-| `media` | local filesystem | Google Cloud Storage |
-
-Adding a service is configuration, not a rewrite: `AUTH_SOURCES=local,firebase`
-will enable Firebase alongside the local source rather than replacing it. The
-last two rows land with their packages.
+Go 1.25 or later. Docker is needed only by `pg/testdb`.
 
 ## Quick start
 
-The smallest useful service needs Postgres and nothing else.
+A service needing Postgres and nothing else:
 
 ```go
 package main
@@ -95,56 +71,80 @@ func main() {
 }
 ```
 
-`examples/minimal` is a runnable service built the same way, with a small API
-over a `notes` table. It needs Postgres and nothing else:
+`examples/minimal` is a runnable service built this way, with a notes API over
+Postgres. Run it with `make run-local`.
 
-```
-make run-local      # Postgres only
-```
+## Packages
 
-A `run-firebase` shape, the same application with `AUTH_SOURCES=local,firebase`,
-arrives with the `auth` package. It is not listed as a target until it does
-something different from `run-local`.
-
-## Package map
-
-Available now:
-
-| Package | What it provides |
+| Package | Description |
 |---|---|
-| `config` | Environment loading over envconfig, optional dotenv, `Validate()`, secret trimming and redaction |
-| `log` | A JSON `slog` handler that carries request ids and redacts credential-shaped keys |
-| `httpx` | HTTP server, chi router, middleware, JSON responses, health endpoints |
+| `config` | Environment loading over envconfig, optional dotenv, validation, secret trimming and redaction |
+| `log` | A JSON `slog` handler carrying request ids, with credential-shaped keys redacted |
+| `httpx` | HTTP server with graceful shutdown, chi router, middleware, JSON responses, health endpoints |
+| `httpx/middleware` | Real client address, request id, request log, panic recovery, CORS, rate limiting |
 | `httpx/buildinfo` | The revision the running binary was built from |
 | `pg` | pgx v5 pool, transaction helper, offset and keyset paging |
 | `pg/migrate` | Migration runner with a ledger, and a replay check |
 | `pg/testdb` | Docker Postgres harness for tests |
-| `search` | A document index over Postgres, or Meilisearch (`search/meili`) |
-| `jobs` | Scheduled and one-shot background work, with run outcomes (`jobs/cloudrun`) |
-| `events` | Publish and subscribe, in memory or over Pub/Sub (`events/pubsub`) |
+| `search` | Document index over Postgres, or Meilisearch via `search/meili` |
+| `jobs` | Background work with run outcomes, an in-process scheduler, and `jobs/cloudrun` triggers |
+| `events` | Publish and subscribe in memory, or over Cloud Pub/Sub via `events/pubsub` |
 | `mail` | Transactional email over a log sender or Postmark |
 
-Planned, and landing on their own branches:
+## Configuration
 
-| Package | What it will provide |
-|---|---|
-| `auth` | Authentication with pluggable sources, sessions, verification |
-| `admin` | Administrative endpoints and their separate authentication |
-| `textpolicy` | One guard for generated and forwarded text |
-| `media` | Object storage and image derivatives |
-| `geocode` | Address to coordinate lookup |
-| `perf` | Timing, budgets, profiling handlers |
-| `scripts` | Developer and CI scripts |
-| `deploy` | Deployment templates and checks |
+`config.Load` reads a struct from the environment, calls `Validate` if the
+struct implements it, and trims whitespace from fields holding a secret or a
+URL.
 
-## Documentation
+```go
+type Config struct {
+	Port        int    `envconfig:"PORT" default:"8080"`
+	DatabaseURL string `envconfig:"DATABASE_URL" required:"true"`
+	APIToken    string `envconfig:"API_TOKEN"`
+}
 
-`ARCHITECTURE.md` describes the layout, the import rules, and what was
-deliberately left out of the extraction. `docs/deploy.md` covers running a keel
-service on a container platform. `docs/testing.md` covers the database harness
-and what a green test run does and does not prove. `CHANGELOG.md` records what
-changed between versions.
+var cfg Config
+if err := config.Load(&cfg); err != nil {
+	return err
+}
+```
 
-## Requirements
+`config.Redacted(&cfg)` renders the struct as name and value pairs safe to log
+at startup: secrets are replaced, collections report a count, and URLs keep
+their host and lose their password.
 
-Go 1.25 or later. Docker, for `pg/testdb` only.
+Each package that talks to an external service selects its backend by
+configuration and falls back to an in-process default:
+
+| Package | Default | External option |
+|---|---|---|
+| `search` | Postgres full-text (`PostgresIndex`) | Meilisearch (`search/meili`) |
+| `mail` | log sender (`LogSender`) | Postmark |
+| `events` | in-memory bus (`InMemoryBus`) | Cloud Pub/Sub (`events/pubsub`) |
+| `jobs` | in-process scheduler | Cloud Run triggers (`jobs/cloudrun`) |
+
+## Testing
+
+```
+make test               # everything that needs no Docker
+make test-db            # database-backed packages, Docker required
+make migrations-check   # replay every migrations directory in the module
+```
+
+`pg/testdb` starts a real Postgres in Docker for tests. `KEEL_REQUIRE_DB=1`
+turns a missing Docker from a skip into a failure. See `docs/testing.md`.
+
+## Deployment
+
+See `docs/deploy.md` for health checks, proxy configuration, migrations,
+shutdown, pool sizing and build identification.
+
+## Contributing
+
+See `CONTRIBUTING.md`. `ARCHITECTURE.md` describes the package layout and the
+import rules.
+
+## License
+
+Apache License 2.0. See `LICENSE`.

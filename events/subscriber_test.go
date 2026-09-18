@@ -151,7 +151,7 @@ func TestInMemoryBus_HandlerErrorDoesNotStopTheLoop(t *testing.T) {
 }
 
 // TestInMemoryBus_FullBufferDropsAreLoud is the regression test for the
-// independent review's probe: publishing past a subscriber whose handler
+// publishing past a subscriber whose handler
 // is blocked dropped 83 of 100 messages with no log line and no counter.
 // A drop must be visible both in the log and in DroppedCount.
 func TestInMemoryBus_FullBufferDropsAreLoud(t *testing.T) {

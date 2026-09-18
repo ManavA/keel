@@ -1,43 +1,54 @@
 # Contributing
 
-## Before you push
+## Requirements
+
+Go 1.25 or later. Docker, for the database-backed tests.
+
+## Building and testing
 
 ```
-make fmt test lint vuln
+make                    # fmt, test, lint, vuln
+make test               # everything that needs no Docker
+make test-db            # database-backed packages, Docker required
+make migrations-check   # replay every migrations directory in the module
+make secrets            # scan for credentials
 ```
 
-`make` with no target runs all four. CI runs the same commands plus a secret
-scan, so a clean local run and a green pipeline mean the same thing.
+CI runs the same commands, so a clean local run and a green pipeline mean the
+same thing.
 
-Run `gitleaks detect` before pushing anything that touched configuration,
+Run `make secrets` before pushing anything that touched configuration,
 deployment or test fixtures. The CI job is a backstop; by the time it fails, the
 secret is in the remote's history.
 
-## What belongs here
+## Scope
 
-Infrastructure any web backend would otherwise write itself. Nothing in this
-repository may carry a domain: no customer names, no product copy, no schema
-from a particular application, no credentials, no host names that resolve to
-something real.
+Code belongs in keel when it is infrastructure that any web backend would
+otherwise write itself.
+
+Nothing in this repository may carry a domain: no customer names, no product
+copy, no schema from a particular application, no credentials, no host names that
+resolve to something real.
 
 A package that talks to an external service must also work without it. Provide
 an in-process default — Postgres, memory, the local filesystem, the log — and
-select the external provider by configuration.
+select the external provider by configuration. Keep the heavy dependency in a
+subpackage so importing the package does not pull in a client nobody asked for.
 
 ## Style
 
 Follow [Effective Go](https://go.dev/doc/effective_go) and the
 [code review comments](https://go.dev/wiki/CodeReviewComments).
 
-Documentation is plain and direct. A package doc comment says what the package
-does, when to use it, and the one or two decisions that are not obvious from the
-signatures. It is not a summary of the API; `go doc` already prints that. Where
-an unusual design choice comes from an incident, one factual clause is enough:
-"migrations are re-run on every deploy, so each file must be idempotent." No
-narratives, no aphorisms.
+A package doc comment says what the package does, when to use it, and the one or
+two decisions that are not obvious from the signatures. It is not a summary of
+the API; `go doc` already prints that. Where an unusual choice has a reason, one
+factual clause is enough: "migrations are re-run on every deploy, so each file
+must be idempotent."
 
-Comments inside a function explain what a careful reader would otherwise have to
-reconstruct. Code that says what it does needs no comment repeating it.
+Comments explain what a careful reader would otherwise have to reconstruct, and
+describe the code rather than the process that produced it. Code that says what
+it does needs no comment repeating it.
 
 Interfaces are small and declared where they are used. Errors are wrapped with
 context. `context.Context` comes first. Options are structs whose zero value
@@ -47,16 +58,25 @@ works.
 
 Table-driven, with testify. Name the case, not the index.
 
-Where a check could pass without exercising what it names, add the case that
-must fail and confirm you have seen it fail. `pg/testdb`'s readiness tests are
-built this way.
+Where a check could pass without exercising what it names, write the case that
+must fail and confirm you have seen it fail. `pg/testdb` does this explicitly:
+`TestTheNaiveProbeAcceptsTheRestartFixture` asserts that a two-tries-and-done
+probe accepts the restart fixture, so if that fixture stops discriminating
+between the real oracle and a naive one, the suite says so.
 
-Database-backed tests use `pg/testdb`. They may skip when Docker is unavailable.
-`KEEL_REQUIRE_DB=1` turns that skip into a failure; `make test-db` sets it, and
-so does the "Database-backed tests" job in `.github/workflows/ci.yml`.
+Database-backed tests use `pg/testdb`. They may skip when Docker is unavailable;
+`KEEL_REQUIRE_DB=1` turns the skip into a failure, and CI sets it.
 
-## Commits
+Migrations are replayed by `make migrations-check`, which finds every directory
+named `migrations` in the module. A new package with migrations needs no wiring.
 
-`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `ci:`, optionally scoped:
-`feat(pg): keyset paging`. The subject says what changed; the body says why, if
-why is not obvious.
+## Commit messages
+
+Imperative mood, one line summarising the change, optionally scoped:
+
+```
+add keyset paging to pg
+fix realip to read the rightmost untrusted entry
+```
+
+The body says why, when why is not obvious from the diff.

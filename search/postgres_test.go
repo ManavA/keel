@@ -51,7 +51,7 @@ func TestPostgresIndex_DocumentCount_ReadsScannedValue(t *testing.T) {
 }
 
 // TestPostgresIndex_PruneStale_ReturnsTheActualDeletedCount is the
-// regression test pinning mutation N8 from the independent review: a
+// regression test: a
 // PruneStale that always returned 0 stayed green under the default test
 // suite and was caught only by a `live`-tagged test against a real
 // database. This test needs no live database — it fakes the "list all ids"

@@ -33,7 +33,16 @@ jobs:
       - name: Database-backed tests
         env:
           KEEL_REQUIRE_DB: "1"
-        run: go test -count=1 ./pg/...
+        run: go test -count=1 ./pg/... ./examples/...
+
+      # Its own step, so a migration that does not replay is reported as that
+      # rather than as one failure among a package's worth. ARCHITECTURE.md
+      # presents Replay as a guarantee of this repository; this is what makes
+      # it one.
+      - name: Migrations replay
+        env:
+          KEEL_REQUIRE_DB: "1"
+        run: go test -count=1 -run 'TestRepositoryMigrations|TestDiscoverMigrationDirs' -v ./pg/migrate/
 
   lint:
     runs-on: ubuntu-latest

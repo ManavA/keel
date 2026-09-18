@@ -114,8 +114,38 @@ _, err := migrate.Replay(ctx, pool, migrate.ReplayOptions{
 A nil `Previous` is the empty set, which is what a repository's first revision
 has.
 
-What `Replay` does not catch: a changed migration that applies cleanly and
-leaves a different schema. `add column if not exists x text` at the earlier
+### The repository-wide check
+
+Every migrations directory in this module is replayed on every CI run:
+
+```
+make migrations-check
+```
+
+It walks the module for directories named `migrations` that hold an `.up.sql`
+file, and replays each one in a schema of its own against a throwaway Postgres —
+applied to an empty schema, applied again for idempotence, then every file down
+and up. A failure names the directory.
+
+The check exists because `Replay` is only as useful as the directories it is
+pointed at, and the other tests in `pg/migrate` build their own fixtures. A real
+migrations directory could fail Replay with nothing noticing. The failure it
+catches most often is a `down` missing `CASCADE`: the `DROP TABLE` succeeds on a
+fresh database and fails the moment anything depends on the table, which is
+never the run that added it.
+
+`TestRepositoryMigrationsCheckCanFail` is the control: it replays a migration
+whose `down` drops a table a view depends on, requires that to fail and name the
+file, and requires the same migration with `CASCADE` to pass. A discovery that
+stopped walking, or a `Replay` that stopped checking down files, would otherwise
+leave the gate green forever.
+
+Adding a package with its own migrations needs no wiring. Put them in a
+directory called `migrations` and the check finds them.
+
+### What Replay does not catch
+
+A changed migration that applies cleanly and leaves a different schema. `add column if not exists x text` at the earlier
 revision and `... x integer` now is a no-op the second time, the column stays
 `text`, and nothing errors. Detecting that needs a schema dump comparison.
 
@@ -130,9 +160,9 @@ two-tries-and-done probe accepts the restart fixture, so if that fixture ever
 stops discriminating between the real oracle and a naive one, the suite says so
 rather than passing quietly.
 
-The same idea, applied by hand, is how this repository is reviewed: change one
-guard at a time and check that a named test goes red. A guard no test defends is
-a guard that will be deleted by someone refactoring in good faith.
+The same idea applied by hand: change one guard at a time and check that a named
+test goes red. A guard no test defends is a guard that will be deleted by
+someone refactoring in good faith.
 
 ## What a green run does not prove
 

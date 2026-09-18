@@ -36,6 +36,15 @@ fmt:
 secrets:
 	gitleaks detect --redact --verbose
 
+# Replay every migrations directory in the module against a throwaway Postgres:
+# applied to an empty schema, applied again for idempotence, then each file down
+# and up. A down that cannot run — one missing CASCADE, typically — fails here
+# rather than the first time somebody rolls back.
+.PHONY: migrations-check
+migrations-check:
+	KEEL_REQUIRE_DB=1 go test -count=1 -v \
+		-run 'TestRepositoryMigrations|TestDiscoverMigrationDirs' ./pg/migrate/
+
 .PHONY: build
 build:
 	go build ./...

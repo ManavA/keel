@@ -14,8 +14,8 @@
 // and a new database, a restored one or a dropped ledger table replays
 // everything.
 //
-// Run migrations from one place. There is no advisory lock yet (issue #6), so
-// two instances deploying at once can both reach the same pending file. The
+// Run migrations from one place. There is no advisory lock yet, so two
+// instances deploying at once can both reach the same pending file. The
 // outcome is safe — one transaction wins and the other fails on the ledger's
 // primary key or on the DDL, stopping the run and naming the file — but in a
 // rolling deploy that shows up as one replica failing while another succeeds,
