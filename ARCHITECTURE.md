@@ -46,6 +46,11 @@ textpolicy/      one normalize-then-match guard for generated and forwarded text
 admin/           administrative session auth and a CORS-scoped router
   pg/              the Postgres-backed admin store
   cmd/seed/        a runnable command that seeds the first admin account
+retry/           exponential backoff with full jitter
+idempotency/     HTTP middleware that replays a response for a repeated request
+  pg/              the Postgres-backed Store, and its migration
+outbox/          write an event with a transaction, relay it to events
+  pg/              the outbox table's migration
 scripts/         developer and CI scripts
 deploy/          deployment templates and checks
 examples/
@@ -61,9 +66,9 @@ Nothing enforces this at build time, so it is written down. A package may import
 anything strictly below it.
 
 1. **`config`, `log`, `httpx/buildinfo`** — no keel imports at all.
-2. **`httpx`, `pg`, `events`, `textpolicy`** — may use level 1.
+2. **`httpx`, `pg`, `events`, `textpolicy`, `retry`** — may use level 1.
 3. **`pg/migrate`, `pg/testdb`, `search`, `mail`, `jobs`, `media`, `geocode`,
-   `perf`** — may use levels 1 and 2. Each owns a dependency on something
+   `perf`, `idempotency`, `outbox`** — may use levels 1 and 2. Each owns a dependency on something
    outside the process.
 4. **`auth`, `admin`** — may use levels 1 through 3, including each other's
    level-3 dependencies (`pg`, `httpx`), but not each other: they sit at the

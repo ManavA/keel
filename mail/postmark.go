@@ -3,10 +3,27 @@ package mail
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"time"
 
 	"github.com/keighl/postmark"
+
+	"github.com/ManavA/keel/retry"
 )
+
+// postmarkTransportRetry bounds how hard Send retries a request the
+// client itself failed to complete — a dropped connection, a timeout —
+// before giving up. It does not apply to a response Postmark returned
+// successfully with a nonzero ErrorCode; those are classified by
+// classifyPostmarkError, and retrying an error like an unknown template
+// alias would just fail the same way every time.
+var postmarkTransportRetry = retry.Options{
+	MaxAttempts: 3,
+	BaseDelay:   200 * time.Millisecond,
+	MaxDelay:    2 * time.Second,
+}
 
 // PostmarkSenderOptions configures a [PostmarkSender]. The zero value works
 // except for the two required fields; FromName may be left empty.
@@ -31,10 +48,45 @@ type PostmarkSender struct {
 
 // NewPostmarkSender builds a PostmarkSender from opts.
 func NewPostmarkSender(opts PostmarkSenderOptions) *PostmarkSender {
+	client := postmark.NewClient(opts.ServerToken, "")
+	client.HTTPClient = &http.Client{
+		Timeout:   client.HTTPClient.Timeout,
+		Transport: &postmark5xxTransport{base: client.HTTPClient.Transport},
+	}
 	return &PostmarkSender{
-		client: postmark.NewClient(opts.ServerToken, ""),
+		client: client,
 		opts:   opts,
 	}
+}
+
+// postmark5xxTransport turns an HTTP 5xx response into a transport error, so
+// Send's retry covers it. The client library never looks at the status code:
+// it parses any body, so a 5xx with a well-formed body would otherwise be
+// classified as an API error and sent once.
+type postmark5xxTransport struct {
+	base http.RoundTripper
+}
+
+func (t *postmark5xxTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+
+	resp, err := base.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+	if resp.StatusCode < 500 {
+		return resp, nil
+	}
+
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+	if readErr != nil {
+		body = nil
+	}
+	return nil, fmt.Errorf("postmark: transient server error (status %d): %s", resp.StatusCode, body)
 }
 
 // Send delivers a templated email via Postmark.
@@ -43,7 +95,7 @@ func NewPostmarkSender(opts PostmarkSenderOptions) *PostmarkSender {
 // returns a nil Go error even when Postmark's response body carries a
 // nonzero ErrorCode, for example 1101 for an unknown template alias. See
 // the package doc.
-func (s *PostmarkSender) Send(_ context.Context, to, templateAlias string, templateModel map[string]any) error {
+func (s *PostmarkSender) Send(ctx context.Context, to, templateAlias string, templateModel map[string]any) error {
 	logger := s.opts.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -56,7 +108,12 @@ func (s *PostmarkSender) Send(_ context.Context, to, templateAlias string, templ
 		To:            to,
 	}
 
-	res, err := s.client.SendTemplatedEmail(email)
+	var res postmark.EmailResponse
+	err := retry.Do(ctx, func() error {
+		var sendErr error
+		res, sendErr = s.client.SendTemplatedEmail(email)
+		return sendErr
+	}, postmarkTransportRetry)
 	if err == nil && res.ErrorCode != 0 {
 		err = classifyPostmarkError(res.ErrorCode, res.Message)
 	}
