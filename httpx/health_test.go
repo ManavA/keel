@@ -30,8 +30,8 @@ func get(t *testing.T, h http.Handler, path string) (*httptest.ResponseRecorder,
 }
 
 func TestLivenessIgnoresChecks(t *testing.T) {
-	// The distinction that keeps a database blip from restarting every
-	// instance you own: liveness must not consult a dependency.
+	// Liveness must not consult a dependency, or a database blip restarts every
+	// instance at once.
 	var ran atomic.Int32
 	h := httpx.Health(httpx.HealthOptions{
 		Logger: log.New(log.Options{Output: io.Discard}),

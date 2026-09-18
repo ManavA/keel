@@ -13,23 +13,20 @@ type RecovererOptions struct {
 	Logger *slog.Logger
 
 	// OnPanic, if set, is called with the recovered value and the stack after
-	// the panic has been logged. For reporting to an error tracker. It runs
-	// inside the recovery, so a panic in it takes the process down — keep it
-	// short and do the work elsewhere.
+	// the panic is logged, for reporting to an error tracker. It runs inside
+	// the recovery, so a panic in it takes the process down.
 	OnPanic func(r *http.Request, recovered any, stack []byte)
 }
 
 // Recoverer turns a panic in a handler into a 500, logs it with its stack, and
 // lets the process carry on serving.
 //
-// The response body is the same generic one every other 500 gets. A panic
-// message is a Go value written for a developer — it names types, fields and
-// sometimes the value that broke — and returning it to the caller is how an
-// internal detail ends up in a bug report from outside.
+// The body is the same generic 500 as everywhere else. A panic value names
+// types, fields and sometimes the data that broke, none of which belongs in a
+// response.
 //
-// http.ErrAbortHandler is re-panicked rather than swallowed. net/http uses it to
-// mean "this response is being abandoned on purpose", and catching it would log
-// an error for something that is not one.
+// http.ErrAbortHandler is re-panicked rather than caught: net/http uses it to
+// mean the response is being abandoned deliberately.
 func Recoverer(opts RecovererOptions) func(http.Handler) http.Handler {
 	logger := opts.Logger
 	if logger == nil {
@@ -39,9 +36,7 @@ func Recoverer(opts RecovererOptions) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Wrapped so the recovery below can tell whether the handler had
-			// already started writing. Without that it would call WriteHeader a
-			// second time on a response that is halfway out of the door, which
-			// net/http ignores while logging a complaint of its own.
+			// already started writing, and not call WriteHeader twice.
 			rw := &recorder{ResponseWriter: w}
 			defer func() {
 				rec := recover()

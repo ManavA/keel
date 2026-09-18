@@ -10,9 +10,9 @@ import (
 	"time"
 )
 
-// Default timeouts. ReadHeaderTimeout is the one that is not optional: without
-// it a client can hold a connection open by sending headers one byte at a time,
-// and net/http will wait forever.
+// Default timeouts. ReadHeaderTimeout is the important one: net/http leaves it
+// unset, and without it a client can hold a connection open indefinitely by
+// sending headers one byte at a time.
 const (
 	DefaultReadHeaderTimeout = 10 * time.Second
 	DefaultReadTimeout       = 30 * time.Second
@@ -36,10 +36,9 @@ type ServerOptions struct {
 	IdleTimeout       time.Duration
 
 	// ShutdownTimeout bounds how long a graceful shutdown waits for in-flight
-	// requests. When it expires the remaining connections are closed. Keep it
-	// under whatever your platform's own termination grace period is: a
-	// shutdown the platform kills partway through is not a graceful one, and
-	// the requests it drops look like random 502s to the client.
+	// requests, after which the remaining connections are closed. Keep it under
+	// the platform's own termination grace period, or the platform kills the
+	// shutdown partway through and the dropped requests surface as 502s.
 	ShutdownTimeout time.Duration
 
 	// Logger defaults to slog.Default.
@@ -94,8 +93,8 @@ func NewServer(opts ServerOptions) *Server {
 }
 
 // Listen binds the address without serving. ListenAndServe calls it; call it
-// yourself when you need Addr before the server starts — a test that has to
-// build a URL, or a process that reports its port to a supervisor.
+// yourself when you need Addr before the server starts, such as a test building
+// a URL against port 0.
 func (s *Server) Listen() error {
 	if s.listener != nil {
 		return errors.New("httpx: already listening")
@@ -104,7 +103,8 @@ func (s *Server) Listen() error {
 	if addr == "" {
 		addr = ":http"
 	}
-	ln, err := net.Listen("tcp", addr)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("httpx: listen on %s: %w", addr, err)
 	}
@@ -156,7 +156,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return err
 	}
 	// Serve returns ErrServerClosed once Shutdown has finished. Waiting for it
-	// is what makes ListenAndServe's return mean "nothing is still running".
+	// makes ListenAndServe's return mean that nothing is still running.
 	if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("httpx: serve: %w", err)
 	}
@@ -172,9 +172,7 @@ func (s *Server) Shutdown() error {
 
 	if err := s.http.Shutdown(ctx); err != nil {
 		// The deadline passed with requests still running. Close them rather
-		// than leaving the process alive holding connections it will never
-		// finish: the platform is about to kill it anyway, and a hard close at
-		// least tells the client something happened.
+		// than holding connections that will never finish.
 		s.log.Warn("graceful shutdown timed out, closing connections", "error", err)
 		if closeErr := s.http.Close(); closeErr != nil {
 			return fmt.Errorf("httpx: shutdown: %w (close: %w)", err, closeErr)

@@ -117,9 +117,8 @@ func TestErrorHelpers(t *testing.T) {
 }
 
 func TestNotFoundAndUnauthorizedReadDifferently(t *testing.T) {
-	// A foreign id is answered 404, the same as an invented one. This is a
-	// check that the two helpers exist and differ, so nobody later "fixes"
-	// NotFound into a 403 for the case where the row does exist.
+	// A foreign id is answered 404, the same as an invented one, so that
+	// NotFound is never "fixed" into a 403 for a row that does exist.
 	slog.SetDefault(log.New(log.Options{Output: io.Discard}))
 
 	notFound := httptest.NewRecorder()

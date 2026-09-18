@@ -1,21 +1,14 @@
-// Package config loads a service's configuration out of the environment and
-// refuses to let two specific mistakes through.
+// Package config loads a service's configuration from the environment.
 //
-// The first is a secret with a trailing newline. Secret managers hand back
-// exactly the bytes they were given, and the bytes they were given usually came
-// from `echo`, which appends one. A token with "\n" on the end authenticates
-// against nothing, and the error the provider returns says "invalid
-// credentials" — which sends you to look at the credential, not at the shell
-// that stored it. Load trims any field it can tell holds a secret.
+// It is envconfig underneath, so the struct tags are envconfig's. This package
+// adds four things: an optional dotenv step, a Validate call so a bad
+// configuration fails at startup rather than at first use, whitespace trimming
+// on secrets and URLs, and redaction helpers for logging what was loaded.
 //
-// The second is a configuration error found at first use rather than at
-// startup. A struct may implement Validator; Load calls it, so a service that
-// cannot possibly work exits immediately with a message naming the field,
-// instead of serving traffic until the request that needs it arrives.
-//
-// Loading is envconfig underneath, so the struct tags are envconfig's. This
-// package adds the dotenv step, the trimming, the validation call and the
-// redaction helpers you need to log what you loaded.
+// The trimming is not cosmetic. A secret manager returns exactly the bytes it
+// was given, and a value stored with `echo` carries a trailing newline; the
+// authentication failure that follows reads as a wrong credential rather than a
+// malformed one.
 package config
 
 import (
@@ -108,9 +101,8 @@ func LoadWith(dest any, opts Options) error {
 // trimSecrets strips surrounding whitespace from every string field that holds
 // a secret or a URL, walking into nested structs and pointers to them.
 //
-// It does not trim every string. A field can legitimately hold a template, a
-// separator, or a banner whose leading space is deliberate, and silently
-// reshaping those would be a worse bug than the one this prevents.
+// It does not trim every string: a field can hold a template, a separator or a
+// banner whose leading space is intended.
 func trimSecrets(v reflect.Value) {
 	t := v.Type()
 	for i := range t.NumField() {
@@ -131,12 +123,9 @@ func trimSecrets(v reflect.Value) {
 	}
 }
 
-// isURLField reports whether a field holds a URL. They are trimmed alongside
-// secrets because they arrive from the same places and fail the same way: a
-// DATABASE_URL with a trailing newline produces a DNS lookup for a host name
-// ending in "\n", and the driver reports that as "no such host" — which reads
-// like a networking problem rather than a shell one. Whitespace around a URL is
-// never deliberate.
+// isURLField reports whether a field holds a URL. URLs are trimmed alongside
+// secrets: a trailing newline on DATABASE_URL produces a DNS lookup for a host
+// name ending in "\n", which the driver reports as "no such host".
 func isURLField(f reflect.StructField) bool {
 	name := strings.ToUpper(f.Name)
 	key := strings.ToUpper(f.Tag.Get("envconfig"))
@@ -146,11 +135,9 @@ func isURLField(f reflect.StructField) bool {
 
 // isSecretField decides whether a struct field holds a credential.
 //
-// An explicit `secret:"true"` or `secret:"false"` tag always wins. Without one,
-// the field is judged by its name and its envconfig key, because the tag is the
-// thing most likely to be forgotten on the field that most needs it — and a
-// heuristic that is right about API_KEY without being told is worth more than a
-// rule that is only ever right when somebody remembered.
+// An explicit `secret:"true"` or `secret:"false"` tag wins. Without one, the
+// field is judged by its name and its envconfig key, so a field does not have
+// to be tagged to be protected.
 func isSecretField(f reflect.StructField) bool {
 	switch strings.ToLower(f.Tag.Get("secret")) {
 	case "true":
@@ -168,10 +155,9 @@ var secretWords = []string{"secret", "token", "password", "passwd", "credential"
 // a log attribute key — looks like it holds a credential. Case and separators
 // are ignored, so SecretKey, SECRET_KEY and secret-key all match.
 //
-// "key" alone is deliberately not on the list. Sort keys, cache keys, partition
-// keys and idempotency keys are all things you want to read in a log line, and
-// a rule that hides every one of them to catch API_KEY is a rule people turn
-// off.
+// "key" on its own is not on the list: sort keys, cache keys and idempotency
+// keys are worth reading in a log line, and hiding them all to catch API_KEY
+// makes the rule more trouble than it is worth.
 func IsSecretName(name string) bool {
 	n := strings.Map(func(r rune) rune {
 		if r == '_' || r == '-' || r == '.' || r == ' ' {

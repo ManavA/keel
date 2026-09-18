@@ -39,14 +39,13 @@ type RouterOptions struct {
 	CORS *middleware.CORSOptions
 
 	// RateLimit, when set, applies a limit to every route on this router. A
-	// limit that should only cover some routes belongs on a sub-router instead:
-	// the interesting limits — login, signup, password reset — are much tighter
-	// than anything you would put on a whole API.
+	// limit for only some routes belongs on a sub-router; the tight limits
+	// (login, signup, password reset) are not ones you would apply API-wide.
 	RateLimit *middleware.RateLimitOptions
 
 	// Timeout bounds a request. Default 30 seconds; a negative value disables
-	// it. Disable it for a router serving long-lived responses — streaming,
-	// server-sent events, an upload — since the timeout cancels those too.
+	// it. Disable it on a router serving streaming responses, server-sent
+	// events or uploads, which the timeout would cancel.
 	Timeout time.Duration
 
 	// CompressLevel enables gzip at that level, 1 to 9. Zero leaves compression
@@ -57,28 +56,25 @@ type RouterOptions struct {
 // DefaultTimeout bounds a request unless RouterOptions says otherwise.
 const DefaultTimeout = 30 * time.Second
 
-// NewRouter returns a chi router with the middleware stack assembled in the
-// order that makes each piece work.
+// NewRouter returns a chi router with the middleware stack in the order each
+// piece needs.
 //
-// The order is the value here. Read it downwards:
-//
-//  1. RequestID, so everything after it — including the panic recovery — can
-//     name the request it is talking about.
-//  2. GetHead, because chi answers HEAD with 405 on a route registered for GET,
-//     and RFC 9110 says HEAD is available wherever GET is. Uptime checks, CDNs
-//     and link checkers all reach for it; `curl -sI` against an endpoint
-//     returning 405 reads as "this endpoint is broken".
+//  1. RequestID, so everything after it, including panic recovery, can name the
+//     request.
+//  2. GetHead. chi answers HEAD with 405 on a route registered for GET, while
+//     RFC 9110 requires HEAD wherever GET is served; uptime checks and CDNs use
+//     it.
 //  3. RealIP, before anything that cares who the client is. After the rate
-//     limiter it would be useless, because the limiter would already have
-//     bucketed every client behind the proxy together.
-//  4. RequestLog, above Recoverer so that a panic is still logged as a request
-//     with a status, rather than vanishing from the access log entirely.
+//     limiter it would have no effect, the limiter having already bucketed
+//     every client behind the proxy together.
+//  4. RequestLog, above Recoverer, so a panic is still logged as a request with
+//     a status.
 //  5. Recoverer, above the timeout and the handler, so it catches panics from
 //     both.
 //  6. Timeout, then compression, then CORS, then the rate limit.
 //
-// Nothing stops you building your own chain out of httpx/middleware. This is
-// the order to copy when you do.
+// Build your own chain from httpx/middleware if this does not suit; this is the
+// order to copy.
 func NewRouter(opts RouterOptions) *chi.Mux {
 	logger := opts.Logger
 	if logger == nil {
@@ -123,8 +119,7 @@ func NewRouter(opts RouterOptions) *chi.Mux {
 		r.Use(middleware.RateLimit(*opts.RateLimit))
 	}
 
-	// chi's defaults write plain text and no request id. These match every
-	// other error the service produces.
+	// chi's defaults write plain text with no request id.
 	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
 		Error(w, req, http.StatusNotFound, nil)
 	})

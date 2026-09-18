@@ -112,8 +112,8 @@ func TestRouterRateLimit(t *testing.T) {
 }
 
 func TestRouterRealIPRunsBeforeTheRateLimiter(t *testing.T) {
-	// The ordering that decides whether a rate limit means anything behind a
-	// proxy: with them the wrong way round every client shares one bucket.
+	// With these the wrong way round, every client behind the proxy shares one
+	// bucket.
 	var seenRemote string
 	r := httpx.NewRouter(httpx.RouterOptions{
 		Logger: log.New(log.Options{Output: io.Discard}),

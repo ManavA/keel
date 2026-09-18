@@ -10,12 +10,10 @@ import (
 	"github.com/ManavA/keel/log"
 )
 
-// ErrorBody is the shape of every error this package writes.
-//
-// One field, and it holds a fixed phrase for the status code. Not the error
-// Go produced, not the identifier the caller sent, not the name of the table
-// that rejected it. The request id is there so that a user quoting it from a
-// support ticket leads you straight to the log line that does hold all of that.
+// ErrorBody is the shape of every error this package writes. The message is a
+// fixed phrase for the status code, never the Go error, the identifier the
+// caller sent, or the name of the table that rejected it. The request id lets a
+// user quote something that leads to the log line holding the detail.
 type ErrorBody struct {
 	Error     string `json:"error"`
 	RequestID string `json:"request_id,omitempty"`
@@ -23,9 +21,8 @@ type ErrorBody struct {
 
 // JSON writes v as a JSON response with the given status.
 //
-// A nil slice is written as [] rather than null. The two are the same thing in
-// Go and are not the same thing in a browser, where `null.length` throws and
-// every consumer of a list endpoint has to learn that the hard way.
+// A nil slice is written as [] rather than null, because `null.length` throws
+// in the browser clients that consume list endpoints.
 func JSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -33,16 +30,14 @@ func JSON(w http.ResponseWriter, status int, v any) {
 	if v == nil {
 		return
 	}
-	// Encode writes to a connection whose status line has already gone out, so
-	// the only errors it can return now are the client having hung up. There is
-	// nothing to say to them and nothing worth logging.
+	// The status line has already gone out, so the only error Encode can return
+	// now is the client having hung up.
 	_ = json.NewEncoder(w).Encode(normalizeNilSlice(v))
 }
 
-// normalizeNilSlice turns a nil slice into an empty one. Only at the top level:
-// walking a whole value graph to fix up nested nil slices would cost something
-// on every response, and a nested null is a field a client can check, whereas a
-// null where the entire body should be a list is a crash.
+// normalizeNilSlice turns a nil slice into an empty one, at the top level only.
+// Walking the whole value graph would cost something on every response, and a
+// nested null is a field a client can check.
 func normalizeNilSlice(v any) any {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() == reflect.Slice && rv.IsNil() {
@@ -54,23 +49,20 @@ func normalizeNilSlice(v any) any {
 // NoContent writes 204.
 func NoContent(w http.ResponseWriter) { w.WriteHeader(http.StatusNoContent) }
 
-// Error writes a generic error body for status, and logs the real reason with
-// the request id.
-//
-// The caller sees "not found". The log sees the error, the path and the id that
-// ties them together. Keeping those apart is the whole rule:
+// Error writes a generic error body for status and logs the real reason with
+// the request id. The caller sees "not found"; the log has the error, the path
+// and the id tying them together.
 //
 //   - 404, never 403, for an identifier that belongs to someone else. A 403
-//     says the thing exists, which is the one fact the request was trying to
-//     establish. Answer a foreign id exactly as you answer an invented one.
-//   - Never echo the input. An identifier that comes back in the response body
-//     is a reflection bug as soon as somebody puts markup in it, and quoting it
-//     tells the caller their guess was well formed.
-//   - Never return the error text. "pq: duplicate key value violates unique
-//     constraint users_email_key" names your database, your schema and your
-//     index, and it answers "is this address registered" on the way past.
+//     confirms the record exists, which is what the request was trying to
+//     establish.
+//   - Never echo the input. An identifier returned in the body is a reflection
+//     bug once it contains markup, and it confirms the guess was well formed.
+//   - Never return the error text. "duplicate key value violates unique
+//     constraint users_email_key" names the schema and answers "is this address
+//     registered" on the way past.
 //
-// err may be nil, for a refusal that has no underlying failure.
+// err may be nil, for a refusal with no underlying failure.
 func Error(w http.ResponseWriter, r *http.Request, status int, err error) {
 	id := log.RequestID(r.Context())
 
@@ -94,10 +86,9 @@ func NotFound(w http.ResponseWriter, r *http.Request) {
 	Error(w, r, http.StatusNotFound, nil)
 }
 
-// BadRequest refuses a malformed request. err is logged, not returned: a
-// validation message written for a developer describes your internal field
-// names, and a caller who needs to know which field was wrong needs a
-// deliberately designed response, not a leaked one.
+// BadRequest refuses a malformed request. err is logged, not returned:
+// validation messages describe internal field names. An endpoint that should
+// tell a caller which field was wrong needs a response designed for that.
 func BadRequest(w http.ResponseWriter, r *http.Request, err error) {
 	Error(w, r, http.StatusBadRequest, err)
 }
@@ -112,9 +103,8 @@ func InternalError(w http.ResponseWriter, r *http.Request, err error) {
 	Error(w, r, http.StatusInternalServerError, err)
 }
 
-// statusMessage is the only text an error response ever carries. It comes from
-// the status code and nothing else, so there is no path by which a value from
-// the request reaches the body.
+// statusMessage is the only text an error response carries. It is derived from
+// the status code alone, so no value from the request can reach the body.
 func statusMessage(status int) string {
 	if text := http.StatusText(status); text != "" {
 		return strings.ToLower(text)

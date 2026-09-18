@@ -8,15 +8,13 @@ import (
 	"net/http"
 )
 
-// recorder wraps an http.ResponseWriter to remember the status and the number
-// of bytes written, which is what a request log needs and what net/http does
-// not expose.
+// recorder wraps an http.ResponseWriter to remember the status and byte count,
+// which a request log needs and net/http does not expose.
 //
-// The delegating methods below are not decoration. A wrapper that implements
-// only ResponseWriter silently removes streaming from every handler beneath it
-// (no Flush), breaks websocket upgrades (no Hijack), and turns io.Copy into a
-// byte-by-byte loop (no ReadFrom). Unwrap is what lets http.ResponseController
-// reach the original writer for everything not covered here.
+// The delegating methods matter. A wrapper implementing only ResponseWriter
+// removes streaming from every handler beneath it (no Flush), breaks websocket
+// upgrades (no Hijack) and turns io.Copy into a byte-by-byte loop (no
+// ReadFrom). Unwrap lets http.ResponseController reach the original writer.
 type recorder struct {
 	http.ResponseWriter
 	status      int

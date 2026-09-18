@@ -30,8 +30,7 @@ func seen(t *testing.T, opts middleware.RealIPOptions, remoteAddr string, forwar
 }
 
 func TestRealIPIgnoresHeadersByDefault(t *testing.T) {
-	// The whole reason the zero value exists. A service with no proxy in front
-	// must not let a client name itself.
+	// A service with no proxy in front must not let a client name itself.
 	got := seen(t, middleware.RealIPOptions{}, "203.0.113.9:4444", "1.2.3.4")
 	assert.Equal(t, "203.0.113.9:4444", got)
 }
@@ -45,9 +44,8 @@ func TestRealIPTakesTheRightmostUntrustedEntry(t *testing.T) {
 		want      string
 	}{
 		{
-			// The defect this middleware exists for. A client that sends its
-			// own X-Forwarded-For gets the leftmost slot, and an implementation
-			// reading from the left believes it.
+			// A client that sends its own X-Forwarded-For occupies the leftmost
+			// slot, and an implementation reading from the left believes it.
 			name:      "a client-supplied entry on the left is not believed",
 			forwarded: []string{"198.51.100.1, 203.0.113.9, 10.0.0.5"},
 			want:      "203.0.113.9",

@@ -10,9 +10,9 @@ import (
 
 // RealIPOptions configures RealIP.
 //
-// The zero value ignores forwarding headers entirely, which is the only safe
-// default: X-Forwarded-For is a request header like any other, and a service
-// reachable directly will happily believe whatever a client writes in it.
+// The zero value ignores forwarding headers. X-Forwarded-For is a request
+// header like any other, so a service reachable directly would otherwise
+// believe whatever a client wrote in it.
 type RealIPOptions struct {
 	// TrustedProxies are the addresses and CIDR blocks of proxies in front of
 	// this service. An entry in the header that matches one of these is a hop,
@@ -20,40 +20,32 @@ type RealIPOptions struct {
 	TrustedProxies []string
 
 	// TrustAnyPeer honours the header whatever address the connection came
-	// from. Set it when the platform guarantees nothing can reach the process
-	// except its own front end, and the front end's address range is not
-	// something you can enumerate — a managed container runtime, typically.
+	// from. Set it on a managed container runtime, where nothing but the
+	// platform's front end can reach the process and that front end's address
+	// range is not enumerable.
 	//
-	// It is a real loosening: if anything else can reach the port, that thing
-	// can claim any client IP it likes.
+	// It is a genuine loosening: anything else that can reach the port can
+	// claim any client address.
 	TrustAnyPeer bool
 
-	// Header defaults to X-Forwarded-For. X-Real-IP is the other common
-	// spelling; it carries a single address rather than a list, which this
-	// handles.
+	// Header defaults to X-Forwarded-For. X-Real-IP carries a single address
+	// rather than a list, which this also handles.
 	Header string
 }
 
-// RealIP rewrites r.RemoteAddr to the client's address, so that everything
-// downstream — rate limiting, logging, abuse rules — sees the client rather
-// than the proxy.
+// RealIP rewrites r.RemoteAddr to the client's address, so that rate limiting,
+// logging and abuse rules see the client rather than the proxy.
 //
 // The address is the rightmost entry in the forwarding header that is not a
-// trusted proxy. Rightmost, not leftmost, and this is the whole point of the
-// middleware.
+// trusted proxy. Rightmost, not leftmost: each hop appends to the header, so
+// the leftmost entry is whatever the original client sent, including a list it
+// invented before any proxy saw the request. Reading from the left — which is
+// what several widely used implementations do — lets a client choose its own
+// rate-limit bucket on every request.
 //
-// A forwarding header is a list that each hop appends to, so the leftmost entry
-// is whatever the original client sent — including a client that sent a list of
-// its own invention before any proxy ever saw the request. Trusting the
-// leftmost entry (which is what the obvious implementation does, and what
-// several widely used ones do) hands every client a per-request way to pick its
-// own identity, and therefore its own rate-limit bucket. Walking from the right
-// and stopping at the first address no trusted proxy could have written is the
-// only reading that cannot be forged.
-//
-// When the header is not trusted — no trusted proxies configured, or a
-// connection from an address that is not one of them — RemoteAddr is left
-// exactly as it was.
+// When the header is not trusted, because no trusted proxies are configured or
+// the connection came from an address that is not one of them, RemoteAddr is
+// left unchanged.
 func RealIP(opts RealIPOptions) func(http.Handler) http.Handler {
 	header := opts.Header
 	if header == "" {
@@ -88,9 +80,8 @@ func clientIP(headers []string, trusted []*net.IPNet) string {
 	for i := len(entries) - 1; i >= 0; i-- {
 		ip := parseIP(entries[i])
 		if ip == nil {
-			// An unparseable entry is not evidence of anything. Skipping it
-			// rather than stopping means a proxy that writes a hostname, or a
-			// client that writes rubbish, does not hide the entries behind it.
+			// Skip rather than stop, so a proxy that writes a hostname does not
+			// hide the entries behind it.
 			continue
 		}
 		if inAny(ip, trusted) {
@@ -126,8 +117,8 @@ func parseIP(s string) net.IP {
 }
 
 // parseCIDRs accepts CIDR blocks and single addresses. An entry that is neither
-// is dropped: a typo in a proxy list must not silently widen what is trusted,
-// and dropping it narrows instead.
+// is dropped, so a typo in the proxy list narrows what is trusted rather than
+// widening it.
 func parseCIDRs(entries []string) []*net.IPNet {
 	nets := make([]*net.IPNet, 0, len(entries))
 	for _, e := range entries {

@@ -1,21 +1,15 @@
-// Package log builds the slog logger a service uses, with two behaviours that
-// are hard to add afterwards.
+// Package log builds the slog logger a service uses.
 //
-// It refuses to print the value of an attribute whose key names a credential.
-// Nobody logs a password on purpose; it arrives because a struct got dumped
-// whole, or because a handler logged the request body of the one endpoint that
-// takes a token. A rule in the handler catches those, and it catches them in
-// code nobody thought to review.
-//
-// It carries the request id without being asked. slog hands every record its
-// context, so the id put there by the request-id middleware ends up on every
-// line a handler logs, including lines logged four packages deep by code that
-// has never heard of HTTP.
+// It adds two behaviours to slog's JSON handler that are awkward to add later.
+// It replaces the value of any attribute whose key names a credential, which
+// catches the cases nobody wrote on purpose: a struct dumped whole, a request
+// body logged by the one endpoint that takes a token. And it reads the request
+// id from the record's context, so a line logged deep in a call stack carries
+// the id without every layer having to pass a logger down.
 //
 // Options.Cloud maps slog's level onto the "severity" field Google Cloud
-// Logging reads. Without it every entry lands at DEFAULT severity and alert
-// policies that match on severity match nothing — quietly, because the logs
-// themselves look fine.
+// Logging reads. Without it every entry is DEFAULT severity and alert policies
+// that match on severity match nothing.
 package log
 
 import (
@@ -31,9 +25,9 @@ type Options struct {
 	// Level defaults to slog.LevelInfo.
 	Level slog.Leveler
 
-	// Output defaults to os.Stdout. Logs belong on stdout: a container
-	// platform collects both streams, and putting ordinary operation on stderr
-	// makes every log line look like a problem to anything that separates them.
+	// Output defaults to os.Stdout. Container platforms collect both streams,
+	// and tools that separate them treat stderr as a problem, so ordinary
+	// operation belongs on stdout.
 	Output io.Writer
 
 	// Cloud maps the level onto a "severity" key for Google Cloud Logging.
@@ -43,14 +37,12 @@ type Options struct {
 	// message turns out to be ambiguous; not worth the cost by default.
 	AddSource bool
 
-	// SecretKeys are extra attribute keys to redact, beyond the ones that look
-	// like credentials on their own. For the key your service happens to call
-	// something else.
+	// SecretKeys are extra attribute keys to redact, for a credential your
+	// service names something this package would not recognise.
 	SecretKeys []string
 
-	// NoRedact turns redaction off. There is one honest reason to set it: a
-	// test that asserts on the value of an attribute this package would
-	// otherwise hide.
+	// NoRedact turns redaction off. Intended for a test that asserts on the
+	// value of an attribute this package would otherwise hide.
 	NoRedact bool
 }
 
@@ -94,7 +86,7 @@ func replacer(opts Options) func([]string, slog.Attr) slog.Attr {
 }
 
 // cloudSeverity rewrites slog's "level" into the "severity" key Cloud Logging
-// reads. WARNING, not slog's WARN: the spelling is the whole point.
+// reads. The spelling matters: Cloud Logging wants WARNING, not slog's WARN.
 func cloudSeverity(groups []string, a slog.Attr) slog.Attr {
 	if a.Key != slog.LevelKey || len(groups) != 0 {
 		return a
@@ -117,10 +109,9 @@ func cloudSeverity(groups []string, a slog.Attr) slog.Attr {
 
 // contextHandler puts the request id from the context onto every record.
 //
-// It wraps rather than replaces the JSON handler because the alternative — a
-// middleware that calls logger.With(requestID) and stuffs the logger into the
-// context — only works for code that remembers to pull the logger back out.
-// Anything logging through slog.Default, which is most code, would lose the id.
+// The alternative is a middleware that calls logger.With(requestID) and puts
+// the logger in the context, which only reaches code that pulls the logger back
+// out. Anything logging through slog.Default would lose the id.
 type contextHandler struct{ slog.Handler }
 
 func (h *contextHandler) Handle(ctx context.Context, r slog.Record) error {

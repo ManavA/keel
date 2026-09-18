@@ -9,11 +9,8 @@ import (
 // Placeholder is what a redacted value is replaced with.
 const Placeholder = "[redacted]"
 
-// Unset is what a redacted EMPTY value is replaced with. It is a different
-// string from Placeholder on purpose: "the token is missing" and "the token is
-// set and I am not showing it to you" are the two answers you actually want
-// from a log line, and collapsing them into one leaves you unable to tell an
-// unconfigured service from a misconfigured one.
+// Unset replaces a redacted empty value. It differs from Placeholder so that an
+// unset secret can be told apart from one that is set and hidden.
 const Unset = "[unset]"
 
 // Redact replaces a secret value with a placeholder.
@@ -24,17 +21,12 @@ func Redact(value string) string {
 	return Placeholder
 }
 
-// RedactURL strips the credentials out of a connection string while keeping
-// everything that makes it identifiable: scheme, host, port, path.
+// RedactURL removes the credentials from a connection string and keeps the
+// scheme, host, port and path.
 //
-// Do not reach for string surgery instead. The shell version of this
-// ("${URL%%@*}@***") cut at the first "@" and kept the part BEFORE it — which
-// is the userinfo — so it published the password and hid the host, and it did
-// so on every run of a migration job for weeks before anyone read the output
-// closely enough to notice.
-//
-// A string that does not parse as a URL is redacted whole. Guessing at the
-// shape of something unrecognised is how the shell version got it wrong.
+// Use it rather than string surgery. Cutting at the first "@" and keeping the
+// left-hand side keeps the password and discards the host, which is the wrong
+// way round. A string that does not parse as a URL is redacted whole.
 func RedactURL(raw string) string {
 	if raw == "" {
 		return Unset
@@ -44,8 +36,8 @@ func RedactURL(raw string) string {
 		return Placeholder
 	}
 	if u.User != nil {
-		// The username stays. It is often the only clue to which database you
-		// are actually pointed at, and it is not the secret.
+		// The username stays: it is not the secret, and it often identifies
+		// which database this is.
 		name := u.User.Username()
 		if _, hasPassword := u.User.Password(); hasPassword {
 			u.User = url.UserPassword(name, Placeholder)
@@ -88,17 +80,13 @@ type Field struct {
 	Secret bool
 }
 
-// Redacted renders a configuration struct as fields safe to log at startup.
+// Redacted renders a configuration struct as fields safe to log at startup,
+// which is the quickest way to confirm a deployment is reading the variables it
+// was given.
 //
-// Logging the configuration you actually loaded is the cheapest possible answer
-// to "is this deployment even reading the variable I set", and services skip it
-// because dumping a struct that contains a password is worse than dumping
-// nothing. This makes the dump safe, so there is no reason left not to do it.
-//
-// Secret fields — the same ones Load trims, by the same rule — are replaced
-// rather than printed. Anything whose name ends in URL is passed through
-// RedactURL, because a connection string is both a secret and the single most
-// useful line in a startup log.
+// Secret fields — the same ones Load trims, by the same rule — are replaced.
+// URL fields go through RedactURL, so the host survives and the password does
+// not.
 func Redacted(cfg any) []Field {
 	v := reflect.ValueOf(cfg)
 	for v.Kind() == reflect.Pointer {

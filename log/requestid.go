@@ -2,17 +2,16 @@ package log
 
 import "context"
 
-// RequestIDKey is the attribute key a request id is logged under, and the name
-// this package looks for. It is exported so a service that already emits
-// request ids under a different name can line the two up rather than emitting
-// both.
+// RequestIDKey is the attribute key a request id is logged under. Exported so a
+// service that already emits request ids under another name can line the two
+// up.
 const RequestIDKey = "request_id"
 
 type requestIDContextKey struct{}
 
 // WithRequestID returns a context carrying id. The request-id middleware in
-// httpx/middleware calls this; so can anything else with an id worth
-// propagating — a queue consumer handling a message, a job run.
+// httpx/middleware calls it, as can anything else with an id worth propagating:
+// a queue consumer, a job run.
 func WithRequestID(ctx context.Context, id string) context.Context {
 	if id == "" {
 		return ctx

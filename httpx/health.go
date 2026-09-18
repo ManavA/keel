@@ -11,12 +11,11 @@ import (
 	"github.com/ManavA/keel/httpx/buildinfo"
 )
 
-// A Check reports whether one dependency is usable right now. It returns nil
+// A Check reports whether one dependency is usable right now, returning nil
 // when it is.
 //
-// Keep it cheap and give it a real query: a check that only proves a TCP
-// connection can be opened goes green against a database that refuses every
-// statement. pg.HealthCheck returns one of these.
+// Give it a real query. A check that only opens a TCP connection reports green
+// against a database that refuses every statement. pg.HealthCheck returns one.
 type Check func(context.Context) error
 
 // HealthOptions configures Health.
@@ -25,18 +24,14 @@ type HealthOptions struct {
 	// runs them.
 	Checks map[string]Check
 
-	// Timeout bounds the whole set of checks. Default 3 seconds. A readiness
-	// endpoint that can hang is worse than one that can fail, because the
-	// prober's own timeout decides what happens and it will not tell you which
+	// Timeout bounds the whole set of checks. Default 3 seconds. Without it the
+	// prober's own timeout decides the outcome, and it cannot say which
 	// dependency it was waiting for.
 	Timeout time.Duration
 
-	// CacheTTL is how long a result is reused. Default 5 seconds.
-	//
-	// Readiness gets polled by every prober, load balancer and uptime check you
-	// own, from several regions, on their own schedules. Without a cache that
-	// traffic reaches your database as a continuous query load that exists
-	// purely to ask whether the database is up.
+	// CacheTTL is how long a result is reused. Default 5 seconds. Readiness is
+	// polled by every prober and load balancer on its own schedule, and without
+	// a cache all of it reaches the database.
 	CacheTTL time.Duration
 
 	// LivenessPath and ReadinessPath default to /healthz and /readyz.
@@ -44,12 +39,9 @@ type HealthOptions struct {
 	ReadinessPath string
 
 	// ExposeCheckErrors puts the error text from a failing check into the
-	// response. Off by default, and for the same reason httpx.Error never
-	// returns an error to a caller: a driver error names your host, your
-	// database and sometimes your credentials. The error is logged either way,
-	// so turning this on buys convenience, not information.
-	//
-	// Turn it on when the endpoint is genuinely unreachable from outside.
+	// response. Off by default: a driver error names the host, the database and
+	// sometimes the credentials. The error is logged either way. Turn it on
+	// when the endpoint is unreachable from outside.
 	ExposeCheckErrors bool
 
 	// Logger defaults to slog.Default.
@@ -60,10 +52,9 @@ type HealthOptions struct {
 type healthResponse struct {
 	Status string `json:"status"`
 
-	// Build names the deployment that answered. It is always present, and reads
-	// "unknown" rather than being omitted, because a missing field cannot be
-	// told apart from an older deployment that predates the field — which is
-	// exactly the question being asked.
+	// Build names the deployment that answered. Always present, reading
+	// "unknown" rather than being omitted: a missing field cannot be told apart
+	// from a deployment older than the field itself.
 	Build buildinfo.Info `json:"build"`
 
 	Checks map[string]string `json:"checks,omitempty"`
@@ -71,15 +62,13 @@ type healthResponse struct {
 
 // Health returns a handler serving liveness and readiness.
 //
-// The two are different questions and conflating them causes outages. Liveness
-// asks whether the process is running, and a failing answer means "restart me".
-// Readiness asks whether it can serve, and a failing answer means "send traffic
-// elsewhere for now". Point a restart policy at a readiness endpoint and a
-// database blip restarts every instance you have, all at once, which turns a
-// blip into an outage.
+// They answer different questions. Liveness asks whether the process is
+// running; a failure means restart it. Readiness asks whether it can serve; a
+// failure means route traffic elsewhere for now. A restart policy pointed at a
+// readiness endpoint restarts every instance at once during a database blip.
 //
-// So /healthz checks nothing and answers 200 as long as the process can serve a
-// request at all, and /readyz runs the checks and answers 503 when one fails.
+// So /healthz checks nothing and answers 200 while the process can serve a
+// request, and /readyz runs the checks and answers 503 when one fails.
 func Health(opts HealthOptions) http.Handler {
 	h := &healthHandler{
 		checks:   opts.Checks,
@@ -166,9 +155,8 @@ func (h *healthHandler) run(ctx context.Context) (healthResponse, bool) {
 	results := make(map[string]string, len(h.checks))
 	healthy := true
 
-	// Sequential, in name order. Checks are cheap and few, the results are
-	// cached, and a deterministic order means the log line for a failure is the
-	// same every time.
+	// Sequential, in name order. Checks are few and cached, and a fixed order
+	// makes the failure log reproducible.
 	for _, name := range sortedKeys(h.checks) {
 		if err := h.checks[name](ctx); err != nil {
 			h.log.ErrorContext(ctx, "readiness check failed", "check", name, "error", err)
@@ -198,9 +186,8 @@ func sortedKeys(m map[string]Check) []string {
 	return names
 }
 
-// noStore keeps a health response out of every cache. Its whole purpose is to
-// describe this instance right now, and a cached "ok" outlives the health it
-// described.
+// noStore keeps a health response out of every cache: it describes this
+// instance right now, and a cached "ok" outlives what it described.
 func noStore(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 }

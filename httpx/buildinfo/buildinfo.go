@@ -1,17 +1,14 @@
-// Package buildinfo answers the one question a running service cannot
-// otherwise answer about itself: which build is this.
+// Package buildinfo reports which revision the running binary was built from.
 //
-// A test suite that runs against a deployed environment and reports green is
-// not evidence unless you know what it ran against. A deployment that has
-// silently stopped updating — a blocked pipeline, a failed push, a rollback
-// nobody announced — produces exactly the same green as a healthy one, and a
-// health endpoint returning {"status":"ok"} is telling the truth the whole
-// time, because the database really is fine. The build is the missing field.
+// A test run against a deployed environment is not evidence unless you know
+// what it ran against, and a deployment that has silently stopped updating —
+// a blocked pipeline, a failed push, an unannounced rollback — looks exactly
+// like a healthy one from the outside. A health endpoint returning
+// {"status":"ok"} is telling the truth throughout.
 //
-// The revision comes from a linker flag when the pipeline sets one, and from
-// Go's own VCS stamp otherwise. It is never defaulted to something that looks
-// like an answer: when nothing is known, Get reports Unknown, and callers are
-// expected to treat that as "cannot compare" rather than "matches".
+// The revision comes from a linker flag when the build sets one, and from Go's
+// VCS stamp otherwise. When neither is available Get reports Unknown rather
+// than something that could be mistaken for an answer.
 package buildinfo
 
 import (
@@ -30,9 +27,9 @@ var Revision string
 var BuiltAt string
 
 // Unknown is what Get reports when nothing was injected and the build carries
-// no VCS stamp — a local `go run`, or an image built from an exported tree. It
-// is a word rather than an empty string so that it cannot be mistaken for a
-// revision that happens to render as blank in a log line or a JSON field.
+// no VCS stamp: a local `go run`, or an image built from an exported tree. A
+// word rather than an empty string, which would be indistinguishable from a
+// revision that renders as blank.
 const Unknown = "unknown"
 
 // Info is the build identity, as served.
@@ -40,10 +37,9 @@ type Info struct {
 	Revision string `json:"revision"`
 	BuiltAt  string `json:"built_at,omitempty"`
 
-	// Dirty reports that the tree had uncommitted changes at build time. A
-	// revision from a dirty tree names a commit whose contents are not what is
-	// running, so a comparison against it can be confidently wrong — which is
-	// worse than being unable to compare at all.
+	// Dirty reports that the tree had uncommitted changes at build time. Such a
+	// revision names a commit whose contents are not what is running, so a
+	// comparison against it can be wrong rather than merely unavailable.
 	Dirty bool `json:"dirty,omitempty"`
 }
 
@@ -70,21 +66,16 @@ func Get() Info {
 	return resolve(Revision, BuiltAt, settings)
 }
 
-// resolve is Get with its inputs passed in rather than read from the process.
-//
-// The split is not stylistic. Written against the package variables, a test for
-// the precedence rule below passes while the precedence branch is deleted: a
-// `go test` binary carries no vcs.* settings at all, so there is never a stamp
-// for the injected value to outrank and both sides of the comparison are the
-// string "unknown". Taking the settings as an argument is the only way a test
-// can supply one.
+// resolve is Get with its inputs passed in rather than read from the process,
+// so a test can supply a VCS stamp. Written against the package variables, a
+// test of the precedence rule passes even with the precedence branch deleted: a
+// `go test` binary carries no vcs.* settings, so there is never a stamp for the
+// injected value to outrank.
 //
 // The linker flag wins. An image is built from a checkout whose stamp may be
-// missing or may name a vendored parent commit, whereas a pipeline knows the
-// revision it was told to ship. The VCS stamp is the fallback, so a plain
-// `go build` with nobody remembering the flag still produces a comparable
-// identity — the point is to remove a failure mode, not to move it into a build
-// script.
+// missing or may name a parent commit, while the pipeline knows the revision it
+// was told to ship. The VCS stamp is the fallback, so a plain `go build` still
+// produces a comparable identity.
 func resolve(injectedRev, injectedAt string, settings []debug.BuildSetting) Info {
 	info := Info{
 		Revision: strings.TrimSpace(injectedRev),

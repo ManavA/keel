@@ -10,10 +10,10 @@ import (
 // CORSOptions configures CORS. The zero value allows nothing, which is the
 // correct default for an API that is not called from a browser at all.
 type CORSOptions struct {
-	// AllowedOrigins are exact origins, "https://app.example.com". A single
-	// "*" allows any origin, which cannot be combined with AllowCredentials —
-	// browsers reject that pairing, so setting both gets you an API that works
-	// in curl and fails in every browser.
+	// AllowedOrigins are exact origins, "https://app.example.com". A single "*"
+	// allows any origin and cannot be combined with AllowCredentials; browsers
+	// reject that pairing, so an API with both works in curl and fails in the
+	// browser.
 	AllowedOrigins []string
 
 	// AllowedMethods defaults to the safe set plus the four that change things.
@@ -23,11 +23,9 @@ type CORSOptions struct {
 	// request id header.
 	AllowedHeaders []string
 
-	// ExposedHeaders are the response headers JavaScript is allowed to read.
-	// Anything not listed here is invisible to the browser, whatever the
-	// response actually contains — which is how a pagination total ends up
-	// being reported as the page size by a client that cannot see the header
-	// carrying it.
+	// ExposedHeaders are the response headers JavaScript may read. Anything not
+	// listed is invisible to the browser whatever the response contains, so a
+	// client reading a pagination total from a header sees nothing.
 	ExposedHeaders []string
 
 	// AllowCredentials lets the browser send cookies and Authorization.

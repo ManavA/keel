@@ -26,13 +26,13 @@ linters:
 
   exclusions:
     rules:
-      # Encoding a response body after the status line is on the wire can only
-      # fail because the client hung up. There is nothing left to say to them
-      # and nothing to log that is not noise.
+      # The status line is already on the wire, so the only error Encode can
+      # return is the client having hung up.
       - linters: [errcheck]
         source: "json.NewEncoder\\(w\\).Encode"
-      # Test helpers assert rather than return.
-      - linters: [errcheck, gosec]
+      # Test helpers assert rather than return, and a test client talking to a
+      # server it started itself needs neither a context nor a body close.
+      - linters: [errcheck, gosec, noctx, bodyclose]
         path: _test\.go
 
 formatters:

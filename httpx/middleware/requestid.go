@@ -15,16 +15,15 @@ const RequestIDHeader = "X-Request-Id"
 // RequestIDOptions configures RequestID.
 type RequestIDOptions struct {
 	// TrustInbound accepts a client-supplied X-Request-Id instead of generating
-	// one. It makes a trace span a whole system instead of one service, which
-	// is worth a lot — and it lets a caller choose the string that will appear
-	// in your logs, which is worth thinking about once. Inbound ids are length
-	// capped and stripped of anything but printable ASCII before use.
+	// one, so a trace spans the whole system rather than one service. It also
+	// lets a caller choose a string that will appear in your logs; inbound ids
+	// are length capped and stripped to a safe character set first.
 	TrustInbound bool
 }
 
-// RequestID puts an id on every request: into the context for log to pick up,
-// and into the response header so that a user reporting an error can quote
-// something you can search for.
+// RequestID puts an id on every request: into the context, where log picks it
+// up, and into the response header, so a user reporting an error can quote
+// something searchable.
 func RequestID(opts RequestIDOptions) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -15,22 +15,20 @@ type RequestLogOptions struct {
 	Logger *slog.Logger
 
 	// Skip returns true for requests that should not be logged. A health check
-	// polled every few seconds by three regions otherwise buries everything
-	// else; there is no point having a log you have to filter before reading.
+	// polled every few seconds from several regions otherwise buries
+	// everything else.
 	Skip func(*http.Request) bool
 
-	// SlowRequest, if set, raises a request taking longer than this to warn
-	// level. Nothing else about the line changes, so a dashboard counting warns
-	// counts slow requests without a separate metric.
+	// SlowRequest, if set, logs a request taking longer than this at warn level.
+	// Nothing else about the line changes.
 	SlowRequest time.Duration
 }
 
 // RequestLog logs one line per request, after the response.
 //
-// The query string is logged with credential-looking parameters removed. This
-// is not hypothetical tidiness: password reset links, email verification links
-// and signed download URLs all put a single-use credential in the query string,
-// and every one of them gets logged in full by the obvious implementation.
+// The query string has credential-shaped parameters removed. Password reset
+// links, email verification links and signed download URLs all carry a
+// single-use credential in the query string.
 func RequestLog(opts RequestLogOptions) func(http.Handler) http.Handler {
 	logger := opts.Logger
 	if logger == nil {
@@ -71,8 +69,8 @@ func RequestLog(opts RequestLogOptions) func(http.Handler) http.Handler {
 	}
 }
 
-// RedactQuery renders query parameters with credential-looking values replaced.
-// Exported because a handler that logs a URL of its own needs the same rule.
+// RedactQuery renders query parameters with credential-shaped values replaced.
+// Exported for handlers that log a URL of their own.
 func RedactQuery(values url.Values) string {
 	if len(values) == 0 {
 		return ""

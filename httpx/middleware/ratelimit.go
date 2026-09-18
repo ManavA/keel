@@ -17,15 +17,13 @@ type RateLimitOptions struct {
 
 	// Key chooses the bucket. Nil means per client address.
 	//
-	// The per-address default is only as good as r.RemoteAddr, so RealIP has to
-	// run before this middleware. The wrong way round, every request carries
-	// the proxy's address, the whole internet shares one bucket, and the limit
-	// either blocks everybody or protects nobody.
+	// That default is only as good as r.RemoteAddr, so RealIP must run before
+	// this middleware. The wrong way round, every request carries the proxy's
+	// address and all clients share one bucket.
 	Key func(*http.Request) (string, error)
 
-	// Message is the response body. It defaults to a generic one and should
-	// stay generic: a limiter that reports which bucket you fell into confirms
-	// for an attacker that they guessed an identifier correctly.
+	// Message is the response body, generic by default. Keep it generic: a
+	// limiter that names the bucket confirms a guessed identifier.
 	Message string
 }
 
@@ -56,13 +54,12 @@ func RateLimit(opts RateLimitOptions) func(http.Handler) http.Handler {
 	)
 }
 
-// KeyByIP buckets by the client address in r.RemoteAddr, deliberately ignoring
-// forwarding headers: RealIP has already decided what to believe about those,
-// and a limiter that re-reads the raw header undoes that decision.
+// KeyByIP buckets by the client address in r.RemoteAddr, ignoring forwarding
+// headers: RealIP has already decided what to believe about those, and
+// re-reading the raw header undoes that decision.
 //
-// An IPv6 address is reduced to its /64. A client typically controls a whole
-// /64, so keying on the full address lets it take a fresh bucket per request
-// simply by picking a new one.
+// IPv6 addresses are reduced to their /64, since a client usually controls a
+// whole /64 and could otherwise take a fresh bucket per request.
 func KeyByIP(r *http.Request) (string, error) {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -71,11 +68,9 @@ func KeyByIP(r *http.Request) (string, error) {
 	return httprate.CanonicalizeIP(host), nil
 }
 
-// KeyByHeader buckets by the value of a header — an API key, a tenant id.
-//
-// A request without the header falls back to the client address rather than
-// sharing one bucket with every other anonymous request, which would let a
-// single caller exhaust the limit for all of them.
+// KeyByHeader buckets by the value of a header, such as an API key or tenant
+// id. A request without the header falls back to the client address rather than
+// sharing one bucket with every other anonymous request.
 func KeyByHeader(name string) func(*http.Request) (string, error) {
 	return func(r *http.Request) (string, error) {
 		if v := r.Header.Get(name); v != "" {

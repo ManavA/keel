@@ -11,8 +11,7 @@ const Placeholder = "[redacted]"
 
 // secretWords are the substrings that make an attribute key look like a
 // credential. "key" on its own is not among them: cache keys, sort keys and
-// idempotency keys are things you want to read, and a rule that hides all of
-// them to catch api_key is a rule people turn off.
+// idempotency keys are worth reading.
 var secretWords = []string{
 	"secret", "token", "password", "passwd", "credential",
 	"apikey", "authorization", "privatekey", "cookie", "session",
@@ -26,9 +25,8 @@ var secretWords = []string{
 //	slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{ReplaceAttr: log.Redact})
 //
 // It matches on the key, so it catches slog.String("api_token", tok) wherever
-// it was written, but it cannot see inside a value that formats itself — a
-// struct with a Password field logged with %+v arrives as one opaque string.
-// Redaction is a safety net; it is not a reason to log the struct.
+// that was written. It cannot see inside a value that formats itself: a struct
+// with a Password field logged with %+v arrives as one opaque string.
 func Redact(groups []string, a slog.Attr) slog.Attr {
 	return redactAttr(a, nil)
 }
@@ -51,13 +49,11 @@ func redactAttr(a slog.Attr, extra []string) slog.Attr {
 	if IsSecretKey(a.Key) || matchesAny(normalizeKey(a.Key), extra) {
 		return slog.String(a.Key, Placeholder)
 	}
-	// A URL attribute keeps its host and loses its userinfo. Connection strings
-	// get logged constantly — "connecting to %s" is the most natural line in
-	// the world to write — and the host is the part worth reading.
+	// A URL attribute keeps its host and loses its userinfo, since connection
+	// strings are logged often and the host is the useful part.
 	//
-	// config.RedactURL does the same job for a configuration dump. The two are
-	// separate, rather than one calling the other, so that neither of these two
-	// bottom-layer packages has to import the other.
+	// config.RedactURL does the same for a configuration dump. The two are
+	// separate so that neither bottom-layer package imports the other.
 	if isURLKey(a.Key) && a.Value.Kind() == slog.KindString {
 		return slog.String(a.Key, redactURL(a.Value.String()))
 	}
@@ -99,9 +95,8 @@ func redactURL(raw string) string {
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
-		// Not something we can take apart. Anything with an "@" in it might be
-		// carrying credentials, so it goes; a relative path or a bare host does
-		// not, and stays readable.
+		// Not something we can take apart. An "@" might mean credentials, so
+		// the value goes; a relative path or a bare host stays readable.
 		if strings.Contains(raw, "@") {
 			return Placeholder
 		}
