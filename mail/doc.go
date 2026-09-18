@@ -23,8 +23,15 @@
 //
 // [LogSender] writes each send through slog and requires no external
 // service; use it for local development or when no provider is configured
-// yet. `mail/testing`'s Recorder captures sends in memory for tests.
-// [PostmarkSender] is the provider-backed implementation and is optional.
+// yet. Because it is also what runs in production if a provider is never
+// configured, it logs only the template alias and a non-reversible hash of
+// the recipient address at Info by default. The recipient address and the
+// full template model — which for a real template can include a
+// password-reset token or another sensitive value — are logged only when
+// [LogSenderOptions.LogBodies] is set, at Debug; leave it unset outside
+// development. `mail/testing`'s Recorder captures sends in memory for
+// tests without logging anything. [PostmarkSender] is the provider-backed
+// implementation and is optional.
 //
 // # Mustache/Mustachio note
 //

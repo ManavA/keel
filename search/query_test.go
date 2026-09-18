@@ -9,11 +9,11 @@ import (
 
 func TestBuildSort(t *testing.T) {
 	table := SortTable{
-		"price_asc": {Field: "price", Dir: Asc},
+		"price_asc": {Field: testField, Dir: Asc},
 		"newest":    {Field: "list_date", Dir: Desc},
 	}
 
-	assert.Equal(t, []SortField{{Field: "price", Dir: Asc}}, BuildSort(table, "price_asc"))
+	assert.Equal(t, []SortField{{Field: testField, Dir: Asc}}, BuildSort(table, "price_asc"))
 	assert.Nil(t, BuildSort(table, ""), "an empty key must fall back to default order, not error")
 	assert.Nil(t, BuildSort(table, "unknown_key"), "an unknown key must fall back to default order, not error")
 }
@@ -25,8 +25,8 @@ type decodeTarget struct {
 
 func TestDecodeHits(t *testing.T) {
 	hits := []map[string]any{
-		{"id": "1", "price": float64(500000)},
-		{"id": "2", "price": float64(750000)},
+		{"id": "1", testField: float64(500000)},
+		{"id": "2", testField: float64(750000)},
 	}
 	out, err := DecodeHits[decodeTarget](hits)
 	require.NoError(t, err)

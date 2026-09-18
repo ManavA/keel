@@ -14,13 +14,13 @@ func TestFormatAddress(t *testing.T) {
 		email string
 		want  string
 	}{
-		{"empty name uses bare address", "", "a@b.com", "a@b.com"},
-		{"simple name is not quoted", "Acme", "hello@acme.com", "Acme <hello@acme.com>"},
-		{"comma in name is quoted, not left to split the address", "Smith, Jane", "a@b.com", `"Smith, Jane" <a@b.com>`},
-		{"quote in name is escaped", `Say "hi"`, "a@b.com", `"Say \"hi\"" <a@b.com>`},
-		{"backslash in name is escaped", `back\slash`, "a@b.com", `"back\\slash" <a@b.com>`},
+		{"empty name uses bare address", "", testRecipient, testRecipient},
+		{"simple name is not quoted", testBrand, "hello@acme.com", "Acme <hello@acme.com>"},
+		{"comma in name is quoted, not left to split the address", "Smith, Jane", testRecipient, `"Smith, Jane" <a@b.com>`},
+		{"quote in name is escaped", `Say "hi"`, testRecipient, `"Say \"hi\"" <a@b.com>`},
+		{"backslash in name is escaped", `back\slash`, testRecipient, `"back\\slash" <a@b.com>`},
 		{"whitespace around both is trimmed", "  Acme  ", "  hello@acme.com  ", "Acme <hello@acme.com>"},
-		{"empty email with a name yields empty", "Acme", "", ""},
+		{"empty email with a name yields empty", testBrand, "", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

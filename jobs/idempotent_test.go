@@ -13,7 +13,7 @@ func TestIdempotent_RunsOnceForANewKey(t *testing.T) {
 	g := NewMemoryGuard()
 	calls := 0
 
-	err := Idempotent(context.Background(), g, "order-1", func(ctx context.Context) error {
+	err := Idempotent(context.Background(), g, "job-a", "order-1", func(ctx context.Context) error {
 		calls++
 		return nil
 	})
@@ -30,8 +30,8 @@ func TestIdempotent_SkipsAnAlreadyDoneKey(t *testing.T) {
 		return nil
 	}
 
-	require.NoError(t, Idempotent(context.Background(), g, "order-1", fn))
-	require.NoError(t, Idempotent(context.Background(), g, "order-1", fn))
+	require.NoError(t, Idempotent(context.Background(), g, "job-a", "order-1", fn))
+	require.NoError(t, Idempotent(context.Background(), g, "job-a", "order-1", fn))
 
 	assert.Equal(t, 1, calls, "fn must not run a second time for a key already marked done")
 }
@@ -44,8 +44,8 @@ func TestIdempotent_DifferentKeysRunIndependently(t *testing.T) {
 		return nil
 	}
 
-	require.NoError(t, Idempotent(context.Background(), g, "order-1", fn))
-	require.NoError(t, Idempotent(context.Background(), g, "order-2", fn))
+	require.NoError(t, Idempotent(context.Background(), g, "job-a", "order-1", fn))
+	require.NoError(t, Idempotent(context.Background(), g, "job-a", "order-2", fn))
 
 	assert.Equal(t, 2, calls)
 }
@@ -54,14 +54,14 @@ func TestIdempotent_FnFailureDoesNotMarkDone(t *testing.T) {
 	g := NewMemoryGuard()
 	calls := 0
 
-	err := Idempotent(context.Background(), g, "order-1", func(ctx context.Context) error {
+	err := Idempotent(context.Background(), g, "job-a", "order-1", func(ctx context.Context) error {
 		calls++
 		return errors.New("downstream refused")
 	})
 	require.Error(t, err)
 
 	// A failed attempt must be retried, not silently accepted as done.
-	err = Idempotent(context.Background(), g, "order-1", func(ctx context.Context) error {
+	err = Idempotent(context.Background(), g, "job-a", "order-1", func(ctx context.Context) error {
 		calls++
 		return nil
 	})
@@ -81,7 +81,7 @@ func (failingGuard) MarkDone(context.Context, string) error { return nil }
 
 func TestIdempotent_UnreadableGuardRefusesToRun(t *testing.T) {
 	calls := 0
-	err := Idempotent(context.Background(), failingGuard{}, "order-1", func(ctx context.Context) error {
+	err := Idempotent(context.Background(), failingGuard{}, "job-a", "order-1", func(ctx context.Context) error {
 		calls++
 		return nil
 	})
@@ -107,7 +107,7 @@ func TestIdempotent_MarkDoneFailureIsReportedNotSwallowed(t *testing.T) {
 	g := &markFailsGuard{}
 	ranSideEffect := false
 
-	err := Idempotent(context.Background(), g, "order-1", func(ctx context.Context) error {
+	err := Idempotent(context.Background(), g, "job-a", "order-1", func(ctx context.Context) error {
 		ranSideEffect = true
 		return nil
 	})
@@ -115,6 +115,27 @@ func TestIdempotent_MarkDoneFailureIsReportedNotSwallowed(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, ranSideEffect, "the side effect ran; a bookkeeping failure must not be confused with fn failing")
 	assert.Contains(t, err.Error(), "already ran")
+}
+
+// TestIdempotent_SameKeyDifferentJobsDoNotCollide is the regression test
+// for a flat, unnamespaced key: two unrelated jobs that both reach for the
+// same natural key (a calendar date, a batch id) must not have the second
+// one's Done check silently see the first one's completion.
+func TestIdempotent_SameKeyDifferentJobsDoNotCollide(t *testing.T) {
+	g := NewMemoryGuard()
+	var jobACalls, jobBCalls int
+
+	require.NoError(t, Idempotent(context.Background(), g, "job-a", "2026-09-17", func(ctx context.Context) error {
+		jobACalls++
+		return nil
+	}))
+	require.NoError(t, Idempotent(context.Background(), g, "job-b", "2026-09-17", func(ctx context.Context) error {
+		jobBCalls++
+		return nil
+	}))
+
+	assert.Equal(t, 1, jobACalls)
+	assert.Equal(t, 1, jobBCalls, "job-b must run even though job-a already completed the same natural key")
 }
 
 func TestMemoryGuard_DoneDefaultsFalse(t *testing.T) {

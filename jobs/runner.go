@@ -2,7 +2,9 @@ package jobs
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"time"
 )
 
@@ -34,7 +36,7 @@ func NewRunner(opts RunnerOptions) Runner {
 }
 
 // Run executes fn, bounded by opts.Timeout when it is non-zero, and returns
-// the process exit code the run earned. name identifies the job in the
+// the process exit code that corresponds to the run's outcome. name identifies the job in the
 // terminal log line ("<name> complete" / "<name> failed").
 func (r Runner) Run(ctx context.Context, name string, fn Func) int {
 	if r.opts.Timeout > 0 {
@@ -43,7 +45,7 @@ func (r Runner) Run(ctx context.Context, name string, fn Func) int {
 		defer cancel()
 	}
 
-	outcome, err := fn(ctx)
+	outcome, err := runRecovered(ctx, fn)
 	if err != nil {
 		// A job that returns an error could not even measure its own work —
 		// distinct from one that measured and found failures, but no less
@@ -52,4 +54,18 @@ func (r Runner) Run(ctx context.Context, name string, fn Func) int {
 		return Complete(r.opts.Logger, name+" complete", name+" failed", outcome, "error", err)
 	}
 	return Complete(r.opts.Logger, name+" complete", name+" failed", outcome)
+}
+
+// runRecovered calls fn and converts a panic into an error instead of
+// letting it propagate. A single job entry panicking must not end the
+// calling process: for Scheduler, one entry's process would take down every
+// other entry sharing that process, which is the failure mode an external
+// scheduler service would not have.
+func runRecovered(ctx context.Context, fn Func) (outcome Outcome, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+		}
+	}()
+	return fn(ctx)
 }

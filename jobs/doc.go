@@ -17,7 +17,7 @@
 //
 // [Outcome] computes the status word from the run's own counts instead.
 // [Complete] applies that computation and returns the exit code the run
-// earned. A run that had work and completed none of it is a distinct state,
+// computes. A run that had work and completed none of it is a distinct state,
 // [StatusDidNothing], not a variant of success.
 //
 // # In-process by default

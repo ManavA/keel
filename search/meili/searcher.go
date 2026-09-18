@@ -1,4 +1,4 @@
-package search
+package meili
 
 import (
 	"context"
@@ -7,7 +7,11 @@ import (
 	"time"
 
 	"github.com/meilisearch/meilisearch-go"
+
+	"github.com/ManavA/keel/search"
 )
+
+var _ search.Index = (*Searcher)(nil)
 
 // Options configures a [Searcher]. Host, APIKey and Config.UID are
 // required; everything else has a working zero value.
@@ -56,7 +60,16 @@ func newSearcherWithFakes(client clientAPI, index indexAPI, cfg Config) *Searche
 }
 
 // Health reports whether Meilisearch is reachable.
-func (s *Searcher) Health(_ context.Context) error {
+//
+// meilisearch-go@v0.26.1's Health call takes no context, so ctx cannot
+// abort a request already in flight; Health only honors ctx if it is
+// already canceled or past its deadline before the call starts. The same
+// limitation applies to every method on Searcher except the wait phase
+// inside awaitTask, which does receive a real context (see awaitTask).
+func (s *Searcher) Health(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	_, err := s.client.Health()
 	return err
 }
@@ -67,8 +80,12 @@ func (s *Searcher) Health(_ context.Context) error {
 //
 // SetupIndex does NOT wait for these settings to actually apply — see the
 // package doc for why, and use [SetupIndexAndVerify] where that guarantee
-// is worth blocking for.
-func (s *Searcher) SetupIndex(_ context.Context) error {
+// is worth blocking for. See [Searcher.Health] for what ctx can and cannot
+// do here.
+func (s *Searcher) SetupIndex(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// DELIBERATE discard. On every call after the first this returns
 	// index_already_exists, which is the expected state, not worth a log
 	// line per boot. Any OTHER failure (unreachable, a key without write
@@ -170,9 +187,12 @@ func (s *Searcher) primaryKeyArg() []string {
 
 // IndexDocuments adds or replaces docs in the index, in one Meilisearch
 // call, and waits for the write to apply.
-func (s *Searcher) IndexDocuments(ctx context.Context, docs []Document) error {
+func (s *Searcher) IndexDocuments(ctx context.Context, docs []search.Document) error {
 	if len(docs) == 0 {
 		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	task, err := s.index.AddDocuments(docs, s.primaryKeyArg()...)
 	if err != nil {
@@ -186,9 +206,12 @@ func (s *Searcher) IndexDocuments(ctx context.Context, docs []Document) error {
 // — and waits for the write to apply. Every document must carry the
 // primary-key field so Meilisearch knows which existing document to merge
 // into.
-func (s *Searcher) UpdateDocuments(ctx context.Context, docs []Document) error {
+func (s *Searcher) UpdateDocuments(ctx context.Context, docs []search.Document) error {
 	if len(docs) == 0 {
 		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	task, err := s.index.UpdateDocuments(docs, s.primaryKeyArg()...)
 	if err != nil {
@@ -207,6 +230,9 @@ func (s *Searcher) RemoveDocuments(ctx context.Context, ids []string) error {
 	}
 	const batchSize = 1000
 	for start := 0; start < len(ids); start += batchSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		end := min(start+batchSize, len(ids))
 		task, err := s.index.DeleteDocuments(ids[start:end])
 		if err != nil {
@@ -232,6 +258,9 @@ func (s *Searcher) PruneStale(ctx context.Context, keep map[string]struct{}) (in
 
 	var stale []string
 	for offset := int64(0); ; offset += pageSize {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		var page meilisearch.DocumentsResult
 		err := s.index.GetDocuments(&meilisearch.DocumentsQuery{
 			Offset: offset,
@@ -268,12 +297,14 @@ func (s *Searcher) PruneStale(ctx context.Context, keep map[string]struct{}) (in
 }
 
 // DocumentCount reports how many documents the index currently holds.
-// Paired with the count of documents that SHOULD be indexed, this is the
-// cheapest possible check against the class of bug PruneStale exists to
-// fix: a sync job that only ever adds documents accumulates stale ones
-// forever, and a job that logs only what it pushed cannot reveal that on
-// its own.
-func (s *Searcher) DocumentCount(_ context.Context) (int64, error) {
+// Compared against the count of documents that should be indexed, this
+// detects the class of bug PruneStale exists to fix: a sync job that only
+// ever adds documents accumulates stale ones indefinitely, and a job that
+// logs only what it pushed cannot detect that on its own.
+func (s *Searcher) DocumentCount(ctx context.Context) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	stats, err := s.index.GetStats()
 	if err != nil {
 		return 0, fmt.Errorf("index stats: %w", err)

@@ -1,4 +1,4 @@
-package search
+package meili
 
 import (
 	"context"
@@ -89,15 +89,19 @@ func (r SettingsReport) Describe() string {
 }
 
 // CheckSettings reads the LIVE index settings and compares them to Config.
-func (s *Searcher) CheckSettings(_ context.Context) (SettingsReport, error) {
+// See [Searcher.Health] for what ctx can and cannot do here.
+func (s *Searcher) CheckSettings(ctx context.Context) (SettingsReport, error) {
+	if err := ctx.Err(); err != nil {
+		return SettingsReport{}, err
+	}
 	live, err := s.index.GetSettings()
 	if err != nil {
 		return SettingsReport{}, fmt.Errorf("read live index settings: %w", err)
 	}
 	if live == nil {
 		// Defensive: a nil settings body with a nil error would otherwise
-		// compare as "every setting empty", reporting drift in everything
-		// — loud, but for the wrong reason.
+		// compare as "every setting empty" and report every setting as
+		// drifted, which is a misdiagnosis rather than an accurate report.
 		return SettingsReport{}, fmt.Errorf("read live index settings: Meilisearch returned no settings body")
 	}
 	return SettingsReport{Measured: true, Drifts: compareIndexSettings(s.cfg, *live)}, nil
@@ -135,8 +139,8 @@ func (s *Searcher) SetupIndexAndVerify(ctx context.Context) (SettingsReport, err
 	if err := s.awaitSettingsTasks(ctx, since); err != nil {
 		// Explicitly NOT a drift report: "the settings did not settle" is a
 		// different claim from "the settings settled and are wrong", and
-		// collapsing them turns a failure to measure into a clean bill of
-		// health.
+		// collapsing them would report a run that failed to measure as a
+		// reported pass.
 		return SettingsReport{}, err
 	}
 	report, err := s.CheckSettings(ctx)

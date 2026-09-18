@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,3 +48,55 @@ func TestNoopPublisher_MarshalFailureIsAnError(t *testing.T) {
 	require.Error(t, err)
 	assert.Empty(t, p.Published)
 }
+
+func TestMarshal_BytesPassThroughUnchanged(t *testing.T) {
+	raw := []byte(`{"already":"encoded"}`)
+	got, err := Marshal(raw)
+	require.NoError(t, err)
+	assert.Same(t, &raw[0], &got[0], "a []byte value must pass through, not be re-encoded as a JSON string")
+}
+
+func TestMarshal_StructIsJSONEncoded(t *testing.T) {
+	got, err := Marshal(sampleEvent{Name: "x", N: 1})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"name":"x","n":1}`, string(got))
+}
+
+// TestMarshal_NoopAndInMemoryBusEncodeIdentically is the regression test
+// for the independent review's finding: NoopPublisher used to call
+// json.Marshal directly while InMemoryBus special-cased []byte, so the same
+// event encoded two different ways depending which implementation
+// published it. Both now call Marshal, so this asserts they agree.
+func TestMarshal_NoopAndInMemoryBusEncodeIdentically(t *testing.T) {
+	event := sampleEvent{Name: testWidgetName, N: 3}
+
+	noop := NewNoopPublisher()
+	require.NoError(t, noop.Publish(context.Background(), "t", event))
+
+	bus := NewInMemoryBus(InMemoryBusOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	received := make(chan []byte, 1)
+	go func() {
+		_ = bus.Subscribe(ctx, "t", func(_ context.Context, data []byte) error {
+			received <- data
+			return nil
+		})
+	}()
+	waitForSubscriber(t, bus, "t")
+	require.NoError(t, bus.Publish(context.Background(), "t", event))
+
+	var busData []byte
+	select {
+	case busData = <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("InMemoryBus never delivered the message")
+	}
+
+	assert.Equal(t, noop.Published[0].Data, busData)
+}
+
+// testWidgetName is reused across event package test files as the
+// canonical sample event name, pulled out because a goconst check applies
+// package-wide, not per file.
+const testWidgetName = "widget"

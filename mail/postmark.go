@@ -81,8 +81,8 @@ const postmarkInactiveRecipient = 406
 // whether retrying could ever help.
 //
 // Only 406 is treated as permanent. Erring the other way would silently
-// treat a real recipient as unreachable over a transient fault or a mistake
-// in our own configuration, which is worse than a few wasted retries.
+// treat a real recipient as unreachable over a transient fault or a
+// configuration mistake, which is worse than a few wasted retries.
 func classifyPostmarkError(code int64, message string) error {
 	base := fmt.Errorf("postmark error %d: %s", code, message)
 	if code == postmarkInactiveRecipient {

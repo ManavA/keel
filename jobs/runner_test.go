@@ -1,8 +1,10 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -45,6 +47,27 @@ func TestRunner_Run_TimeoutCancelsContext(t *testing.T) {
 
 	<-started
 	require.True(t, sawDone, "Runner.Run must cancel the context passed to fn once Timeout elapses")
+}
+
+// TestRunner_Run_RecoversFromPanic is the regression test for a panicking
+// job entry taking down the process. Without runRecovered's defer/recover,
+// this test itself would crash the go test binary instead of failing it.
+func TestRunner_Run_RecoversFromPanic(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	r := NewRunner(RunnerOptions{Logger: logger})
+
+	var exit int
+	assert.NotPanics(t, func() {
+		exit = r.Run(context.Background(), "exploding-job", func(ctx context.Context) (Outcome, error) {
+			panic("entry exploded")
+		})
+	})
+
+	assert.Equal(t, 1, exit, "a panicking entry must exit non-zero, not crash the caller")
+	out := buf.String()
+	assert.Contains(t, out, "entry exploded", "the panic value must reach the log")
+	assert.Contains(t, out, "status=failed")
 }
 
 func TestRunner_Run_ZeroTimeoutAddsNoDeadline(t *testing.T) {

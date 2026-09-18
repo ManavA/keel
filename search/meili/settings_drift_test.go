@@ -1,4 +1,4 @@
-package search
+package meili
 
 import (
 	"context"
@@ -24,18 +24,18 @@ func TestSettingsReport_Describe_DistinguishesAllThreeStates(t *testing.T) {
 func TestCompareIndexSettings_NoDriftWhenEverythingMatches(t *testing.T) {
 	cfg := Config{
 		Searchable:        []string{"title"},
-		Filterable:        []string{"status"},
-		Sortable:          []string{"price"},
-		RankingRules:      []string{"words", "typo"},
-		Synonyms:          map[string][]string{"sf": {"san francisco"}},
+		Filterable:        []string{testStatus},
+		Sortable:          []string{testPrice},
+		RankingRules:      []string{testWords, testTypo},
+		Synonyms:          map[string][]string{"sf": {testSF}},
 		MaxTotalHits:      1000,
 		MaxValuesPerFacet: 100,
 	}
 	got := meilisearch.Settings{
 		SearchableAttributes: []string{"title"},
-		FilterableAttributes: []string{"status"},
-		SortableAttributes:   []string{"price"},
-		RankingRules:         []string{"words", "typo"},
+		FilterableAttributes: []string{testStatus},
+		SortableAttributes:   []string{testPrice},
+		RankingRules:         []string{testWords, testTypo},
 		Synonyms:             map[string][]string{"sf": {"san francisco"}},
 		Pagination:           &meilisearch.Pagination{MaxTotalHits: 1000},
 		Faceting:             &meilisearch.Faceting{MaxValuesPerFacet: 100},
@@ -44,24 +44,24 @@ func TestCompareIndexSettings_NoDriftWhenEverythingMatches(t *testing.T) {
 }
 
 func TestCompareIndexSettings_MissingFilterableIsDrift(t *testing.T) {
-	cfg := Config{Filterable: []string{"status", "city"}}
-	got := meilisearch.Settings{FilterableAttributes: []string{"status"}}
+	cfg := Config{Filterable: []string{testStatus, testCity}}
+	got := meilisearch.Settings{FilterableAttributes: []string{testStatus}}
 	drifts := compareIndexSettings(cfg, got)
 	require.Len(t, drifts, 1)
 	assert.Equal(t, "filterableAttributes", drifts[0].Setting)
-	assert.Equal(t, []string{"city"}, drifts[0].Missing)
+	assert.Equal(t, []string{testCity}, drifts[0].Missing)
 	assert.Contains(t, drifts[0].Impact, "REJECTED")
 }
 
 func TestCompareIndexSettings_SortableSetIsOrderInsensitive(t *testing.T) {
-	cfg := Config{Sortable: []string{"price", "sqft"}}
-	got := meilisearch.Settings{SortableAttributes: []string{"sqft", "price"}}
+	cfg := Config{Sortable: []string{testPrice, testSqft}}
+	got := meilisearch.Settings{SortableAttributes: []string{testSqft, testPrice}}
 	assert.Empty(t, compareIndexSettings(cfg, got), "sortable/filterable are sets: Meilisearch may reorder them without that being drift")
 }
 
 func TestCompareIndexSettings_RankingRulesOrderMatters(t *testing.T) {
-	cfg := Config{RankingRules: []string{"words", "typo", "proximity"}}
-	got := meilisearch.Settings{RankingRules: []string{"typo", "words", "proximity"}}
+	cfg := Config{RankingRules: []string{testWords, testTypo, "proximity"}}
+	got := meilisearch.Settings{RankingRules: []string{testTypo, testWords, "proximity"}}
 	drifts := compareIndexSettings(cfg, got)
 	require.Len(t, drifts, 1)
 	assert.Equal(t, "rankingRules", drifts[0].Setting)
@@ -103,7 +103,7 @@ func TestCheckSettings_MeasuredFlagAndDrifts(t *testing.T) {
 	idx := &fakeIndex{getSettingsFn: func() (*meilisearch.Settings, error) {
 		return &meilisearch.Settings{FilterableAttributes: []string{}}, nil
 	}}
-	s := testSearcher(&fakeClient{}, idx, Config{Filterable: []string{"status"}})
+	s := testSearcher(&fakeClient{}, idx, Config{Filterable: []string{testStatus}})
 
 	report, err := s.CheckSettings(context.Background())
 	require.NoError(t, err)

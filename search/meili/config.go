@@ -1,4 +1,4 @@
-package search
+package meili
 
 // Config declares one index's settings. SetupIndex and CheckSettings both
 // read the same Config, so the declared settings and the settings a check

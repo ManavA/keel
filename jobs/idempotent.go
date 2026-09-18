@@ -20,17 +20,27 @@ type Guard interface {
 	MarkDone(ctx context.Context, key string) error
 }
 
-// Idempotent runs fn unless g reports key already done, and marks key done
-// after fn succeeds.
+// Idempotent runs fn unless g reports the (job, key) pair already done, and
+// marks it done after fn succeeds.
+//
+// job namespaces key. Without it, two unrelated callers that both reach for
+// the same natural key — a calendar date, a batch id — collide: the second
+// caller's Done check reports true, and it never runs at all. job and key
+// are joined with a separator that cannot appear in either half naturally,
+// but a caller supplying job or key values from untrusted input should not
+// rely on that; construct g directly with a manually chosen key in that
+// case.
 //
 // A failed Done check is returned as an error rather than treated as "not
 // done". Treating it as "not done" would re-run fn whenever the guard's
 // store is briefly unreachable, which is unsafe for a fn whose side effect
 // (an email send, a charge) is not itself idempotent.
-func Idempotent(ctx context.Context, g Guard, key string, fn func(ctx context.Context) error) error {
-	done, err := g.Done(ctx, key)
+func Idempotent(ctx context.Context, g Guard, job, key string, fn func(ctx context.Context) error) error {
+	namespaced := job + "\x00" + key
+
+	done, err := g.Done(ctx, namespaced)
 	if err != nil {
-		return fmt.Errorf("check idempotency key %q: %w", key, err)
+		return fmt.Errorf("check idempotency key %q for job %q: %w", key, job, err)
 	}
 	if done {
 		return nil
@@ -38,11 +48,11 @@ func Idempotent(ctx context.Context, g Guard, key string, fn func(ctx context.Co
 	if err := fn(ctx); err != nil {
 		return err
 	}
-	if err := g.MarkDone(ctx, key); err != nil {
+	if err := g.MarkDone(ctx, namespaced); err != nil {
 		// fn already ran and succeeded; only the bookkeeping failed. The
 		// error message says so, so a retry is not misdiagnosed as fn
 		// itself failing.
-		return fmt.Errorf("mark idempotency key %q done (side effect already ran): %w", key, err)
+		return fmt.Errorf("mark idempotency key %q for job %q done (side effect already ran): %w", key, job, err)
 	}
 	return nil
 }

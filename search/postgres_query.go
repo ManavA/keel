@@ -9,19 +9,25 @@ import (
 // buildPostgresWhere translates text and filters into a SQL WHERE clause
 // (without the "WHERE" keyword) and appends the corresponding arguments to
 // *args in the order their placeholders appear. It returns "" with a nil
-// error when there is nothing to filter on.
+// error when there is nothing to filter on. textConfig names the Postgres
+// text search configuration (see PostgresConfig.TextSearchConfig) used to
+// parse text into a query.
 //
 // Every JSON field name is passed as a PARAMETER to the `->>` operator
 // (`document->>$1`), never interpolated into the SQL text — Postgres
 // accepts a parameter on the right-hand side of `->>` exactly as it does
 // for a comparison value, which means a field name never needs identifier
-// quoting or escaping here at all.
-func buildPostgresWhere(text string, filters []Filter, args *[]any) (string, error) {
+// quoting or escaping here at all. The text search configuration name is
+// parameterized the same way, cast with `::regconfig`.
+func buildPostgresWhere(text string, filters []Filter, textConfig string, args *[]any) (string, error) {
 	var clauses []string
 
 	if text != "" {
+		*args = append(*args, textConfig)
+		configParam := len(*args)
 		*args = append(*args, text)
-		clauses = append(clauses, fmt.Sprintf("search_text @@ plainto_tsquery('simple', $%d)", len(*args)))
+		textParam := len(*args)
+		clauses = append(clauses, fmt.Sprintf("search_text @@ plainto_tsquery($%d::regconfig, $%d)", configParam, textParam))
 	}
 
 	for _, f := range filters {
@@ -33,6 +39,60 @@ func buildPostgresWhere(text string, filters []Filter, args *[]any) (string, err
 	}
 
 	return strings.Join(clauses, " AND "), nil
+}
+
+// buildPostgresQueries builds the count query and the paged select query
+// for one Search call, including the default ORDER BY id fallback and
+// Offset clamping, without touching the database. Kept pure and separate
+// from Search's execution so both are unit-testable without a live
+// Postgres.
+func buildPostgresQueries(table string, cfg PostgresConfig, q Query) (countQuery string, countArgs []any, selectQuery string, selectArgs []any, err error) {
+	var whereArgs []any
+	where, err := buildPostgresWhere(q.Text, q.Filters, cfg.textSearchConfig(), &whereArgs)
+	if err != nil {
+		return "", nil, "", nil, err
+	}
+
+	countQuery = fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteIdent(table))
+	if where != "" {
+		countQuery += " WHERE " + where
+	}
+	countArgs = whereArgs
+
+	selectArgs = append([]any(nil), whereArgs...)
+	selectQuery = fmt.Sprintf("SELECT id, document FROM %s", quoteIdent(table))
+	if where != "" {
+		selectQuery += " WHERE " + where
+	}
+	if orderClause := buildPostgresOrderBy(q.Sort, &selectArgs); orderClause != "" {
+		selectQuery += " ORDER BY " + orderClause
+	} else {
+		// A stable default order. Without one, LIMIT/OFFSET paging over an
+		// unordered result can return the same row on two different pages,
+		// or skip one, because Postgres makes no ordering guarantee at all
+		// absent an ORDER BY.
+		selectQuery += " ORDER BY id"
+	}
+
+	limit := q.Limit
+	if limit <= 0 {
+		limit = defaultPostgresLimit
+	}
+	selectArgs = append(selectArgs, limit)
+	selectQuery += fmt.Sprintf(" LIMIT $%d", len(selectArgs))
+
+	offset := q.Offset
+	if offset < 0 {
+		// A negative Offset is a caller mistake (e.g. an unvalidated page
+		// number computed as page*size), not a request for "no offset" —
+		// clamp it the same way Limit is clamped, rather than sending it
+		// to Postgres, which rejects it outright.
+		offset = 0
+	}
+	selectArgs = append(selectArgs, offset)
+	selectQuery += fmt.Sprintf(" OFFSET $%d", len(selectArgs))
+
+	return countQuery, countArgs, selectQuery, selectArgs, nil
 }
 
 func buildPostgresFilterClause(f Filter, args *[]any) (string, error) {

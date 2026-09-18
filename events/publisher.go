@@ -4,58 +4,26 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
-
-	"cloud.google.com/go/pubsub/v2"
 )
 
-// Publisher publishes an event to a named topic. event is marshaled to JSON
-// by the implementation; see the package doc for why it is not unmarshaled
-// back into a caller type on the subscribe side.
+// Publisher publishes an event to a named topic. event is marshaled with
+// [Marshal] by the implementation; see the package doc for why it is not
+// unmarshaled back into a caller type on the subscribe side.
 type Publisher interface {
 	Publish(ctx context.Context, topic string, event any) error
 }
 
-// PubSubPublisherOptions configures a [PubSubPublisher]. The zero value
-// works: logging falls back to [slog.Default].
-type PubSubPublisherOptions struct {
-	// Logger receives one Info line per published message. Nil falls back
-	// to slog.Default(); this package never calls slog.SetDefault.
-	Logger *slog.Logger
-}
-
-// PubSubPublisher publishes events to Google Cloud Pub/Sub.
-type PubSubPublisher struct {
-	client *pubsub.Client
-	opts   PubSubPublisherOptions
-}
-
-// NewPubSubPublisher wraps an already-constructed Pub/Sub client. The client
-// is the caller's to close.
-func NewPubSubPublisher(client *pubsub.Client, opts PubSubPublisherOptions) *PubSubPublisher {
-	return &PubSubPublisher{client: client, opts: opts}
-}
-
-// Publish marshals event to JSON and publishes it to topic, waiting for
-// Pub/Sub to acknowledge the publish before returning.
-func (p *PubSubPublisher) Publish(ctx context.Context, topic string, event any) error {
-	data, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("marshal event for topic %s: %w", topic, err)
+// Marshal encodes event for delivery: a []byte value passes through
+// unchanged, and anything else is encoded with [encoding/json.Marshal].
+// [NoopPublisher], [InMemoryBus] and events/pubsub's Publisher all use this
+// exact function, so the same event marshals identically regardless which
+// implementation a caller has chosen — see the package doc for why that
+// consistency matters.
+func Marshal(event any) ([]byte, error) {
+	if b, ok := event.([]byte); ok {
+		return b, nil
 	}
-
-	result := p.client.Publisher(topic).Publish(ctx, &pubsub.Message{Data: data})
-	id, err := result.Get(ctx)
-	if err != nil {
-		return fmt.Errorf("publish to %s: %w", topic, err)
-	}
-
-	logger := p.opts.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-	logger.Info("published event", "topic", topic, "message_id", id)
-	return nil
+	return json.Marshal(event)
 }
 
 // PublishedMessage records one message published through [NoopPublisher].
@@ -77,11 +45,11 @@ func NewNoopPublisher() *NoopPublisher {
 	return &NoopPublisher{}
 }
 
-// Publish marshals event to JSON and appends it to Published. It never
-// returns an error except a marshal failure, and it never delivers the
-// message to any subscriber.
+// Publish marshals event with [Marshal] and appends it to Published. It
+// never returns an error except a marshal failure, and it never delivers
+// the message to any subscriber.
 func (p *NoopPublisher) Publish(_ context.Context, topic string, event any) error {
-	data, err := json.Marshal(event)
+	data, err := Marshal(event)
 	if err != nil {
 		return fmt.Errorf("marshal event for topic %s: %w", topic, err)
 	}

@@ -1,4 +1,4 @@
-package search
+package meili
 
 import (
 	"context"
@@ -7,10 +7,50 @@ import (
 	"github.com/meilisearch/meilisearch-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ManavA/keel/search"
 )
 
 func testSearcher(client *fakeClient, index *fakeIndex, cfg Config) *Searcher {
 	return newSearcherWithFakes(client, index, cfg)
+}
+
+// TestSearcher_HonorsAnAlreadyCanceledContext checks the one thing Searcher
+// CAN do with ctx, given that meilisearch-go@v0.26.1 accepts no context on
+// these calls: refuse to even try when ctx is already done. Every method
+// below must not reach the fake at all in that case.
+func TestSearcher_HonorsAnAlreadyCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	called := false
+	idx := &fakeIndex{
+		getSettingsFn: func() (*meilisearch.Settings, error) { called = true; return &meilisearch.Settings{}, nil },
+		getStatsFn:    func() (*meilisearch.StatsIndex, error) { called = true; return &meilisearch.StatsIndex{}, nil },
+		searchFn: func(string, *meilisearch.SearchRequest) (*meilisearch.SearchResponse, error) {
+			called = true
+			return &meilisearch.SearchResponse{}, nil
+		},
+	}
+	client := &fakeClient{}
+	s := testSearcher(client, idx, Config{})
+
+	assert.Error(t, s.Health(ctx))
+	assert.Error(t, s.SetupIndex(ctx))
+	assert.Error(t, s.IndexDocuments(ctx, []search.Document{search.MapDocument{"id": "1"}}))
+	assert.Error(t, s.UpdateDocuments(ctx, []search.Document{search.MapDocument{"id": "1"}}))
+	assert.Error(t, s.RemoveDocuments(ctx, []string{"1"}))
+	_, err := s.PruneStale(ctx, nil)
+	assert.Error(t, err)
+	_, err = s.DocumentCount(ctx)
+	assert.Error(t, err)
+	_, err = s.CheckSettings(ctx)
+	assert.Error(t, err)
+	_, err = s.Search(ctx, search.Query{})
+	assert.Error(t, err)
+
+	assert.False(t, called, "an already-canceled context must stop every call before it reaches Meilisearch")
+	assert.Zero(t, client.createIndexN)
 }
 
 func TestSetupIndex_AppliesEveryDeclaredSetting(t *testing.T) {
@@ -49,12 +89,12 @@ func TestSetupIndex_AppliesEveryDeclaredSetting(t *testing.T) {
 		},
 	}
 	cfg := Config{
-		UID:               "things",
+		UID:               testUID,
 		Searchable:        []string{"name", "description"},
-		Filterable:        []string{"status"},
-		Sortable:          []string{"price"},
-		RankingRules:      []string{"words", "typo"},
-		Synonyms:          map[string][]string{"sf": {"san francisco"}},
+		Filterable:        []string{testStatus},
+		Sortable:          []string{testPrice},
+		RankingRules:      []string{testWords, testTypo},
+		Synonyms:          map[string][]string{"sf": {testSF}},
 		MaxTotalHits:      20000,
 		MaxValuesPerFacet: 500,
 	}
@@ -72,7 +112,7 @@ func TestSetupIndex_AppliesEveryDeclaredSetting(t *testing.T) {
 
 func TestSetupIndex_IndexAlreadyExistsIsNotAnError(t *testing.T) {
 	client := &fakeClient{createIndexErr: errFake}
-	s := testSearcher(client, &fakeIndex{}, Config{UID: "things"})
+	s := testSearcher(client, &fakeIndex{}, Config{UID: testUID})
 	require.NoError(t, s.SetupIndex(context.Background()),
 		"CreateIndex failing (as it does on every call after the first) must not fail SetupIndex")
 }
@@ -81,7 +121,7 @@ func TestSetupIndex_SearchableAttributesFailureIsReturned(t *testing.T) {
 	idx := &fakeIndex{
 		updateSearchableAttributesFn: func(*[]string) (*meilisearch.TaskInfo, error) { return nil, errFake },
 	}
-	s := testSearcher(&fakeClient{}, idx, Config{UID: "things"})
+	s := testSearcher(&fakeClient{}, idx, Config{UID: testUID})
 	err := s.SetupIndex(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "searchable")
@@ -95,7 +135,7 @@ func TestSetupIndex_ZeroCapsAreNotSent(t *testing.T) {
 			return &meilisearch.TaskInfo{}, nil
 		},
 	}
-	s := testSearcher(&fakeClient{}, idx, Config{UID: "things"}) // MaxTotalHits unset
+	s := testSearcher(&fakeClient{}, idx, Config{UID: testUID}) // MaxTotalHits unset
 	require.NoError(t, s.SetupIndex(context.Background()))
 	assert.False(t, called, "an unset MaxTotalHits must leave Meilisearch's own default alone")
 }
@@ -131,7 +171,7 @@ func TestIndexDocuments_AwaitsTheTask(t *testing.T) {
 		},
 	}
 	s := testSearcher(&fakeClient{}, idx, Config{PrimaryKey: "id"})
-	require.NoError(t, s.IndexDocuments(context.Background(), []Document{MapDocument{"id": "1"}}))
+	require.NoError(t, s.IndexDocuments(context.Background(), []search.Document{search.MapDocument{"id": "1"}}))
 	assert.True(t, waited)
 }
 
@@ -144,7 +184,7 @@ func TestIndexDocuments_FailedTaskIsAnError(t *testing.T) {
 		},
 	}
 	s := testSearcher(&fakeClient{}, idx, Config{})
-	err := s.IndexDocuments(context.Background(), []Document{MapDocument{"id": "1"}})
+	err := s.IndexDocuments(context.Background(), []search.Document{search.MapDocument{"id": "1"}})
 	require.Error(t, err, "a task that finished in any status other than Succeeded did NOT do the work")
 	assert.Contains(t, err.Error(), "boom")
 }
@@ -175,14 +215,14 @@ func TestPruneStale_DeletesOnlyWhatIsNotInKeep(t *testing.T) {
 	idx := &fakeIndex{
 		getDocumentsFn: func(q *meilisearch.DocumentsQuery, resp *meilisearch.DocumentsResult) error {
 			if q.Offset == 0 {
-				resp.Results = []map[string]interface{}{{"id": "keep-1"}, {"id": "stale-1"}}
+				resp.Results = []map[string]interface{}{{"id": testKeep1}, {"id": "stale-1"}}
 			}
 			return nil
 		},
 	}
 	s := testSearcher(&fakeClient{}, idx, Config{PrimaryKey: "id"})
 
-	n, err := s.PruneStale(context.Background(), map[string]struct{}{"keep-1": {}})
+	n, err := s.PruneStale(context.Background(), map[string]struct{}{testKeep1: {}})
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
 	require.Len(t, idx.deleteCalls, 1)
@@ -193,13 +233,13 @@ func TestPruneStale_NothingStaleDeletesNothing(t *testing.T) {
 	idx := &fakeIndex{
 		getDocumentsFn: func(q *meilisearch.DocumentsQuery, resp *meilisearch.DocumentsResult) error {
 			if q.Offset == 0 {
-				resp.Results = []map[string]interface{}{{"id": "keep-1"}}
+				resp.Results = []map[string]interface{}{{"id": testKeep1}}
 			}
 			return nil
 		},
 	}
 	s := testSearcher(&fakeClient{}, idx, Config{PrimaryKey: "id"})
-	n, err := s.PruneStale(context.Background(), map[string]struct{}{"keep-1": {}})
+	n, err := s.PruneStale(context.Background(), map[string]struct{}{testKeep1: {}})
 	require.NoError(t, err)
 	assert.Zero(t, n)
 	assert.Empty(t, idx.deleteCalls)

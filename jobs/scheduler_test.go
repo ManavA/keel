@@ -72,4 +72,38 @@ func TestScheduler_Run_EntriesAreIndependent(t *testing.T) {
 	assert.Equal(t, int32(1), slow.Load(), "the slow entry must run its immediate tick and nothing more in this window")
 }
 
+// TestScheduler_Run_SurvivesPanickingEntry is the regression test for one
+// entry's panic taking down the whole Scheduler, and with it every sibling
+// entry sharing the process. Without recovery in Runner.Run (and the
+// defense-in-depth recover in Scheduler.Run's goroutine), this test would
+// crash the go test binary instead of failing it.
+func TestScheduler_Run_SurvivesPanickingEntry(t *testing.T) {
+	var healthyCalls atomic.Int32
+	s := NewScheduler(SchedulerOptions{})
+	require.NoError(t, s.Register(Entry{
+		Name:     "exploding",
+		Interval: 10 * time.Millisecond,
+		Func: func(ctx context.Context) (Outcome, error) {
+			panic("entry exploded")
+		},
+	}))
+	require.NoError(t, s.Register(Entry{
+		Name:     "healthy",
+		Interval: 10 * time.Millisecond,
+		Func: func(ctx context.Context) (Outcome, error) {
+			healthyCalls.Add(1)
+			return Outcome{}, nil
+		},
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Millisecond)
+	defer cancel()
+
+	assert.NotPanics(t, func() {
+		s.Run(ctx)
+	})
+	assert.GreaterOrEqual(t, healthyCalls.Load(), int32(2),
+		"a sibling entry must keep running after another entry panics")
+}
+
 func noop(ctx context.Context) (Outcome, error) { return Outcome{}, nil }

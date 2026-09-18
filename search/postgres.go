@@ -3,12 +3,27 @@ package search
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// pgConn is the subset of *pgxpool.Pool this package needs. It exists so
+// tests can fake Postgres access to exercise PostgresIndex's query-building
+// and result-processing logic without a live database — there is no
+// in-memory Postgres to run instead; the concrete *pgxpool.Pool satisfies
+// it without any adapter.
+type pgConn interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
+	Ping(ctx context.Context) error
+}
 
 // PostgresConfig declares one [PostgresIndex]'s table.
 type PostgresConfig struct {
@@ -20,6 +35,21 @@ type PostgresConfig struct {
 	// the table's tsvector column at write time, for Query.Text matching.
 	// A field whose value is missing or is not a JSON string is skipped.
 	SearchableFields []string
+	// TextSearchConfig names the Postgres text search configuration used
+	// to build and to query the tsvector column. Empty uses "simple":
+	// whole-lexeme, case-insensitive, unstemmed matching — "bungalow"
+	// matches "Bungalow" but not the substring "bung", and "charm" does
+	// not match "Charming". Set this to a language configuration such as
+	// "english" to opt into stemming and stop-word removal.
+	TextSearchConfig string
+}
+
+// textSearchConfig resolves the configured value, defaulting to "simple".
+func (c PostgresConfig) textSearchConfig() string {
+	if c.TextSearchConfig == "" {
+		return "simple"
+	}
+	return c.TextSearchConfig
 }
 
 // PostgresIndexOptions configures a [PostgresIndex].
@@ -27,7 +57,8 @@ type PostgresIndexOptions struct {
 	// Pool is an already-opened connection pool. Required; its lifecycle
 	// (including Close) belongs to the caller.
 	Pool *pgxpool.Pool
-	// Config declares the table and searchable fields.
+	// Config declares the table, searchable fields, and text search
+	// configuration.
 	Config PostgresConfig
 	// Logger receives this index's log lines. Nil falls back to
 	// slog.Default(); this package never calls slog.SetDefault.
@@ -45,7 +76,7 @@ type PostgresIndexOptions struct {
 // Switch to [Searcher] when result-set size, facets, or typo tolerance
 // matter.
 type PostgresIndex struct {
-	pool   *pgxpool.Pool
+	conn   pgConn
 	cfg    PostgresConfig
 	logger *slog.Logger
 }
@@ -57,7 +88,14 @@ func NewPostgresIndex(opts PostgresIndexOptions) *PostgresIndex {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &PostgresIndex{pool: opts.Pool, cfg: opts.Config, logger: logger}
+	return &PostgresIndex{conn: opts.Pool, cfg: opts.Config, logger: logger}
+}
+
+// newPostgresIndexWithConn builds a PostgresIndex over conn directly,
+// bypassing NewPostgresIndex's *pgxpool.Pool requirement, for tests that
+// fake conn.
+func newPostgresIndexWithConn(conn pgConn, cfg PostgresConfig) *PostgresIndex {
+	return &PostgresIndex{conn: conn, cfg: cfg, logger: slog.Default()}
 }
 
 // EnsureSchema creates the documents table and its search index if they do
@@ -65,7 +103,7 @@ func NewPostgresIndex(opts PostgresIndexOptions) *PostgresIndex {
 // safe to call on every process start.
 func (p *PostgresIndex) EnsureSchema(ctx context.Context) error {
 	table := quoteIdent(p.cfg.Table)
-	if _, err := p.pool.Exec(ctx, fmt.Sprintf(`
+	if _, err := p.conn.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
 			id TEXT PRIMARY KEY,
 			document JSONB NOT NULL,
@@ -74,7 +112,7 @@ func (p *PostgresIndex) EnsureSchema(ctx context.Context) error {
 	`, table)); err != nil {
 		return fmt.Errorf("create table %s: %w", p.cfg.Table, err)
 	}
-	if _, err := p.pool.Exec(ctx, fmt.Sprintf(
+	if _, err := p.conn.Exec(ctx, fmt.Sprintf(
 		`CREATE INDEX IF NOT EXISTS %s ON %s USING GIN (search_text)`,
 		quoteIdent(p.cfg.Table+"_search_text_idx"), table,
 	)); err != nil {
@@ -83,9 +121,9 @@ func (p *PostgresIndex) EnsureSchema(ctx context.Context) error {
 	return nil
 }
 
-// Health pings the pool.
+// Health pings the connection.
 func (p *PostgresIndex) Health(ctx context.Context) error {
-	return p.pool.Ping(ctx)
+	return p.conn.Ping(ctx)
 }
 
 // IndexDocuments upserts docs: an existing id's document is replaced
@@ -95,6 +133,7 @@ func (p *PostgresIndex) IndexDocuments(ctx context.Context, docs []Document) err
 		return nil
 	}
 	table := quoteIdent(p.cfg.Table)
+	textConfig := p.cfg.textSearchConfig()
 	batch := &pgx.Batch{}
 	for _, d := range docs {
 		id := d.ID()
@@ -111,9 +150,9 @@ func (p *PostgresIndex) IndexDocuments(ctx context.Context, docs []Document) err
 		}
 		batch.Queue(fmt.Sprintf(`
 			INSERT INTO %s (id, document, search_text)
-			VALUES ($1, $2, to_tsvector('simple', $3))
+			VALUES ($1, $2, to_tsvector($4::regconfig, $3))
 			ON CONFLICT (id) DO UPDATE SET document = EXCLUDED.document, search_text = EXCLUDED.search_text
-		`, table), id, raw, text)
+		`, table), id, raw, text, textConfig)
 	}
 	return p.runBatch(ctx, batch, len(docs), "index")
 }
@@ -136,6 +175,7 @@ func (p *PostgresIndex) UpdateDocuments(ctx context.Context, docs []Document) er
 		return nil
 	}
 	table := quoteIdent(p.cfg.Table)
+	textConfig := p.cfg.textSearchConfig()
 	batch := &pgx.Batch{}
 	for _, d := range docs {
 		id := d.ID()
@@ -152,21 +192,21 @@ func (p *PostgresIndex) UpdateDocuments(ctx context.Context, docs []Document) er
 		}
 		batch.Queue(fmt.Sprintf(`
 			INSERT INTO %[1]s (id, document, search_text)
-			VALUES ($1, $2, to_tsvector('simple', $3))
+			VALUES ($1, $2, to_tsvector($4::regconfig, $3))
 			ON CONFLICT (id) DO UPDATE SET
 				document = %[1]s.document || EXCLUDED.document,
 				search_text = CASE WHEN $3 = '' THEN %[1]s.search_text ELSE %[1]s.search_text || EXCLUDED.search_text END
-		`, table), id, raw, text)
+		`, table), id, raw, text, textConfig)
 	}
 	return p.runBatch(ctx, batch, len(docs), "update")
 }
 
 func (p *PostgresIndex) runBatch(ctx context.Context, batch *pgx.Batch, n int, verb string) error {
-	br := p.pool.SendBatch(ctx, batch)
+	br := p.conn.SendBatch(ctx, batch)
 	defer func() { _ = br.Close() }()
 	for i := 0; i < n; i++ {
 		if _, err := br.Exec(); err != nil {
-			return fmt.Errorf("%s document %d/%d: %w", verb, i+1, n, err)
+			return fmt.Errorf("%s document %d/%d: %w", verb, i+1, n, wrapPgError(err))
 		}
 	}
 	return nil
@@ -177,10 +217,10 @@ func (p *PostgresIndex) RemoveDocuments(ctx context.Context, ids []string) error
 	if len(ids) == 0 {
 		return nil
 	}
-	_, err := p.pool.Exec(ctx,
+	_, err := p.conn.Exec(ctx,
 		fmt.Sprintf(`DELETE FROM %s WHERE id = ANY($1)`, quoteIdent(p.cfg.Table)), ids)
 	if err != nil {
-		return fmt.Errorf("remove documents: %w", err)
+		return fmt.Errorf("remove documents: %w", wrapPgError(err))
 	}
 	return nil
 }
@@ -189,26 +229,25 @@ func (p *PostgresIndex) RemoveDocuments(ctx context.Context, ids []string) error
 // returns how many it deleted. See [Searcher.PruneStale] for why this
 // exists as its own step rather than being implied by IndexDocuments.
 func (p *PostgresIndex) PruneStale(ctx context.Context, keep map[string]struct{}) (int, error) {
-	rows, err := p.pool.Query(ctx, fmt.Sprintf(`SELECT id FROM %s`, quoteIdent(p.cfg.Table)))
+	rows, err := p.conn.Query(ctx, fmt.Sprintf(`SELECT id FROM %s`, quoteIdent(p.cfg.Table)))
 	if err != nil {
-		return 0, fmt.Errorf("list indexed documents: %w", err)
+		return 0, fmt.Errorf("list indexed documents: %w", wrapPgError(err))
 	}
-	var stale []string
+	var allIDs []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("scan indexed document id: %w", err)
 		}
-		if _, wanted := keep[id]; !wanted {
-			stale = append(stale, id)
-		}
+		allIDs = append(allIDs, id)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("list indexed documents: %w", err)
+		return 0, fmt.Errorf("list indexed documents: %w", wrapPgError(err))
 	}
 
+	stale := staleIDs(allIDs, keep)
 	if len(stale) == 0 {
 		return 0, nil
 	}
@@ -218,12 +257,28 @@ func (p *PostgresIndex) PruneStale(ctx context.Context, keep map[string]struct{}
 	return len(stale), nil
 }
 
+// staleIDs returns the members of allIDs that are not in keep. Split out
+// from PruneStale so the "how many are stale" computation is testable on
+// its own, without a database.
+func staleIDs(allIDs []string, keep map[string]struct{}) []string {
+	var stale []string
+	for _, id := range allIDs {
+		if id == "" {
+			continue
+		}
+		if _, wanted := keep[id]; !wanted {
+			stale = append(stale, id)
+		}
+	}
+	return stale
+}
+
 // DocumentCount reports how many documents the table currently holds.
 func (p *PostgresIndex) DocumentCount(ctx context.Context) (int64, error) {
 	var n int64
-	err := p.pool.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteIdent(p.cfg.Table))).Scan(&n)
+	err := p.conn.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteIdent(p.cfg.Table))).Scan(&n)
 	if err != nil {
-		return 0, fmt.Errorf("count documents: %w", err)
+		return 0, fmt.Errorf("count documents: %w", wrapPgError(err))
 	}
 	return n, nil
 }
@@ -241,51 +296,26 @@ const defaultPostgresLimit = 20
 // the window approach reports 0 whenever Offset skips past every matching
 // row, which is a wrong total, not just a missing page.
 func (p *PostgresIndex) Search(ctx context.Context, q Query) (*Result, error) {
-	var whereArgs []any
-	where, err := buildPostgresWhere(q.Text, q.Filters, &whereArgs)
+	countQuery, countArgs, selectQuery, selectArgs, err := buildPostgresQueries(p.cfg.Table, p.cfg, q)
 	if err != nil {
 		return nil, err
 	}
 
-	total, err := p.countMatching(ctx, where, whereArgs)
-	if err != nil {
-		return nil, err
+	var total int64
+	if err := p.conn.QueryRow(ctx, countQuery, countArgs...).Scan(&total); err != nil {
+		return nil, fmt.Errorf("count matching documents: %w", wrapPgError(err))
 	}
 	if total == 0 {
 		return &Result{Hits: []map[string]any{}, Total: 0}, nil
 	}
 
-	args := append([]any(nil), whereArgs...)
-	query := fmt.Sprintf("SELECT id, document FROM %s", quoteIdent(p.cfg.Table))
-	if where != "" {
-		query += " WHERE " + where
-	}
-	if orderClause := buildPostgresOrderBy(q.Sort, &args); orderClause != "" {
-		query += " ORDER BY " + orderClause
-	} else {
-		// A stable default order. Without one, LIMIT/OFFSET paging over an
-		// unordered result can return the same row on two different pages,
-		// or skip one, because Postgres makes no ordering guarantee at all
-		// absent an ORDER BY.
-		query += " ORDER BY id"
-	}
-
-	limit := q.Limit
-	if limit <= 0 {
-		limit = defaultPostgresLimit
-	}
-	args = append(args, limit)
-	query += fmt.Sprintf(" LIMIT $%d", len(args))
-	args = append(args, q.Offset)
-	query += fmt.Sprintf(" OFFSET $%d", len(args))
-
-	rows, err := p.pool.Query(ctx, query, args...)
+	rows, err := p.conn.Query(ctx, selectQuery, selectArgs...)
 	if err != nil {
-		return nil, fmt.Errorf("search: %w", err)
+		return nil, fmt.Errorf("search: %w", wrapPgError(err))
 	}
 	defer rows.Close()
 
-	hits := make([]map[string]any, 0, limit)
+	hits := make([]map[string]any, 0, minInt(int(total), defaultPostgresLimit))
 	for rows.Next() {
 		var id string
 		var raw []byte
@@ -299,20 +329,35 @@ func (p *PostgresIndex) Search(ctx context.Context, q Query) (*Result, error) {
 		hits = append(hits, doc)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("search: %w", err)
+		return nil, fmt.Errorf("search: %w", wrapPgError(err))
 	}
 
 	return &Result{Hits: hits, Total: total}, nil
 }
 
-func (p *PostgresIndex) countMatching(ctx context.Context, where string, args []any) (int64, error) {
-	query := fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteIdent(p.cfg.Table))
-	if where != "" {
-		query += " WHERE " + where
+func minInt(a, b int) int {
+	if a < b {
+		return a
 	}
-	var n int64
-	if err := p.pool.QueryRow(ctx, query, args...).Scan(&n); err != nil {
-		return 0, fmt.Errorf("count matching documents: %w", err)
+	return b
+}
+
+// pgInvalidTextRepresentation is the SQLSTATE Postgres reports when a value
+// cannot be cast to the type an expression needs — e.g. a numeric filter or
+// sort applied to a JSONB field whose value in some row is not a number.
+const pgInvalidTextRepresentation = "22P02"
+
+// wrapPgError replaces a Postgres invalid-input error with a generic one,
+// dropping the driver's own message. That message includes the offending
+// value verbatim ("invalid input syntax for type numeric: \"not a
+// number\""), so passing it straight to a caller — and from there, commonly,
+// into an HTTP response or a log a wider audience reads — echoes whatever
+// bad data was already in the table. Every other error is returned
+// unchanged.
+func wrapPgError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgInvalidTextRepresentation {
+		return fmt.Errorf("search: a filtered or sorted field held a value of the wrong type for that comparison")
 	}
-	return n, nil
+	return err
 }

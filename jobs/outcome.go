@@ -43,8 +43,9 @@ const (
 	StatusSuccess = "success"
 )
 
-// DidNothing reports the case a hardcoded "success" cannot see: the run had
-// work in front of it and finished none of it.
+// DidNothing reports the case a hardcoded "success" literal cannot
+// distinguish from a real success: the run had work in front of it and
+// finished none of it.
 func (o Outcome) DidNothing() bool {
 	return o.Attempted > 0 && o.Succeeded <= 0
 }
@@ -72,7 +73,7 @@ func (o Outcome) OK() bool {
 	return !o.Fatal && !o.DidNothing()
 }
 
-// ExitCode is the process status this run earned. A run that had work and
+// ExitCode is the process exit code that corresponds to this Outcome. A run that had work and
 // landed none of it must exit non-zero, or a scheduler that only restarts
 // non-zero exits never retries it.
 func (o Outcome) ExitCode() int {
@@ -83,7 +84,7 @@ func (o Outcome) ExitCode() int {
 }
 
 // Complete emits a job run's terminal log line and returns the exit code the
-// run earned.
+// run's outcome.
 //
 // okMsg is emitted at Info, and ONLY when the counts say work actually
 // landed — a monitoring rule that matches on message text alone (a common

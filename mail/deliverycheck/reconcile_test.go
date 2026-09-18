@@ -150,9 +150,9 @@ func TestAMisaddressedMessageIsADivergence(t *testing.T) {
 }
 
 // TestRecipientComparisonIsForgivingAboutCaseAndSpace: recipient comparison
-// must not turn a case difference or stray whitespace into a false alarm —
-// a check that cries wolf gets switched off, and then it is exactly as
-// useful as no check at all.
+// must not turn a case difference or stray whitespace into a false
+// divergence. A check that reports false divergences will be disabled, and
+// a disabled check verifies nothing.
 func TestRecipientComparisonIsForgivingAboutCaseAndSpace(t *testing.T) {
 	v := Reconcile(Input{
 		Claims:         []Claim{claim("a", 90, " Buyer@Example.com ")},

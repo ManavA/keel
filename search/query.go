@@ -158,11 +158,14 @@ type Result struct {
 }
 
 // Index is what a caller depends on to store and search documents. Two
-// implementations ship: [Searcher] wraps Meilisearch and supports facets
-// and typo tolerance; [PostgresIndex] needs no service beyond a Postgres
-// database and is suitable for small tables. A caller that depends on
-// Index rather than either concrete type can switch implementations
-// without changing its own code.
+// implementations ship: search/meili's Searcher wraps Meilisearch and
+// supports facets and typo tolerance; [PostgresIndex] needs no service
+// beyond a Postgres database and is suitable for small tables. A caller
+// that depends on Index rather than either concrete type can switch
+// implementations without changing its own code. search/meili is a
+// separate package specifically so that depending on search alone (for
+// PostgresIndex, or just for Query/Filter/Index) does not pull in the
+// Meilisearch client — see search/meili's package doc.
 type Index interface {
 	IndexDocuments(ctx context.Context, docs []Document) error
 	UpdateDocuments(ctx context.Context, docs []Document) error
@@ -173,10 +176,7 @@ type Index interface {
 	Health(ctx context.Context) error
 }
 
-var (
-	_ Index = (*Searcher)(nil)
-	_ Index = (*PostgresIndex)(nil)
-)
+var _ Index = (*PostgresIndex)(nil)
 
 // DecodeHits decodes hits (as returned in [Result.Hits]) into a slice of T,
 // via a JSON round trip. Use this when a caller wants typed documents back

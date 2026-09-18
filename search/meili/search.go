@@ -1,14 +1,20 @@
-package search
+package meili
 
 import (
 	"context"
 	"fmt"
 
 	"github.com/meilisearch/meilisearch-go"
+
+	"github.com/ManavA/keel/search"
 )
 
-// Search runs q against the Meilisearch index.
-func (s *Searcher) Search(_ context.Context, q Query) (*Result, error) {
+// Search runs q against the Meilisearch index. See [Searcher.Health] for
+// what ctx can and cannot do here.
+func (s *Searcher) Search(ctx context.Context, q search.Query) (*search.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	filters, err := buildMeiliFilters(q.Filters)
 	if err != nil {
 		return nil, err
@@ -54,13 +60,12 @@ func (s *Searcher) Search(_ context.Context, q Query) (*Result, error) {
 		}
 	}
 
-	return &Result{Hits: hits, Total: resp.EstimatedTotalHits, Facets: facets}, nil
+	return &search.Result{Hits: hits, Total: resp.EstimatedTotalHits, Facets: facets}, nil
 }
 
 // anyFilter adapts []string to the interface{} meilisearch.SearchRequest.Filter
 // expects, returning nil for an empty slice rather than an empty-but-non-nil
-// one, which is the unambiguous "no filter" that the vast majority of
-// queries actually want.
+// one, since nil is the value Meilisearch itself treats as "no filter".
 func anyFilter(filters []string) interface{} {
 	if len(filters) == 0 {
 		return nil

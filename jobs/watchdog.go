@@ -31,8 +31,8 @@ const (
 type WatchdogResult struct {
 	Status WatchdogStatus
 	// Checked is how many claims the watchdog actually compared against
-	// evidence. Zero alongside WatchdogInconclusive is the expected,
-	// honest shape for "there was nothing to check yet."
+	// evidence. Zero alongside WatchdogInconclusive is the correct value
+	// for "there was nothing to check yet," not an error.
 	Checked int
 	// Reason is a human-readable explanation, always set — including for
 	// WatchdogVerified, where it names what was checked rather than
@@ -41,7 +41,7 @@ type WatchdogResult struct {
 }
 
 // CompleteWatchdog emits a watchdog run's terminal log line and returns the
-// exit code the run earned.
+// exit code that corresponds to the run's result.
 //
 // WatchdogInconclusive exits non-zero, the same as WatchdogDiverged.
 // "Nothing to check" and "verified clean" must not share an exit code, or a

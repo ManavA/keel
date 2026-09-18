@@ -1,4 +1,4 @@
-package search
+package meili
 
 import (
 	"context"
@@ -7,6 +7,8 @@ import (
 	"github.com/meilisearch/meilisearch-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ManavA/keel/search"
 )
 
 func TestSearch_PassesTextFiltersAndSort(t *testing.T) {
@@ -19,17 +21,17 @@ func TestSearch_PassesTextFiltersAndSort(t *testing.T) {
 	}}
 	s := testSearcher(&fakeClient{}, idx, Config{})
 
-	_, err := s.Search(context.Background(), Query{
+	_, err := s.Search(context.Background(), search.Query{
 		Text:    "bungalow",
-		Filters: []Filter{Eq("city", "Alameda")},
-		Sort:    []SortField{{Field: "price", Dir: Asc}},
+		Filters: []search.Filter{search.Eq(testCity, "Alameda")},
+		Sort:    []search.SortField{{Field: testPrice, Dir: search.Asc}},
 		Offset:  20,
 		Limit:   10,
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "bungalow", gotQuery)
 	assert.Equal(t, []string{`city = "Alameda"`}, gotReq.Filter)
-	assert.Equal(t, []string{"price:asc"}, gotReq.Sort)
+	assert.Equal(t, []string{testPriceAsc}, gotReq.Sort)
 	assert.EqualValues(t, 20, gotReq.Offset)
 	assert.EqualValues(t, 10, gotReq.Limit)
 }
@@ -42,7 +44,7 @@ func TestSearch_NoFiltersSendsNilNotEmptySlice(t *testing.T) {
 	}}
 	s := testSearcher(&fakeClient{}, idx, Config{})
 
-	_, err := s.Search(context.Background(), Query{})
+	_, err := s.Search(context.Background(), search.Query{})
 	require.NoError(t, err)
 	assert.Nil(t, gotReq.Filter)
 }
@@ -56,7 +58,7 @@ func TestSearch_DecodesHitsAndSkipsUnexpectedShapes(t *testing.T) {
 	}}
 	s := testSearcher(&fakeClient{}, idx, Config{})
 
-	res, err := s.Search(context.Background(), Query{})
+	res, err := s.Search(context.Background(), search.Query{})
 	require.NoError(t, err)
 	require.Len(t, res.Hits, 2, "a hit that is not a map must be skipped, not panic the whole search")
 	assert.Equal(t, "1", res.Hits[0]["id"])
@@ -67,15 +69,15 @@ func TestSearch_DecodesHitsAndSkipsUnexpectedShapes(t *testing.T) {
 func TestSearch_DecodesFacetDistribution(t *testing.T) {
 	idx := &fakeIndex{searchFn: func(string, *meilisearch.SearchRequest) (*meilisearch.SearchResponse, error) {
 		return &meilisearch.SearchResponse{
-			FacetDistribution: map[string]interface{}{"city": map[string]interface{}{"Alameda": float64(3)}},
+			FacetDistribution: map[string]interface{}{testCity: map[string]interface{}{"Alameda": float64(3)}},
 		}, nil
 	}}
 	s := testSearcher(&fakeClient{}, idx, Config{})
 
-	res, err := s.Search(context.Background(), Query{Facets: []string{"city"}})
+	res, err := s.Search(context.Background(), search.Query{Facets: []string{testCity}})
 	require.NoError(t, err)
 	require.NotNil(t, res.Facets)
-	assert.Contains(t, res.Facets, "city")
+	assert.Contains(t, res.Facets, testCity)
 }
 
 func TestSearch_UnderlyingErrorIsWrapped(t *testing.T) {
@@ -84,7 +86,7 @@ func TestSearch_UnderlyingErrorIsWrapped(t *testing.T) {
 	}}
 	s := testSearcher(&fakeClient{}, idx, Config{})
 
-	_, err := s.Search(context.Background(), Query{})
+	_, err := s.Search(context.Background(), search.Query{})
 	require.Error(t, err)
 }
 
@@ -96,7 +98,7 @@ func TestSearch_InvalidFilterOpIsReturnedBeforeCallingMeilisearch(t *testing.T) 
 	}}
 	s := testSearcher(&fakeClient{}, idx, Config{})
 
-	_, err := s.Search(context.Background(), Query{Filters: []Filter{{Field: "x", Op: "bogus"}}})
+	_, err := s.Search(context.Background(), search.Query{Filters: []search.Filter{{Field: "x", Op: "bogus"}}})
 	require.Error(t, err)
 	assert.False(t, called, "an unbuildable filter must not reach Meilisearch at all")
 }

@@ -1,9 +1,11 @@
 package events
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -13,7 +15,7 @@ import (
 )
 
 func TestInMemoryBus_PublishIsDeliveredToSubscriber(t *testing.T) {
-	bus := NewInMemoryBus()
+	bus := NewInMemoryBus(InMemoryBusOptions{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -33,18 +35,18 @@ func TestInMemoryBus_PublishIsDeliveredToSubscriber(t *testing.T) {
 	// does not queue for a subscriber that has not joined yet.
 	waitForSubscriber(t, bus, "orders")
 
-	require.NoError(t, bus.Publish(context.Background(), "orders", sampleEvent{Name: "widget", N: 3}))
+	require.NoError(t, bus.Publish(context.Background(), "orders", sampleEvent{Name: testWidgetName, N: 3}))
 
 	select {
 	case got := <-received:
-		assert.Equal(t, sampleEvent{Name: "widget", N: 3}, got)
+		assert.Equal(t, sampleEvent{Name: testWidgetName, N: 3}, got)
 	case <-time.After(2 * time.Second):
 		t.Fatal("subscriber never received the published message")
 	}
 }
 
 func TestInMemoryBus_PublishBeforeSubscribeIsNotQueued(t *testing.T) {
-	bus := NewInMemoryBus()
+	bus := NewInMemoryBus(InMemoryBusOptions{})
 
 	// Nobody is subscribed yet; this must not panic or block.
 	require.NoError(t, bus.Publish(context.Background(), "orders", sampleEvent{Name: "early"}))
@@ -66,7 +68,7 @@ func TestInMemoryBus_PublishBeforeSubscribeIsNotQueued(t *testing.T) {
 }
 
 func TestInMemoryBus_MultipleSubscribersEachReceive(t *testing.T) {
-	bus := NewInMemoryBus()
+	bus := NewInMemoryBus(InMemoryBusOptions{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -101,7 +103,7 @@ func TestInMemoryBus_MultipleSubscribersEachReceive(t *testing.T) {
 }
 
 func TestInMemoryBus_SubscribeReturnsContextErrOnCancel(t *testing.T) {
-	bus := NewInMemoryBus()
+	bus := NewInMemoryBus(InMemoryBusOptions{})
 	ctx, cancel := context.WithCancel(context.Background())
 
 	errCh := make(chan error, 1)
@@ -121,7 +123,7 @@ func TestInMemoryBus_SubscribeReturnsContextErrOnCancel(t *testing.T) {
 }
 
 func TestInMemoryBus_HandlerErrorDoesNotStopTheLoop(t *testing.T) {
-	bus := NewInMemoryBus()
+	bus := NewInMemoryBus(InMemoryBusOptions{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -145,6 +147,36 @@ func TestInMemoryBus_HandlerErrorDoesNotStopTheLoop(t *testing.T) {
 		defer mu.Unlock()
 		return calls == 2
 	}, 2*time.Second, 5*time.Millisecond, "a handler error on one message must not stop later messages from being delivered")
+}
+
+// TestInMemoryBus_FullBufferDropsAreLoud is the regression test for the
+// independent review's probe: publishing past a subscriber whose handler
+// is blocked dropped 83 of 100 messages with no log line and no counter.
+// A drop must be visible both in the log and in DroppedCount.
+func TestInMemoryBus_FullBufferDropsAreLoud(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	bus := NewInMemoryBus(InMemoryBusOptions{Logger: logger})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	blocked := make(chan struct{})
+	go func() {
+		_ = bus.Subscribe(ctx, "topic", func(context.Context, []byte) error {
+			<-blocked // hold the handler open so the subscriber's buffer fills
+			return nil
+		})
+	}()
+	waitForSubscriber(t, bus, "topic")
+
+	for i := 0; i < 100; i++ {
+		require.NoError(t, bus.Publish(context.Background(), "topic", sampleEvent{Name: "x"}))
+	}
+	close(blocked)
+
+	assert.Greater(t, bus.DroppedCount(), int64(0), "publishing past a full subscriber buffer must be counted")
+	assert.Contains(t, buf.String(), "event dropped", "a drop must be logged, not silent")
 }
 
 func waitForSubscriber(t *testing.T, bus *InMemoryBus, topic string) {

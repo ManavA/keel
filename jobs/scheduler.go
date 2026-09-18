@@ -71,8 +71,22 @@ func (s *Scheduler) Run(ctx context.Context) {
 	done := make(chan struct{})
 	for _, e := range s.entries {
 		go func(e Entry) {
+			// Runner.Run already recovers a panic inside e.Func. This
+			// second recover is defense in depth against a panic in
+			// runLoop itself (the ticker logic, not the job body): without
+			// it, that goroutine would never send on done, and Run below
+			// would block forever instead of returning.
+			defer func() {
+				if p := recover(); p != nil {
+					logger := s.opts.Logger
+					if logger == nil {
+						logger = slog.Default()
+					}
+					logger.Error("scheduler entry loop panicked", "entry", e.Name, "panic", p)
+				}
+				done <- struct{}{}
+			}()
 			s.runLoop(ctx, runner, e)
-			done <- struct{}{}
 		}(e)
 	}
 	for range s.entries {

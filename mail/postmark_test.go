@@ -40,9 +40,9 @@ func TestPostmarkSender_Send_Accepted(t *testing.T) {
 	srv, captured := postmarkStub(t, postmark.EmailResponse{MessageID: "msg-1", ErrorCode: 0})
 	defer srv.Close()
 
-	s := newTestSender(t, PostmarkSenderOptions{ServerToken: "tok", FromEmail: "hello@example.com"}, srv.URL)
+	s := newTestSender(t, PostmarkSenderOptions{ServerToken: testServerToken, FromEmail: testFromEmail}, srv.URL)
 
-	err := s.Send(context.Background(), "buyer@example.com", "welcome", map[string]any{"name": "Jane"})
+	err := s.Send(context.Background(), "buyer@example.com", "welcome", map[string]any{testNameKey: testName})
 	require.NoError(t, err)
 	assert.Equal(t, "hello@example.com", captured.From)
 	assert.Equal(t, "buyer@example.com", captured.To)
@@ -54,9 +54,9 @@ func TestPostmarkSender_Send_UsesFromName(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestSender(t, PostmarkSenderOptions{
-		ServerToken: "tok",
-		FromEmail:   "hello@example.com",
-		FromName:    "Acme",
+		ServerToken: testServerToken,
+		FromEmail:   testFromEmail,
+		FromName:    testBrand,
 	}, srv.URL)
 
 	require.NoError(t, s.Send(context.Background(), "buyer@example.com", "welcome", nil))
@@ -70,7 +70,7 @@ func TestPostmarkSender_Send_APIErrorCodeInA200BodyIsAnError(t *testing.T) {
 	srv, _ := postmarkStub(t, postmark.EmailResponse{ErrorCode: 1101, Message: "template not found"})
 	defer srv.Close()
 
-	s := newTestSender(t, PostmarkSenderOptions{ServerToken: "tok", FromEmail: "hello@example.com"}, srv.URL)
+	s := newTestSender(t, PostmarkSenderOptions{ServerToken: testServerToken, FromEmail: testFromEmail}, srv.URL)
 
 	err := s.Send(context.Background(), "buyer@example.com", "missing-template", nil)
 	require.Error(t, err, "a nonzero ErrorCode inside a 200 response must be treated as a failed send")
@@ -81,7 +81,7 @@ func TestPostmarkSender_Send_InactiveRecipientWrapsErrRecipientUndeliverable(t *
 	srv, _ := postmarkStub(t, postmark.EmailResponse{ErrorCode: 406, Message: "inactive recipient"})
 	defer srv.Close()
 
-	s := newTestSender(t, PostmarkSenderOptions{ServerToken: "tok", FromEmail: "hello@example.com"}, srv.URL)
+	s := newTestSender(t, PostmarkSenderOptions{ServerToken: testServerToken, FromEmail: testFromEmail}, srv.URL)
 
 	err := s.Send(context.Background(), "gone@example.com", "welcome", nil)
 	require.Error(t, err)
@@ -92,7 +92,7 @@ func TestPostmarkSender_Send_OtherErrorCodesAreNotTreatedAsPermanent(t *testing.
 	srv, _ := postmarkStub(t, postmark.EmailResponse{ErrorCode: 300, Message: "invalid email request"})
 	defer srv.Close()
 
-	s := newTestSender(t, PostmarkSenderOptions{ServerToken: "tok", FromEmail: "hello@example.com"}, srv.URL)
+	s := newTestSender(t, PostmarkSenderOptions{ServerToken: testServerToken, FromEmail: testFromEmail}, srv.URL)
 
 	err := s.Send(context.Background(), "buyer@example.com", "welcome", nil)
 	require.Error(t, err)
@@ -101,7 +101,7 @@ func TestPostmarkSender_Send_OtherErrorCodesAreNotTreatedAsPermanent(t *testing.
 }
 
 func TestPostmarkSender_DeliversToProvider(t *testing.T) {
-	s := NewPostmarkSender(PostmarkSenderOptions{ServerToken: "tok", FromEmail: "hello@example.com"})
+	s := NewPostmarkSender(PostmarkSenderOptions{ServerToken: testServerToken, FromEmail: testFromEmail})
 	assert.True(t, s.DeliversToProvider())
 	assert.True(t, DeliversToProvider(s))
 }

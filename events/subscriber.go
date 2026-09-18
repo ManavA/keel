@@ -2,17 +2,17 @@ package events
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
-
-	"cloud.google.com/go/pubsub/v2"
+	"sync/atomic"
 )
 
 // Handler processes one message's raw payload. A non-nil error means the
-// message should not be considered handled — [PubSubSubscriber] nacks it so
-// the broker redelivers.
+// message should not be considered handled — events/pubsub's Subscriber
+// nacks it so the broker redelivers; [InMemoryBus] logs it, since it has no
+// broker underneath to ask again (see InMemoryBus's own doc on delivery
+// semantics).
 type Handler func(ctx context.Context, data []byte) error
 
 // Subscriber delivers messages from a subscription to handler until ctx is
@@ -20,58 +20,32 @@ type Handler func(ctx context.Context, data []byte) error
 //
 // Subscribe blocks. Callers that want to run several subscriptions
 // concurrently start each in its own goroutine, the same way
-// [cloud.google.com/go/pubsub]'s own Subscription.Receive works underneath
-// [PubSubSubscriber].
+// [cloud.google.com/go/pubsub/v2]'s own Subscriber.Receive works underneath
+// events/pubsub's Subscriber.
+//
+// The two implementations in this module differ in delivery semantics, and
+// a caller switching between them must account for that difference, not
+// just the interface:
+//
+//   - [InMemoryBus] is at-most-once. A message can be dropped — see its own
+//     doc — and a handler error is logged, not retried.
+//   - events/pubsub's Subscriber is at-least-once, matching Google Cloud
+//     Pub/Sub: a handler error nacks the message, and Pub/Sub redelivers
+//     it, possibly more than once and possibly out of order. A handler
+//     written against events/pubsub must be idempotent; a handler written
+//     only against InMemoryBus may not need to be, and will be wrong if
+//     moved to events/pubsub unchanged.
 type Subscriber interface {
 	Subscribe(ctx context.Context, subscriptionID string, handler Handler) error
 }
 
-// PubSubSubscriberOptions configures a [PubSubSubscriber]. The zero value
-// works: logging falls back to [slog.Default].
-type PubSubSubscriberOptions struct {
-	// Logger receives one Error line per handler failure. Nil falls back
-	// to slog.Default(); this package never calls slog.SetDefault.
+// InMemoryBusOptions configures an [InMemoryBus]. The zero value works:
+// logging falls back to [slog.Default].
+type InMemoryBusOptions struct {
+	// Logger receives a Warn line every time a message is dropped for a
+	// slow subscriber. Nil falls back to slog.Default(); this package
+	// never calls slog.SetDefault.
 	Logger *slog.Logger
-}
-
-// PubSubSubscriber delivers messages from Google Cloud Pub/Sub
-// subscriptions.
-type PubSubSubscriber struct {
-	client *pubsub.Client
-	opts   PubSubSubscriberOptions
-}
-
-// NewPubSubSubscriber wraps an already-constructed Pub/Sub client. The
-// client is the caller's to close.
-func NewPubSubSubscriber(client *pubsub.Client, opts PubSubSubscriberOptions) *PubSubSubscriber {
-	return &PubSubSubscriber{client: client, opts: opts}
-}
-
-// Subscribe receives messages on subscriptionID and calls handler for each.
-// A message is acked only when handler returns nil; a handler error nacks
-// the message so Pub/Sub redelivers it. Subscribe blocks until ctx is
-// canceled, at which point it returns ctx.Err() (or nil, if Receive itself
-// returned first for some other reason).
-func (s *PubSubSubscriber) Subscribe(ctx context.Context, subscriptionID string, handler Handler) error {
-	logger := s.opts.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-
-	sub := s.client.Subscriber(subscriptionID)
-	err := sub.Receive(ctx, func(msgCtx context.Context, m *pubsub.Message) {
-		if err := handler(msgCtx, m.Data); err != nil {
-			logger.Error("event handler failed; message will be redelivered",
-				"subscription", subscriptionID, "error", err)
-			m.Nack()
-			return
-		}
-		m.Ack()
-	})
-	if err != nil {
-		return fmt.Errorf("subscribe to %s: %w", subscriptionID, err)
-	}
-	return nil
 }
 
 // InMemoryBus is a [Publisher] and [Subscriber] implemented entirely in
@@ -83,27 +57,48 @@ func (s *PubSubSubscriber) Subscribe(ctx context.Context, subscriptionID string,
 // topic is delivered to whichever subscribers are registered at publish
 // time; InMemoryBus does not queue for subscribers that join later, the
 // same as a Pub/Sub topic with no matching subscription created yet.
+//
+// InMemoryBus is at-most-once delivery, not at-least-once: each subscriber
+// channel is a fixed-size buffer, and a message published while that buffer
+// is full is dropped for that subscriber rather than blocking Publish or
+// queuing without bound. A drop is never silent — it is logged, at Warn,
+// and counted (see [InMemoryBus.DroppedCount]) — but it is also never
+// retried; there is no broker underneath to ask again. A handler that
+// assumes at-least-once delivery (built and tested against events/pubsub,
+// say) will silently lose messages under load if the same code is later
+// run against InMemoryBus without accounting for this.
 type InMemoryBus struct {
-	mu   sync.Mutex
-	subs map[string][]chan []byte
+	opts InMemoryBusOptions
+
+	mu      sync.Mutex
+	subs    map[string][]chan []byte
+	dropped atomic.Int64
 }
 
 // NewInMemoryBus builds an empty InMemoryBus.
-func NewInMemoryBus() *InMemoryBus {
-	return &InMemoryBus{subs: make(map[string][]chan []byte)}
+func NewInMemoryBus(opts InMemoryBusOptions) *InMemoryBus {
+	return &InMemoryBus{opts: opts, subs: make(map[string][]chan []byte)}
 }
 
-// Publish marshals event to JSON and delivers it to every subscriber
-// currently registered on topic. Delivery to each subscriber's channel is
-// buffered and non-blocking up to a small internal buffer, so one slow
-// subscriber cannot stall Publish for the others; if a subscriber's buffer
-// is full the message is dropped for that subscriber only, matching a
-// broker's own behavior under sustained backpressure rather than pretending
-// unbounded delivery is free.
-func (b *InMemoryBus) Publish(ctx context.Context, topic string, event any) error {
-	data, err := marshalEvent(event)
+// DroppedCount reports how many subscriber deliveries have been dropped
+// (across all topics) since this InMemoryBus was created, for a caller or
+// test that wants to assert on it directly rather than parsing logs.
+func (b *InMemoryBus) DroppedCount() int64 {
+	return b.dropped.Load()
+}
+
+// Publish marshals event with [Marshal] and delivers it to every subscriber
+// currently registered on topic. See the type doc for what happens when a
+// subscriber's buffer is full.
+func (b *InMemoryBus) Publish(_ context.Context, topic string, event any) error {
+	data, err := Marshal(event)
 	if err != nil {
 		return fmt.Errorf("marshal event for topic %s: %w", topic, err)
+	}
+
+	logger := b.opts.Logger
+	if logger == nil {
+		logger = slog.Default()
 	}
 
 	b.mu.Lock()
@@ -112,6 +107,9 @@ func (b *InMemoryBus) Publish(ctx context.Context, topic string, event any) erro
 		select {
 		case ch <- data:
 		default:
+			total := b.dropped.Add(1)
+			logger.Warn("event dropped: subscriber buffer full",
+				"topic", topic, "total_dropped", total)
 		}
 	}
 	return nil
@@ -121,6 +119,11 @@ func (b *InMemoryBus) Publish(ctx context.Context, topic string, event any) erro
 // message published to it while this call is running. It blocks until ctx
 // is canceled, then deregisters the channel and returns ctx.Err().
 func (b *InMemoryBus) Subscribe(ctx context.Context, topic string, handler Handler) error {
+	logger := b.opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	ch := make(chan []byte, 16)
 
 	b.mu.Lock()
@@ -135,11 +138,11 @@ func (b *InMemoryBus) Subscribe(ctx context.Context, topic string, handler Handl
 			return ctx.Err()
 		case data := <-ch:
 			// A handler error has nowhere to redeliver to in this
-			// implementation — there is no broker underneath it to ask
-			// again. It is logged rather than silently discarded, so a
-			// test relying on InMemoryBus at least sees the failure.
+			// implementation — see the type doc's at-most-once note. It is
+			// logged rather than silently discarded, so a caller relying
+			// on InMemoryBus at least sees the failure.
 			if err := handler(ctx, data); err != nil {
-				slog.Default().Error("event handler failed (in-memory bus cannot redeliver)",
+				logger.Error("event handler failed (in-memory bus cannot redeliver)",
 					"topic", topic, "error", err)
 			}
 		}
@@ -156,11 +159,4 @@ func (b *InMemoryBus) unsubscribe(topic string, target chan []byte) {
 			break
 		}
 	}
-}
-
-func marshalEvent(event any) ([]byte, error) {
-	if b, ok := event.([]byte); ok {
-		return b, nil
-	}
-	return json.Marshal(event)
 }

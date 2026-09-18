@@ -1,8 +1,10 @@
-package search
+package meili
 
 import (
 	"fmt"
 	"strings"
+
+	"github.com/ManavA/keel/search"
 )
 
 // QuoteFilterValue removes characters that could break out of a quoted
@@ -20,30 +22,30 @@ func QuoteFilterValue(v string) string {
 	return fmt.Sprintf("%q", cleaned)
 }
 
-// buildMeiliFilters translates a backend-agnostic []Filter into Meilisearch
-// filter expressions.
-func buildMeiliFilters(filters []Filter) ([]string, error) {
+// buildMeiliFilters translates a backend-agnostic []search.Filter into
+// Meilisearch filter expressions.
+func buildMeiliFilters(filters []search.Filter) ([]string, error) {
 	out := make([]string, 0, len(filters))
 	for _, f := range filters {
 		switch f.Op {
-		case OpRaw:
+		case search.OpRaw:
 			expr, _ := f.Value.(string)
 			if expr != "" {
 				out = append(out, expr)
 			}
-		case OpEq:
+		case search.OpEq:
 			out = append(out, fmt.Sprintf("%s = %s", f.Field, meiliValue(f.Value)))
-		case OpNeq:
+		case search.OpNeq:
 			out = append(out, fmt.Sprintf("%s != %s", f.Field, meiliValue(f.Value)))
-		case OpGte:
-			out = append(out, fmt.Sprintf("%s >= %v", f.Field, f.Value))
-		case OpLte:
-			out = append(out, fmt.Sprintf("%s <= %v", f.Field, f.Value))
-		case OpGt:
-			out = append(out, fmt.Sprintf("%s > %v", f.Field, f.Value))
-		case OpLt:
-			out = append(out, fmt.Sprintf("%s < %v", f.Field, f.Value))
-		case OpIn:
+		case search.OpGte:
+			out = append(out, fmt.Sprintf("%s >= %s", f.Field, meiliValue(f.Value)))
+		case search.OpLte:
+			out = append(out, fmt.Sprintf("%s <= %s", f.Field, meiliValue(f.Value)))
+		case search.OpGt:
+			out = append(out, fmt.Sprintf("%s > %s", f.Field, meiliValue(f.Value)))
+		case search.OpLt:
+			out = append(out, fmt.Sprintf("%s < %s", f.Field, meiliValue(f.Value)))
+		case search.OpIn:
 			if len(f.Values) == 0 {
 				continue
 			}
@@ -53,7 +55,7 @@ func buildMeiliFilters(filters []Filter) ([]string, error) {
 			}
 			out = append(out, fmt.Sprintf("%s IN [%s]", f.Field, strings.Join(quoted, ", ")))
 		default:
-			return nil, fmt.Errorf("search: unsupported filter op %q", f.Op)
+			return nil, fmt.Errorf("meili: unsupported filter op %q", f.Op)
 		}
 	}
 	return out, nil
@@ -68,13 +70,13 @@ func meiliValue(v any) string {
 	return fmt.Sprintf("%v", v)
 }
 
-// buildMeiliSort translates a backend-agnostic []SortField into Meilisearch
-// sort expressions.
-func buildMeiliSort(sort []SortField) []string {
+// buildMeiliSort translates a backend-agnostic []search.SortField into
+// Meilisearch sort expressions.
+func buildMeiliSort(sort []search.SortField) []string {
 	out := make([]string, 0, len(sort))
 	for _, s := range sort {
 		dir := "asc"
-		if s.Dir == Desc {
+		if s.Dir == search.Desc {
 			dir = "desc"
 		}
 		out = append(out, fmt.Sprintf("%s:%s", s.Field, dir))
