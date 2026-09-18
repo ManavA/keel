@@ -1,0 +1,72 @@
+# Cloud Build config for a service built on keel: build, push, deploy to
+# Cloud Run.
+#
+# The build step below is followed by an explicit `docker push` before the
+# deploy step. Cloud Build's top-level `images:` field only pushes images
+# after every step in the build has finished, so a deploy step that runs
+# before that point would reference an image that has not been pushed yet.
+#
+# No values in this file are project-specific. Every value that differs
+# between environments is a substitution, passed at submit time or set on a
+# trigger; no secret is embedded here — pass secrets through Secret Manager
+# and `--set-secrets` on the deploy step, not through substitutions.
+#
+# Submit with:
+#   gcloud builds submit --config deploy/cloudbuild.yaml \
+#     --substitutions=_SERVICE_NAME=my-service,_GIT_REVISION=$(git rev-parse HEAD) .
+
+substitutions:
+  _REGION: us-central1
+  _REPOSITORY: services
+  _SERVICE_NAME: my-service
+  _CMD_PATH: ./cmd/api
+  # $COMMIT_SHA is set by Cloud Build only for a trigger-driven build. A
+  # manual `gcloud builds submit` leaves it empty, so pass this explicitly
+  # for a manual submit (see scripts/deploy-cloudbuild.sh).
+  _GIT_REVISION: ""
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - deploy/Dockerfile
+      - --build-arg
+      - CMD_PATH=${_CMD_PATH}
+      - --build-arg
+      - GIT_REVISION=${_GIT_REVISION}
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE_NAME}:$BUILD_ID
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE_NAME}:latest
+      - .
+
+  # Pushed explicitly, before the deploy step, for the reason above.
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE_NAME}
+
+  # Deployed by immutable $BUILD_ID tag, not :latest. A Cloud Run service
+  # resolves a mutable tag to a new digest on every deploy, but a Cloud Run
+  # job does not always re-resolve it: updating a job to the same tag
+  # string can be a no-op if the job is already pinned to that tag's
+  # current digest. Deploying by $BUILD_ID removes that failure mode for
+  # both services and jobs.
+  - name: gcr.io/cloud-builders/gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE_NAME}
+      - --image
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE_NAME}:$BUILD_ID
+      - --region
+      - ${_REGION}
+      - --platform
+      - managed
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 900s
