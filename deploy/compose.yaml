@@ -1,0 +1,69 @@
+# Local, no-cloud-account way to run a keel-based service: the app and
+# Postgres. Cloud Run is covered separately in cloudbuild.yaml and
+# cloudrun.md; this file is for local development and for any deployment
+# target that runs plain containers.
+#
+# Start the app and database:
+#   docker compose -f deploy/compose.yaml up
+#
+# Start with Meilisearch too (only needed if the service uses keel's search
+# package):
+#   docker compose -f deploy/compose.yaml --profile search up
+#
+# The app's DATABASE_URL points at the postgres service by its compose name,
+# not localhost, since containers on the default compose network reach each
+# other by service name.
+#
+# CMD_PATH defaults to this repository's example so the file is runnable here
+# rather than only illustrative. A service using keel overrides it with its own
+# main package, usually ./cmd/api.
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        CMD_PATH: ./examples/minimal
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://keel:keel@postgres:5432/keel?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: keel
+      POSTGRES_PASSWORD: keel
+      POSTGRES_DB: keel
+    ports:
+      - "5432:5432"
+    volumes:
+      - keel-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keel"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Optional: only started with --profile search. Not required for a
+  # service that does not use keel's search package.
+  meilisearch:
+    image: getmeili/meilisearch:v1.11
+    profiles:
+      - search
+    environment:
+      MEILI_MASTER_KEY: development-only-key
+      MEILI_NO_ANALYTICS: "true"
+    ports:
+      - "7700:7700"
+    volumes:
+      - keel-meilisearch-data:/meili_data
+
+volumes:
+  keel-postgres-data:
+  keel-meilisearch-data:
