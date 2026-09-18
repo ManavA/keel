@@ -9,27 +9,23 @@ import (
 // FilterOp is a comparison a [Filter] applies.
 type FilterOp string
 
+// The comparisons a [Filter] can apply.
 const (
-	// OpEq matches a field equal to Value.
-	OpEq FilterOp = "eq"
-	// OpNeq matches a field not equal to Value.
+	OpEq  FilterOp = "eq"
 	OpNeq FilterOp = "neq"
-	// OpIn matches a field equal to one of Values. This and every range op
-	// below assume a numeric or string field; mixing types across one
-	// field is a caller error.
-	OpIn FilterOp = "in"
-	// OpGte matches a numeric field greater than or equal to Value.
+
+	// OpIn and the range ops assume a numeric or string field; mixing types
+	// across one field is a caller error.
+	OpIn  FilterOp = "in"
 	OpGte FilterOp = "gte"
-	// OpLte matches a numeric field less than or equal to Value.
 	OpLte FilterOp = "lte"
-	// OpGt matches a numeric field greater than Value.
-	OpGt FilterOp = "gt"
-	// OpLt matches a numeric field less than Value.
-	OpLt FilterOp = "lt"
-	// OpRaw carries a raw, backend-specific expression in Value, for a
-	// Meilisearch function such as `_geoBoundingBox(...)` that has no
-	// portable equivalent. Only [Searcher] supports it; [PostgresIndex]
-	// returns an error for it rather than ignoring it.
+	OpGt  FilterOp = "gt"
+	OpLt  FilterOp = "lt"
+
+	// OpRaw carries a backend-specific expression in Value, for a Meilisearch
+	// function such as `_geoBoundingBox(...)` that has no portable equivalent.
+	// Only [Searcher] supports it; [PostgresIndex] returns an error for it
+	// rather than ignoring it.
 	OpRaw FilterOp = "raw"
 )
 
@@ -78,10 +74,9 @@ func Raw(expr string) Filter { return Filter{Op: OpRaw, Value: expr} }
 // SortDir is the direction of a [SortField].
 type SortDir string
 
+// The sort directions.
 const (
-	// Asc sorts ascending.
-	Asc SortDir = "asc"
-	// Desc sorts descending.
+	Asc  SortDir = "asc"
 	Desc SortDir = "desc"
 )
 

@@ -54,23 +54,15 @@ func normalizeNilSlice(v any) any {
 func NoContent(w http.ResponseWriter) { w.WriteHeader(http.StatusNoContent) }
 
 // Error writes a generic error body for status and logs the real reason with
-// the request id. The caller sees "not found"; the log has the error, the path
-// and the id tying them together.
-//
-// It logs through the logger on the request context, which NewRouter puts there
-// — so a service that configured its own logger, or extra redaction keys, gets
-// them applied here too. Without one it falls back to slog.Default.
-//
-//   - 404, never 403, for an identifier that belongs to someone else. A 403
-//     confirms the record exists, which is what the request was trying to
-//     establish.
-//   - Never echo the input. An identifier returned in the body is a reflection
-//     bug once it contains markup, and it confirms the guess was well formed.
-//   - Never return the error text. "duplicate key value violates unique
-//     constraint users_email_key" names the schema and answers "is this address
-//     registered" on the way past.
-//
+// the request id, through the logger NewRouter put on the request context.
 // err may be nil, for a refusal with no underlying failure.
+//
+// The body never carries the input or the Go error. An identifier echoed back
+// is a reflection bug once it contains markup and confirms the guess was well
+// formed; "duplicate key value violates unique constraint users_email_key"
+// names the schema and answers "is this address registered" on the way past.
+// For the same reason a record belonging to someone else is 404, never 403: a
+// 403 confirms it exists.
 func Error(w http.ResponseWriter, r *http.Request, status int, err error) {
 	id := log.RequestID(r.Context())
 

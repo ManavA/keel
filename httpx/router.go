@@ -19,7 +19,6 @@ type RouterOptions struct {
 	// logs.
 	Logger *slog.Logger
 
-	// RequestID configures the request-id middleware.
 	RequestID middleware.RequestIDOptions
 
 	// RealIP configures client-address recovery. Its zero value ignores
@@ -32,7 +31,6 @@ type RouterOptions struct {
 	RequestLog     middleware.RequestLogOptions
 	SkipRequestLog bool
 
-	// Recoverer configures panic recovery.
 	Recoverer middleware.RecovererOptions
 
 	// CORS, when set, answers browser preflights.
@@ -56,26 +54,20 @@ type RouterOptions struct {
 // DefaultTimeout bounds a request unless RouterOptions says otherwise.
 const DefaultTimeout = 30 * time.Second
 
-// NewRouter returns a chi router with the middleware stack in the order each
-// piece needs.
+// NewRouter returns a chi router with the middleware stack assembled in the
+// order below. Build your own chain from httpx/middleware if it does not suit;
+// this is the order to copy, and each step is placed where it is for a reason:
 //
-//  1. The router's logger onto the request context, then RequestID, so
-//     everything after them — including panic recovery and the response
-//     helpers — can log through the right logger and name the request.
-//  2. GetHead. chi answers HEAD with 405 on a route registered for GET, while
-//     RFC 9110 requires HEAD wherever GET is served; uptime checks and CDNs use
-//     it.
-//  3. RealIP, before anything that cares who the client is. After the rate
-//     limiter it would have no effect, the limiter having already bucketed
-//     every client behind the proxy together.
-//  4. RequestLog, above Recoverer, so a panic is still logged as a request with
-//     a status.
-//  5. Recoverer, above the timeout and the handler, so it catches panics from
-//     both.
-//  6. Timeout, then compression, then CORS, then the rate limit.
-//
-// Build your own chain from httpx/middleware if this does not suit; this is the
-// order to copy.
+//	logger, RequestID   everything after them, including panic recovery and the
+//	                    response helpers, can name the request
+//	GetHead             chi answers HEAD with 405 on a GET route; RFC 9110
+//	                    requires HEAD wherever GET is served
+//	RealIP              after the rate limiter it would have no effect, the
+//	                    limiter having already bucketed every client behind the
+//	                    proxy together
+//	RequestLog          above Recoverer, so a panic is still logged as a request
+//	Recoverer           above the timeout and the handler, to catch both
+//	Timeout, compression, CORS, rate limit
 //
 // One chi behaviour to know about: on a router with no routes registered at
 // all, ServeHTTP goes straight to the NotFound handler without running the

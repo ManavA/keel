@@ -22,12 +22,11 @@ type Trigger interface {
 // scheduler yet. It is the default Trigger: no external service is
 // required to use this package.
 type NoopTrigger struct {
-	// Logger, if set, receives a debug line per call. Nil is silent.
+	// Nil is silent.
 	Logger *slog.Logger
 }
 
-// Run logs the request (if a Logger is set) and returns nil without
-// starting anything.
+// Run starts nothing and returns nil.
 func (t NoopTrigger) Run(_ context.Context, jobName string) error {
 	if t.Logger != nil {
 		t.Logger.Debug("job trigger disabled", "job", jobName)

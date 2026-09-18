@@ -43,19 +43,14 @@ type RealIPOptions struct {
 // logging and abuse rules see the client rather than the proxy.
 //
 // The address is the rightmost entry in the forwarding header that is not a
-// trusted proxy. Rightmost, not leftmost: each hop appends to the header, so
-// the leftmost entry is whatever the original client sent, including a list it
-// invented before any proxy saw the request. Reading from the left — which is
-// what several widely used implementations do — lets a client choose its own
-// rate-limit bucket on every request.
+// trusted proxy. Rightmost, not leftmost: each hop appends, so the leftmost
+// entry is whatever the original client sent, including a list it invented
+// before any proxy saw the request. Reading from the left lets a client choose
+// its own rate-limit bucket on every request.
 //
-// When the header is not trusted, because no trusted proxies are configured or
-// the connection came from an address that is not one of them, RemoteAddr is
-// left unchanged.
-//
-// The rewritten RemoteAddr carries port 0. The client's source port is not in
-// the header to recover, and it is what would correlate a NAT'd client against
-// the proxy's own logs.
+// RemoteAddr is left unchanged when the header is not trusted, and the
+// rewritten form carries port 0 — the source port is not in the header to
+// recover, and it is what would correlate a NAT'd client against proxy logs.
 func RealIP(opts RealIPOptions) func(http.Handler) http.Handler {
 	header := opts.Header
 	if header == "" {
