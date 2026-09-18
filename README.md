@@ -14,11 +14,6 @@ go get github.com/ManavA/keel
 
 Go 1.25 or later. Docker is needed only by `pg/testdb`.
 
-keel is not a framework. There is no root package, no plugin registry and no
-lifecycle to adopt. You can take `httpx` without `pg`, or `media` without
-`geocode`. Packages meet through interfaces the caller supplies, not through
-imports of each other.
-
 ## Quick start
 
 A service needing Postgres and nothing else:
@@ -98,8 +93,6 @@ Postgres. Run it with `make run-local`.
 | `media` | Object storage and image derivatives, local filesystem or Google Cloud Storage |
 | `geocode` | Address to coordinate lookup with a degrade chain, Mapbox or a no-op default |
 | `perf` | Response caching, ETag, gzip, and singleflight middleware for HTTP handlers |
-| `scripts` | Developer and CI scripts |
-| `deploy` | Deployment templates and checks |
 
 ## Configuration
 
@@ -148,6 +141,10 @@ make migrations-check   # replay every migrations directory in the module
 turns a missing Docker from a skip into a failure. See `docs/testing.md`.
 
 ## Deployment
+
+`deploy/` holds a Dockerfile that injects the build revision, Cloud Build
+configuration, and scripts that check a deployed revision is the one that was
+pushed. `scripts/` holds the repository's own developer and CI scripts.
 
 See `docs/deploy.md` for health checks, proxy configuration, migrations,
 shutdown, pool sizing and build identification.

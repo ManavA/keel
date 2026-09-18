@@ -46,17 +46,16 @@ examples/
   minimal/       a runnable service over Postgres and nothing else
 docs/
   deploy.md
+  testing.md
 ```
 
-The rest of the layout is planned and arrives with the remaining extraction
-branches. It is fixed in advance so that work on it can happen in parallel:
+Three packages are planned, with the layout fixed in advance so work on them can
+happen in parallel:
 
 ```
 auth/        authentication sources, sessions, tokens
 admin/       administrative endpoints and their auth
 textpolicy/  one guard for generated and forwarded text
-docs/
-  testing.md
 ```
 
 ## Import layers
