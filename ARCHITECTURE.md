@@ -37,10 +37,25 @@ events/          publish and subscribe
 mail/            transactional email
   testing/         a Recorder for tests
   deliverycheck/   reconciling delivery claims against a provider
+media/           object storage and image derivatives
+geocode/         address to coordinate lookup
+perf/            response caching, ETag, gzip, and singleflight middleware
+scripts/         developer and CI scripts
+deploy/          deployment templates and checks
 examples/
   minimal/       a runnable service over Postgres and nothing else
 docs/
   deploy.md
+```
+
+The rest of the layout is planned and arrives with the remaining extraction
+branches. It is fixed in advance so that work on it can happen in parallel:
+
+```
+auth/        authentication sources, sessions, tokens
+admin/       administrative endpoints and their auth
+textpolicy/  one guard for generated and forwarded text
+docs/
   testing.md
 ```
 
@@ -51,8 +66,9 @@ anything strictly below it.
 
 1. **`config`, `log`, `httpx/buildinfo`** — no keel imports at all.
 2. **`httpx`, `pg`, `events`** — may use level 1.
-3. **`pg/migrate`, `pg/testdb`, `search`, `mail`, `jobs`** — may use levels 1 and
-   2. Each owns a dependency on something outside the process.
+3. **`pg/migrate`, `pg/testdb`, `search`, `mail`, `jobs`, `media`, `geocode`,
+   `perf`** — may use levels 1 and 2. Each owns a dependency on something
+   outside the process.
 
 `examples/minimal` sits outside the layers and imports whatever it needs.
 

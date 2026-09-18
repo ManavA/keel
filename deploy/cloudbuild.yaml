@@ -13,7 +13,7 @@
 #
 # Submit with:
 #   gcloud builds submit --config deploy/cloudbuild.yaml \
-#     --substitutions=_SERVICE_NAME=my-service,_GIT_REVISION=$(git rev-parse HEAD) .
+#     --substitutions=_SERVICE_NAME=my-service,_GIT_REVISION=$(git rev-parse HEAD),_BUILDINFO_PACKAGE=your/module/internal/buildinfo .
 
 substitutions:
   _REGION: us-central1
@@ -24,6 +24,10 @@ substitutions:
   # manual `gcloud builds submit` leaves it empty, so pass this explicitly
   # for a manual submit (see scripts/deploy-cloudbuild.sh).
   _GIT_REVISION: ""
+  # Required whenever _GIT_REVISION is set — deploy/Dockerfile fails the
+  # build rather than silently stamping nothing if it is left empty. Set it
+  # to your project's buildinfo package, e.g. your/module/internal/buildinfo.
+  _BUILDINFO_PACKAGE: ""
 
 steps:
   - name: gcr.io/cloud-builders/docker
@@ -35,6 +39,8 @@ steps:
       - CMD_PATH=${_CMD_PATH}
       - --build-arg
       - GIT_REVISION=${_GIT_REVISION}
+      - --build-arg
+      - BUILDINFO_PACKAGE=${_BUILDINFO_PACKAGE}
       - -t
       - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE_NAME}:$BUILD_ID
       - -t

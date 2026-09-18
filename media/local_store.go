@@ -49,7 +49,7 @@ func NewLocalStore(root, baseURL string) (*LocalStore, error) {
 	if root == "" {
 		return nil, errors.New("media: local store root must not be empty")
 	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, fmt.Errorf("media: create local store root: %w", err)
 	}
 	r, err := os.OpenRoot(root)
@@ -99,7 +99,7 @@ func (s *LocalStore) Put(_ context.Context, key string, body []byte, contentType
 	}
 
 	if dir := path.Dir(cleaned); dir != "." {
-		if err := s.root.MkdirAll(dir, 0o755); err != nil {
+		if err := s.root.MkdirAll(dir, 0o750); err != nil {
 			return fmt.Errorf("media: create directory for %q: %w", key, err)
 		}
 	}
