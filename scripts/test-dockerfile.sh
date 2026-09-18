@@ -2,12 +2,14 @@
 #
 # Build deploy/Dockerfile against a throwaway minimal Go project and check
 # what a template Dockerfile cannot prove on its own: that the migrations/
-# COPY is genuinely optional (present and absent both build), that a
-# revision with no declared destination fails the build instead of being
-# silently dropped, and that the stamped revision actually reaches a
-# running container — plus one honestly-documented limitation: a
-# BUILDINFO_PACKAGE pointing at the wrong package cannot be caught here at
-# all (see the Dockerfile's own comment on why).
+# COPY is genuinely optional and does not match anything else named with a
+# migrations prefix, that a revision with no declared destination fails the
+# build instead of being silently dropped, that a BUILDINFO_PACKAGE this
+# build never actually imports also fails the build, and that a stamped
+# revision reaches a running container — plus one honestly-documented
+# limitation: BUILDINFO_PACKAGE naming a real, reachable package with no
+# variable actually named Revision cannot be caught here (see the
+# Dockerfile's own comment on why).
 #
 # This never builds against keel itself: keel has no cmd/ directory (it is
 # a library), so there is nothing for CMD_PATH to point at here. The
@@ -28,9 +30,9 @@ usage() {
 Usage: test-dockerfile.sh
        test-dockerfile.sh --help
 
-Builds deploy/Dockerfile against a throwaway minimal Go project, with and
-without a migrations/ directory, and with a correct and an incorrect
-BUILDINFO_PACKAGE, asserting the outcome each combination requires.
+Builds deploy/Dockerfile against a throwaway minimal Go project under
+several combinations of migrations/, GIT_REVISION and BUILDINFO_PACKAGE,
+asserting the outcome each one requires.
 
 Requires Docker.
 EOF
@@ -122,26 +124,60 @@ check "builds with a correct BUILDINFO_PACKAGE and migrations/ present" 0 \
 check "the stamped revision actually reaches a container run from that image" 0 \
     bash -c "docker run --rm keel-dockerfile-selftest:with-migrations | grep -q deadbeefcafe"
 
-check "fails the build when GIT_REVISION is set but BUILDINFO_PACKAGE is not -- this is the required control: it must be able to fail" 1 \
+check "the correct build actually copied migrations/" 0 \
+    bash -c "docker run --rm --entrypoint ls keel-dockerfile-selftest:with-migrations /app/migrations/0001_init.sql"
+
+check "fails the build when GIT_REVISION is set but BUILDINFO_PACKAGE is not -- this is a required control: it must be able to fail" 1 \
     build keel-dockerfile-selftest:missing-package deadbeefcafe ""
 
-echo "== the one misconfiguration this Dockerfile cannot catch, demonstrated =="
-# BUILDINFO_PACKAGE pointing at a package that exists in no way relevant to
-# the binary is not, and cannot be, a build-time error: the Go linker
-# treats an unknown -X target as a no-op, not a failure. This documents
-# that limitation as a passing build with an honestly-unset revision at
-# runtime, rather than leaving it unverified.
-check "builds successfully even with a nonexistent BUILDINFO_PACKAGE (documented limitation, not a bug)" 0 \
+check "fails the build when BUILDINFO_PACKAGE names a package this build never imports -- another required control" 1 \
     build keel-dockerfile-selftest:wrong-package deadbeefcafe dockerfile-selftest/internal/nonexistent
 
-check "a nonexistent BUILDINFO_PACKAGE reports the honest default, not the intended revision" 0 \
-    bash -c "docker run --rm keel-dockerfile-selftest:wrong-package | grep -q 'revision: unset'"
+echo "== the one misconfiguration this Dockerfile cannot catch, demonstrated =="
+# A real, reachable package with no variable actually named Revision is not,
+# and cannot be, a build-time error here: the Go linker treats -X targeting
+# a missing symbol in an otherwise valid package as a no-op, not a failure,
+# the same as it does for a missing package. Confirmed by building this
+# case and inspecting the result, not assumed.
+mkdir -p "$WORKDIR/project/internal/novar"
+cat > "$WORKDIR/project/internal/novar/novar.go" <<'EOF'
+package novar
 
-echo "== rebuilding without migrations/ =="
+var SomethingElse = "x"
+EOF
+# novar must actually be imported by cmd/api, or go list -deps correctly
+# refuses it for the OTHER reason (not reachable) and this case never
+# reaches the one it is meant to demonstrate.
+cat > "$WORKDIR/project/cmd/api/main.go" <<'EOF'
+package main
+
+import (
+	"fmt"
+
+	"dockerfile-selftest/internal/buildinfo"
+	_ "dockerfile-selftest/internal/novar"
+)
+
+func main() {
+	fmt.Println("revision:", buildinfo.Revision)
+}
+EOF
+
+check "builds successfully even when BUILDINFO_PACKAGE has no Revision variable (documented limitation, not a bug)" 0 \
+    build keel-dockerfile-selftest:no-revision-var deadbeefcafe dockerfile-selftest/internal/novar
+
+check "a BUILDINFO_PACKAGE with no Revision variable reports the honest default, not the intended revision" 0 \
+    bash -c "docker run --rm keel-dockerfile-selftest:no-revision-var | grep -q 'revision: unset'"
+
+echo "== rebuilding without migrations/, with a similarly-named file present instead =="
 rm -rf "$WORKDIR/project/migrations"
+echo "not a migration" > "$WORKDIR/project/migrations.md"
 
 check "builds when migrations/ is absent (the COPY must be a genuine no-op, not a failure)" 0 \
     build keel-dockerfile-selftest:no-migrations deadbeefcafe dockerfile-selftest/internal/buildinfo
+
+check "a similarly-named file (migrations.md) is not swept into /app/migrations" 1 \
+    bash -c "docker run --rm --entrypoint ls keel-dockerfile-selftest:no-migrations /app/migrations/migrations.md"
 
 echo "$pass passed, $fail failed"
 
@@ -149,6 +185,7 @@ docker rmi -f \
     keel-dockerfile-selftest:with-migrations \
     keel-dockerfile-selftest:missing-package \
     keel-dockerfile-selftest:wrong-package \
+    keel-dockerfile-selftest:no-revision-var \
     keel-dockerfile-selftest:no-migrations \
     >/dev/null 2>&1 || true
 

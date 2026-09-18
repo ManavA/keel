@@ -2,6 +2,8 @@ package perf
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
 
 	"golang.org/x/sync/singleflight"
 )
@@ -26,14 +28,38 @@ type SingleFlight struct {
 	group singleflight.Group
 }
 
+// ErrPanicked reports that fn panicked. Do recovers the panic itself and
+// returns it as this error rather than letting it reach
+// golang.org/x/sync/singleflight's own handling: that package deliberately
+// crashes the process on an unrecovered panic whenever more than one caller
+// is waiting on DoChan, by spawning a goroutine that re-panics — a caller's
+// own recover cannot catch a panic raised in a different goroutine, so
+// there is no way to prevent the crash from outside. Recovering here, before
+// fn's panic ever reaches that code, avoids it entirely and reports the
+// panic as an ordinary error to every caller waiting on the key instead.
+type ErrPanicked struct {
+	Value any
+	Stack []byte
+}
+
+func (e *ErrPanicked) Error() string {
+	return fmt.Sprintf("singleflight: panic: %v", e.Value)
+}
+
 // Do calls fn for key unless a call for the same key is already in flight,
 // in which case it waits for that call and shares its result. shared
 // reports whether the result was shared with another caller. If ctx is
 // done before a result is available, Do returns ctx.Err() without waiting
 // further; the underlying call is not affected and other callers waiting on
-// the same key are not woken by this caller's cancellation.
+// the same key are not woken by this caller's cancellation. If fn panics,
+// Do returns an *ErrPanicked instead of propagating the panic.
 func (s *SingleFlight) Do(ctx context.Context, key string, fn func(ctx context.Context) (any, error)) (v any, shared bool, err error) {
-	ch := s.group.DoChan(key, func() (any, error) {
+	ch := s.group.DoChan(key, func() (result any, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = &ErrPanicked{Value: r, Stack: debug.Stack()}
+			}
+		}()
 		return fn(context.Background())
 	})
 	select {

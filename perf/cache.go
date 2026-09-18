@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -266,10 +267,12 @@ func (o CacheOptions) withDefaults() CacheOptions {
 // this even with a custom key. Handlers that require per-user responses
 // must sit behind this refusal, not rely on it as their only defense.
 //
-// It refuses to store a response that carries Set-Cookie, a Cache-Control
-// directive of private or no-store, or Vary: *, and never stores a non-2xx
-// response — caching a transient failure would turn it into a lasting one
-// for as long as the entry's ttl runs.
+// It refuses to store a response that carries Set-Cookie; a Cache-Control
+// of private, no-store, no-cache, or max-age=0; or a Vary naming anything
+// other than Accept-Encoding (the only header DefaultKey folds into the
+// key) — and never stores a non-2xx response, since caching a transient
+// failure would turn it into a lasting one for as long as the entry's ttl
+// runs.
 func ResponseCache(store Store, opts CacheOptions) func(http.Handler) http.Handler {
 	opts = opts.withDefaults()
 
@@ -320,7 +323,9 @@ func cacheableRequest(r *http.Request) bool {
 }
 
 // cacheableResponse reports whether a response may be stored: a 2xx status,
-// no Set-Cookie, no Cache-Control: private or no-store, and no Vary: *.
+// no Set-Cookie, a Cache-Control that does not forbid or immediately expire
+// storage, and a Vary that names nothing this cache does not already fold
+// into its key.
 func cacheableResponse(status int, header http.Header) bool {
 	if status < 200 || status >= 300 {
 		return false
@@ -330,12 +335,30 @@ func cacheableResponse(status int, header http.Header) bool {
 	}
 	for _, directive := range strings.Split(header.Get("Cache-Control"), ",") {
 		d := strings.ToLower(strings.TrimSpace(directive))
-		if d == "private" || d == "no-store" {
+		switch {
+		case d == "private", d == "no-store":
 			return false
+		// no-cache means "store it, but revalidate with the origin before
+		// every use" — this cache has no revalidation path, so honoring it
+		// means refusing to store rather than serving an unvalidated copy.
+		case d == "no-cache":
+			return false
+		// max-age=0 marks the response stale on arrival; storing it for the
+		// configured TTL anyway would ignore that.
+		case strings.HasPrefix(d, "max-age="):
+			if n, err := strconv.Atoi(strings.TrimPrefix(d, "max-age=")); err == nil && n <= 0 {
+				return false
+			}
 		}
 	}
+	// DefaultKey folds in Accept-Encoding, so a Vary naming only that is
+	// already accounted for. A Vary naming anything else — including "*" —
+	// means the response depends on something the key does not vary by,
+	// and storing it under one key would replay it across every value of
+	// whatever the key is missing.
 	for _, v := range strings.Split(header.Get("Vary"), ",") {
-		if strings.TrimSpace(v) == "*" {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v != "" && v != "accept-encoding" {
 			return false
 		}
 	}

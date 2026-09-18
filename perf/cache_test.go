@@ -306,6 +306,99 @@ func TestResponseCache(t *testing.T) {
 		require.Equal(t, 1, calls, "a public, cacheable response must be served from cache on the second call")
 	})
 
+	t.Run("a response with Cache-Control: no-cache is never cached", func(t *testing.T) {
+		// no-cache means "store it, but revalidate before every use" — this
+		// cache has no revalidation path, so it must refuse to store rather
+		// than serve a copy it never revalidates.
+		store := NewMemoryStore(MemoryStoreOptions{})
+		calls := 0
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/no-cache", nil)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		require.Equal(t, 2, calls)
+	})
+
+	t.Run("a response with Cache-Control: max-age=0 is never cached", func(t *testing.T) {
+		store := NewMemoryStore(MemoryStoreOptions{})
+		calls := 0
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			w.Header().Set("Cache-Control", "public, max-age=0")
+			w.WriteHeader(http.StatusOK)
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/max-age-zero", nil)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		require.Equal(t, 2, calls)
+	})
+
+	t.Run("a response with a positive max-age is still cached", func(t *testing.T) {
+		// Control for the max-age=0 refusal above: an ordinary positive
+		// max-age must not be mistaken for it.
+		store := NewMemoryStore(MemoryStoreOptions{})
+		calls := 0
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			w.Header().Set("Cache-Control", "public, max-age=60")
+			w.WriteHeader(http.StatusOK)
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/max-age-positive", nil)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		require.Equal(t, 1, calls)
+	})
+
+	t.Run("a response Vary-ing on a header the cache key does not fold in is never cached", func(t *testing.T) {
+		// Without this refusal, a response cached under a key that ignores
+		// X-Tenant would be replayed across every tenant.
+		store := NewMemoryStore(MemoryStoreOptions{})
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Vary", "X-Tenant")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(r.Header.Get("X-Tenant")))
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+
+		alice := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/tenant-data", nil)
+		alice.Header.Set("X-Tenant", "alice")
+		wAlice := httptest.NewRecorder()
+		wrapped.ServeHTTP(wAlice, alice)
+
+		bob := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/tenant-data", nil)
+		bob.Header.Set("X-Tenant", "bob")
+		wBob := httptest.NewRecorder()
+		wrapped.ServeHTTP(wBob, bob)
+
+		require.Equal(t, "alice", wAlice.Body.String())
+		require.Equal(t, "bob", wBob.Body.String(), "bob must never receive alice's response because Vary named a header the key ignores")
+	})
+
+	t.Run("a response Vary-ing only on Accept-Encoding is still cached", func(t *testing.T) {
+		// Control for the Vary refusal above: Accept-Encoding is already
+		// folded into DefaultKey, so a Vary naming only it must not be
+		// mistaken for one naming something the key ignores.
+		store := NewMemoryStore(MemoryStoreOptions{})
+		calls := 0
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			w.Header().Set("Vary", "Accept-Encoding")
+			w.WriteHeader(http.StatusOK)
+		})
+		wrapped := ResponseCache(store, CacheOptions{})(handler)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/vary-encoding-only", nil)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		wrapped.ServeHTTP(httptest.NewRecorder(), req)
+		require.Equal(t, 1, calls)
+	})
+
 	t.Run("gzip and identity responses to the same URL are cached and replayed separately", func(t *testing.T) {
 		store := NewMemoryStore(MemoryStoreOptions{})
 		handler := Gzip(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

@@ -201,4 +201,68 @@ func TestSingleFlight_Do(t *testing.T) {
 
 		require.False(t, <-fnCtxCancelled, "fn's context must not be cancelled by the leader's own context cancellation")
 	})
+
+	t.Run("a panic in fn is recovered and returned as an error, not a process crash", func(t *testing.T) {
+		var sf SingleFlight
+		v, shared, err := sf.Do(context.Background(), "k", func(context.Context) (any, error) {
+			panic("boom")
+		})
+		require.Nil(t, v)
+		require.False(t, shared)
+		var panicErr *ErrPanicked
+		require.ErrorAs(t, err, &panicErr)
+		require.Equal(t, "boom", panicErr.Value)
+		require.NotEmpty(t, panicErr.Stack)
+	})
+
+	t.Run("a follower waiting on a call whose fn panics gets the same error, not a hang or a second panic", func(t *testing.T) {
+		var sf SingleFlight
+		release := make(chan struct{})
+		started := make(chan struct{})
+
+		leaderDone := make(chan struct{})
+		var leaderErr error
+		go func() {
+			defer close(leaderDone)
+			_, _, leaderErr = sf.Do(context.Background(), "shared-key", func(context.Context) (any, error) {
+				close(started)
+				<-release
+				panic("boom")
+			})
+		}()
+		<-started
+
+		followerDone := make(chan struct{})
+		var followerErr error
+		go func() {
+			defer close(followerDone)
+			_, _, followerErr = sf.Do(context.Background(), "shared-key", func(context.Context) (any, error) {
+				t.Error("a follower must never re-run fn")
+				return nil, nil
+			})
+		}()
+
+		// Give the follower a moment to actually join the in-flight call
+		// before it is allowed to panic — the same reasoning as the
+		// existing "does not affect other waiters" test above.
+		time.Sleep(20 * time.Millisecond)
+		close(release)
+
+		select {
+		case <-leaderDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the leader must return the recovered panic, not hang or crash the process")
+		}
+		select {
+		case <-followerDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the follower must receive the shared panic result, not hang")
+		}
+
+		var leaderPanicErr, followerPanicErr *ErrPanicked
+		require.ErrorAs(t, leaderErr, &leaderPanicErr)
+		require.ErrorAs(t, followerErr, &followerPanicErr)
+		require.Equal(t, "boom", leaderPanicErr.Value)
+		require.Equal(t, "boom", followerPanicErr.Value)
+	})
 }

@@ -2,6 +2,7 @@ package media
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -10,6 +11,23 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+// failAfterNWrites wraps a real rootFS and fails every WriteFile call after
+// the first n have succeeded, letting a test target the write that lands
+// after a previous one in the same Put has already landed — the window
+// where an overwrite could destroy a previously-good object.
+type failAfterNWrites struct {
+	rootFS
+	writesRemaining int
+}
+
+func (f *failAfterNWrites) WriteFile(name string, data []byte, perm os.FileMode) error {
+	if f.writesRemaining <= 0 {
+		return errors.New("simulated write failure")
+	}
+	f.writesRemaining--
+	return f.rootFS.WriteFile(name, data, perm)
+}
 
 func TestLocalStore(t *testing.T) {
 	ctx := context.Background()
@@ -127,5 +145,51 @@ func TestLocalStore_SymlinkEscape(t *testing.T) {
 		require.Error(t, err)
 		_, statErr := os.Stat(filepath.Join(outsideDir, "planted.txt"))
 		require.True(t, os.IsNotExist(statErr), "must never have written outside the root")
+	})
+}
+
+// TestLocalStore_PutPartialFailure targets the write that lands after
+// another one in the same Put has already succeeded — the window in which
+// an overwrite could previously destroy a good object by deleting it when
+// only the second of its two writes failed.
+func TestLocalStore_PutPartialFailure(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a fresh Put that fails on its second write leaves nothing behind", func(t *testing.T) {
+		root, err := os.OpenRoot(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = root.Close() })
+
+		s := &LocalStore{root: root, fs: &failAfterNWrites{rootFS: root, writesRemaining: 1}}
+
+		err = s.Put(ctx, "new-key.txt", []byte("new body"), "text/plain")
+		require.Error(t, err)
+
+		_, err = s.Get(ctx, "new-key.txt")
+		require.ErrorIs(t, err, ErrNotFound, "a key that never existed must still not exist after a failed Put")
+	})
+
+	t.Run("an overwrite that fails on its second write leaves the previous object untouched", func(t *testing.T) {
+		root, err := os.OpenRoot(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = root.Close() })
+
+		s := &LocalStore{root: root, fs: root}
+		require.NoError(t, s.Put(ctx, "existing-key.txt", []byte("original body"), "text/original"))
+
+		// Now make only the FIRST write of the next Put succeed (the new
+		// body), and the second (its content type) fail — the exact
+		// sequence that used to delete the already-landed new body,
+		// destroying the working object that was there before this Put
+		// was even attempted.
+		s.fs = &failAfterNWrites{rootFS: root, writesRemaining: 1}
+		err = s.Put(ctx, "existing-key.txt", []byte("new body"), "text/new")
+		require.Error(t, err)
+
+		s.fs = root // restore real writes for the verification read
+		body, err := s.Get(ctx, "existing-key.txt")
+		require.NoError(t, err, "the previously-stored object must still be readable")
+		require.Equal(t, "original body", string(body), "a failed overwrite must not destroy the original body")
+		require.Equal(t, "text/original", s.contentType("existing-key.txt"), "a failed overwrite must not destroy the original content type")
 	})
 }

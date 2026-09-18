@@ -25,6 +25,18 @@ const contentTypeSuffix = ".__keel_content_type"
 // or abandoned write is never exposed even if one is left behind.
 const tmpInfix = ".__keel_tmp_"
 
+// rootFS is the subset of *os.Root's methods Put needs. Declared so a
+// same-package test can inject a failure at a specific write — the write
+// that lands after another one in the same Put has already succeeded is
+// otherwise impractical to trigger through the real filesystem. *os.Root
+// satisfies this interface without any wrapping.
+type rootFS interface {
+	MkdirAll(name string, perm os.FileMode) error
+	WriteFile(name string, data []byte, perm os.FileMode) error
+	Rename(oldname, newname string) error
+	Remove(name string) error
+}
+
 // LocalStore implements Store on the local filesystem: for tests, local
 // development, and any deployment with no object storage at all. It never
 // signs anything — URL just joins BaseURL and key — so whatever serves
@@ -38,7 +50,8 @@ const tmpInfix = ".__keel_tmp_"
 // that points outside it, since the escape happens at the filesystem level,
 // not in the path string.
 type LocalStore struct {
-	root    *os.Root
+	root    *os.Root // Get, contentType and Handler need the concrete *os.File from Open
+	fs      rootFS   // Put's writes; always root, except in this package's own tests
 	baseURL string
 }
 
@@ -56,7 +69,7 @@ func NewLocalStore(root, baseURL string) (*LocalStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("media: open local store root: %w", err)
 	}
-	return &LocalStore{root: r, baseURL: strings.TrimRight(baseURL, "/")}, nil
+	return &LocalStore{root: r, fs: r, baseURL: strings.TrimRight(baseURL, "/")}, nil
 }
 
 // Close releases the root directory handle. A LocalStore used for the life
@@ -86,12 +99,17 @@ func randomSuffix() string {
 }
 
 // Put implements Store. The object and its content type are each written to
-// a uniquely-named temporary file and renamed into place, so two concurrent
-// Puts of the same key never race on one temp path, a reader never observes
-// a partially written object, and a Put that fails partway through never
-// corrupts whatever was there before. If the content type cannot be
-// recorded, the object itself is rolled back rather than left with no
-// record of what it is.
+// a uniquely-named temporary file first, and neither is renamed into place
+// until both writes have succeeded — so two concurrent Puts of the same key
+// never race on one temp path, a reader never observes a partially written
+// object, and a Put that fails while overwriting an existing key leaves the
+// previous object exactly as it was rather than deleting it: nothing about
+// the live key is touched until there is a complete replacement ready to
+// swap in. The two renames themselves cannot be made atomic together
+// without OS support neither this filesystem nor most others offer; if the
+// first rename succeeds and the second does not, the object has been
+// updated but the content type may briefly lag behind it, which Handler
+// tolerates by falling back to no explicit Content-Type.
 func (s *LocalStore) Put(_ context.Context, key string, body []byte, contentType string) error {
 	cleaned, err := cleanKey(key)
 	if err != nil {
@@ -99,29 +117,29 @@ func (s *LocalStore) Put(_ context.Context, key string, body []byte, contentType
 	}
 
 	if dir := path.Dir(cleaned); dir != "." {
-		if err := s.root.MkdirAll(dir, 0o750); err != nil {
+		if err := s.fs.MkdirAll(dir, 0o750); err != nil {
 			return fmt.Errorf("media: create directory for %q: %w", key, err)
 		}
 	}
 
 	bodyTmp := cleaned + tmpInfix + randomSuffix()
-	if err := s.root.WriteFile(bodyTmp, body, 0o644); err != nil {
+	if err := s.fs.WriteFile(bodyTmp, body, 0o644); err != nil {
 		return fmt.Errorf("media: write %q: %w", key, err)
-	}
-	if err := s.root.Rename(bodyTmp, cleaned); err != nil {
-		_ = s.root.Remove(bodyTmp)
-		return fmt.Errorf("media: finalize %q: %w", key, err)
 	}
 
 	ctPath := cleaned + contentTypeSuffix
 	ctTmp := ctPath + tmpInfix + randomSuffix()
-	if err := s.root.WriteFile(ctTmp, []byte(contentType), 0o644); err != nil {
-		_ = s.root.Remove(cleaned)
+	if err := s.fs.WriteFile(ctTmp, []byte(contentType), 0o644); err != nil {
+		_ = s.fs.Remove(bodyTmp)
 		return fmt.Errorf("media: write content type for %q: %w", key, err)
 	}
-	if err := s.root.Rename(ctTmp, ctPath); err != nil {
-		_ = s.root.Remove(ctTmp)
-		_ = s.root.Remove(cleaned)
+
+	if err := s.fs.Rename(bodyTmp, cleaned); err != nil {
+		_ = s.fs.Remove(bodyTmp)
+		_ = s.fs.Remove(ctTmp)
+		return fmt.Errorf("media: finalize %q: %w", key, err)
+	}
+	if err := s.fs.Rename(ctTmp, ctPath); err != nil {
 		return fmt.Errorf("media: finalize content type for %q: %w", key, err)
 	}
 
