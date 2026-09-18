@@ -96,6 +96,9 @@ Postgres. Run it with `make run-local`.
 | `auth` | Authentication composable across local, Firebase and generic OIDC sources; sessions, verification, password reset (`auth/pg` for Postgres) |
 | `admin` | Administrative session auth, a CORS-scoped router, and a helper for keeping admin-only fields out of public responses (`admin/pg` for Postgres) |
 | `textpolicy` | One normalize-then-match guard for generated and forwarded text, with no domain-specific rules of its own |
+| `retry` | Exponential backoff with full jitter, and context cancellation |
+| `idempotency` | HTTP middleware that replays a stored response for a repeated `Idempotency-Key` |
+| `outbox` | Writes an event with a domain transaction, then relays it to `events` |
 
 ## Configuration
 
@@ -132,6 +135,7 @@ configuration and falls back to an in-process default:
 | `media` | local filesystem (`LocalStore`) | Google Cloud Storage (`GCSStore`) |
 | `geocode` | `NoopProvider` — reports no result rather than a fabricated one | Mapbox |
 | `auth` | `local` — email, password, verification, reset, sessions, all in-memory (`auth/pg` for Postgres) | `firebase` (ID tokens), `oidc` (any issuer) |
+| `idempotency` | in-memory (`MemoryStore`) | Postgres (`idempotency/pg`) |
 
 ## Testing
 

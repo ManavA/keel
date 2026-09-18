@@ -3,9 +3,11 @@ package geocode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -161,4 +163,63 @@ func TestMapboxProvider_Geocode(t *testing.T) {
 		require.NoError(t, err)
 		require.Contains(t, unescaped, "1 Foo & Bar Ave")
 	})
+
+	t.Run("retries a transport failure and succeeds without degrading precision", func(t *testing.T) {
+		srv := mapboxStub(t, map[string][]mapboxFeature{
+			"address": {{Center: []float64{-122.2, 37.8}}},
+		})
+		defer srv.Close()
+
+		flaky := &flakyTransport{fails: 2, next: http.DefaultTransport}
+		p := NewMapboxProvider("test-token", MapboxOptions{
+			BaseURL:    srv.URL + "/",
+			HTTPClient: &http.Client{Transport: flaky},
+		})
+
+		coords, err := p.Geocode(context.Background(), "123 Main St", "Oakland", "CA", "94601")
+		require.NoError(t, err)
+		require.NotNil(t, coords)
+		require.Equal(t, PrecisionAddress, coords.Precision,
+			"a transport failure that eventually succeeds must not fall through to a coarser tier")
+		require.Equal(t, int32(3), flaky.attemptCount(), "2 failures plus the succeeding attempt")
+	})
+
+	t.Run("gives up after transport retries are exhausted", func(t *testing.T) {
+		srv := mapboxStub(t, map[string][]mapboxFeature{
+			"address": {{Center: []float64{-122.2, 37.8}}},
+		})
+		defer srv.Close()
+
+		flaky := &flakyTransport{fails: 999, next: http.DefaultTransport}
+		p := NewMapboxProvider("test-token", MapboxOptions{
+			BaseURL:    srv.URL + "/",
+			HTTPClient: &http.Client{Transport: flaky},
+		})
+
+		coords, err := p.Geocode(context.Background(), "123 Main St", "", "", "")
+		require.Error(t, err)
+		require.Nil(t, coords)
+		require.Equal(t, int32(mapboxTransportRetry.MaxAttempts), flaky.attemptCount(),
+			"mapboxTransportRetry.MaxAttempts bounds the retrying")
+	})
+}
+
+// flakyTransport fails its first `fails` round trips with a transport-level
+// error, then delegates to next, so a test can pin exactly how many times
+// the outbound request was attempted.
+type flakyTransport struct {
+	fails int
+	next  http.RoundTripper
+
+	attempts atomic.Int32
+}
+
+func (f *flakyTransport) attemptCount() int32 { return f.attempts.Load() }
+
+func (f *flakyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	n := f.attempts.Add(1)
+	if int(n) <= f.fails {
+		return nil, errors.New("flakyTransport: simulated transport failure")
+	}
+	return f.next.RoundTrip(req)
 }

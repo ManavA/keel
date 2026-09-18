@@ -9,7 +9,19 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/ManavA/keel/retry"
 )
+
+// mapboxTransportRetry retries a request the HTTP client could not complete.
+// Without it a dropped connection falls through the degrade chain and comes
+// back as a coarser result with a nil error. A non-200 response is not
+// retried. The request is a GET with no body, so repeating it is safe.
+var mapboxTransportRetry = retry.Options{
+	MaxAttempts: 3,
+	BaseDelay:   200 * time.Millisecond,
+	MaxDelay:    2 * time.Second,
+}
 
 // defaultMapboxBaseURL is overridden in tests via MapboxOptions.BaseURL.
 const defaultMapboxBaseURL = "https://api.mapbox.com/geocoding/v5/mapbox.places/"
@@ -146,7 +158,17 @@ func (p *MapboxProvider) lookup(ctx context.Context, query, types string) (*Coor
 		return nil, fmt.Errorf("geocode: build request: %w", sanitizeTransportErr(err))
 	}
 
-	resp, err := p.httpClient.Do(req)
+	// resp is assigned only by the attempt that succeeds, so there is one
+	// body to close.
+	var resp *http.Response
+	err = retry.Do(ctx, func() error {
+		r, doErr := p.httpClient.Do(req) //nolint:bodyclose // closed by the defer below
+		if doErr != nil {
+			return doErr
+		}
+		resp = r
+		return nil
+	}, mapboxTransportRetry)
 	if err != nil {
 		return nil, fmt.Errorf("geocode: request failed: %w", sanitizeTransportErr(err))
 	}
