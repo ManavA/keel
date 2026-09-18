@@ -86,3 +86,23 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - name: check-deployed-revision.sh self-test
+        run: scripts/check-deployed-revision.sh --self-test
+      - name: verify-deployed.sh self-test
+        run: scripts/verify-deployed.sh --self-test
+      - name: deploy-cloudbuild.sh self-test
+        run: scripts/deploy-cloudbuild.sh --self-test
+      - name: docker compose config validates
+        run: docker compose -f deploy/compose.yaml config >/dev/null
+      # Builds deploy/Dockerfile against a throwaway project, not keel
+      # itself — keel is a library with no cmd/ of its own. See the
+      # script's own header for exactly what this does and does not prove.
+      - name: Dockerfile self-test
+        run: scripts/test-dockerfile.sh

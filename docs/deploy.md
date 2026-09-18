@@ -186,3 +186,60 @@ An example service and the configuration it needs are in `examples/minimal`. It
 needs Postgres and nothing else: search is Postgres-backed, mail writes to the
 log, events are in-process. Each of those has an opt-in external backend when
 you want one, selected by configuration rather than by a rewrite.
+
+## The deploy/ and scripts/ directories
+
+`deploy/` and `scripts/` are templates and checks for the two shapes above:
+running locally with no cloud account, and running on Cloud Run.
+
+### Running locally
+
+`deploy/compose.yaml` runs the service and Postgres with `docker compose`.
+This is the default: it requires no cloud account and no external service
+beyond Docker. Start it with:
+
+```
+docker compose -f deploy/compose.yaml up
+```
+
+Add `--profile search` to also start Meilisearch, for a service that uses
+keel's `search` package. A service that only uses Postgres does not need
+this profile.
+
+### Running on Cloud Run
+
+`deploy/Dockerfile` and `deploy/cloudbuild.yaml` build and deploy a service
+to Cloud Run. `deploy/cloudrun.md` documents the Cloud Run-specific details:
+how `--args` interacts with the container's `ENTRYPOINT`, the difference
+between build-time and runtime environment variables, why a migration job
+must be run against a freshly built image, and how to confirm a scheduled
+job is enabled, not only created.
+
+`scripts/deploy-cloudbuild.sh` submits a build with the current git revision
+stamped into the image, and then runs `scripts/check-deployed-revision.sh`
+to confirm the deployed service reports that same revision.
+
+### Verifying a deployment
+
+Two scripts answer two different questions:
+
+- `scripts/check-deployed-revision.sh` answers "is this service running the
+  code I think it is running." It compares the deployed service's reported
+  build revision against a git revision and exits 0 (current), 1 (a
+  different, known revision is deployed), or 2 (the deployed revision
+  cannot be determined).
+- `scripts/verify-deployed.sh` answers "is this service healthy and
+  reachable." It checks the service's health endpoint and any additional
+  endpoints passed to it, and exits nonzero if any check fails.
+
+Both scripts support `--help` and are safe to run against a service that
+is not a keel service; `check-deployed-revision.sh` will report an unknown
+revision rather than a false match.
+
+### Building the migration job image
+
+A migration job runs the same migration files on every execution, so
+running it against an image that predates a new migration file applies
+nothing new and still reports success. Rebuild the job's image immediately
+before running the job, as one step, rather than assuming a previously
+built image is current.

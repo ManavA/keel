@@ -14,6 +14,11 @@ go get github.com/ManavA/keel
 
 Go 1.25 or later. Docker is needed only by `pg/testdb`.
 
+keel is not a framework. There is no root package, no plugin registry and no
+lifecycle to adopt. You can take `httpx` without `pg`, or `media` without
+`geocode`. Packages meet through interfaces the caller supplies, not through
+imports of each other.
+
 ## Quick start
 
 A service needing Postgres and nothing else:
@@ -90,6 +95,11 @@ Postgres. Run it with `make run-local`.
 | `jobs` | Background work with run outcomes, an in-process scheduler, and `jobs/cloudrun` triggers |
 | `events` | Publish and subscribe in memory, or over Cloud Pub/Sub via `events/pubsub` |
 | `mail` | Transactional email over a log sender or Postmark |
+| `media` | Object storage and image derivatives, local filesystem or Google Cloud Storage |
+| `geocode` | Address to coordinate lookup with a degrade chain, Mapbox or a no-op default |
+| `perf` | Response caching, ETag, gzip, and singleflight middleware for HTTP handlers |
+| `scripts` | Developer and CI scripts |
+| `deploy` | Deployment templates and checks |
 
 ## Configuration
 
@@ -123,6 +133,8 @@ configuration and falls back to an in-process default:
 | `mail` | log sender (`LogSender`) | Postmark |
 | `events` | in-memory bus (`InMemoryBus`) | Cloud Pub/Sub (`events/pubsub`) |
 | `jobs` | in-process scheduler | Cloud Run triggers (`jobs/cloudrun`) |
+| `media` | local filesystem (`LocalStore`) | Google Cloud Storage (`GCSStore`) |
+| `geocode` | `NoopProvider` — reports no result rather than a fabricated one | Mapbox |
 
 ## Testing
 
