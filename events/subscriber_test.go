@@ -150,6 +150,46 @@ func TestInMemoryBus_HandlerErrorDoesNotStopTheLoop(t *testing.T) {
 	}, 2*time.Second, 5*time.Millisecond, "a handler error on one message must not stop later messages from being delivered")
 }
 
+// TestInMemoryBus_PublishReturnsBufferFullErrorOnDrop is the acceptance test
+// for the publisher getting a signal on drop: a publish that drops a delivery
+// for a full subscriber buffer must return a *BufferFullError instead of nil,
+// so tests and health checks can assert delivery intent without scraping logs
+// or counters.
+func TestInMemoryBus_PublishReturnsBufferFullErrorOnDrop(t *testing.T) {
+	bus := NewInMemoryBus(InMemoryBusOptions{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	blocked := make(chan struct{})
+	defer close(blocked)
+	go func() {
+		_ = bus.Subscribe(ctx, "topic", func(context.Context, []byte) error {
+			<-blocked // hold the handler open so the subscriber's buffer fills
+			return nil
+		})
+	}()
+	waitForSubscriber(t, bus, "topic")
+
+	var fullErr *BufferFullError
+	sawFull := false
+	for i := 0; i < 100; i++ {
+		err := bus.Publish(context.Background(), "topic", sampleEvent{Name: "x"})
+		if err == nil {
+			continue
+		}
+		var bf *BufferFullError
+		require.True(t, errors.As(err, &bf), "a publish that drops must fail with *BufferFullError, got %v", err)
+		fullErr = bf
+		sawFull = true
+		break
+	}
+	require.True(t, sawFull, "publishing past a full subscriber buffer must return a buffer-full error, not success")
+	assert.Equal(t, "topic", fullErr.Topic)
+	assert.GreaterOrEqual(t, fullErr.Dropped, 1)
+	assert.Greater(t, bus.DroppedCount(), int64(0))
+}
+
 // TestInMemoryBus_FullBufferDropsAreLoud is the regression test for the
 // publishing past a subscriber whose handler
 // is blocked dropped 83 of 100 messages with no log line and no counter.
@@ -171,9 +211,20 @@ func TestInMemoryBus_FullBufferDropsAreLoud(t *testing.T) {
 	}()
 	waitForSubscriber(t, bus, "topic")
 
+	// Once the buffer fills, publishes drop and report *BufferFullError
+	// rather than resolving success — Publish is the signal, the log and
+	// counter below are the corroboration.
+	sawFull := false
 	for i := 0; i < 100; i++ {
-		require.NoError(t, bus.Publish(context.Background(), "topic", sampleEvent{Name: "x"}))
+		err := bus.Publish(context.Background(), "topic", sampleEvent{Name: "x"})
+		if err == nil {
+			continue
+		}
+		var bf *BufferFullError
+		require.True(t, errors.As(err, &bf), "a publish that drops must fail with *BufferFullError, got %v", err)
+		sawFull = true
 	}
+	require.True(t, sawFull, "publishing past a full subscriber buffer must surface backpressure to the publisher")
 	close(blocked)
 
 	assert.Greater(t, bus.DroppedCount(), int64(0), "publishing past a full subscriber buffer must be counted")
@@ -203,7 +254,12 @@ func TestInMemoryBus_DropLoggingIsRateLimited(t *testing.T) {
 
 	const n = 500
 	for i := 0; i < n; i++ {
-		require.NoError(t, bus.Publish(context.Background(), "topic", sampleEvent{Name: "x"}))
+		err := bus.Publish(context.Background(), "topic", sampleEvent{Name: "x"})
+		if err == nil {
+			continue
+		}
+		var bf *BufferFullError
+		require.True(t, errors.As(err, &bf), "a publish that drops must fail with *BufferFullError, got %v", err)
 	}
 	close(blocked)
 
@@ -255,8 +311,17 @@ func TestInMemoryBus_PublishDoesNotBlockOnASlowLogWrite(t *testing.T) {
 
 	// Fill topic A's buffer, then one more publish to trigger a drop; the
 	// resulting log write blocks on blockingHandler until release closes.
+	// The fill tolerates *BufferFullError: if the handler has not taken its
+	// first message yet, the last fill publish can drop instead of the
+	// one-more publish, and either drop triggers the blocked log write this
+	// test needs.
 	for i := 0; i < 17; i++ {
-		require.NoError(t, bus.Publish(context.Background(), "A", sampleEvent{Name: "x"}))
+		err := bus.Publish(context.Background(), "A", sampleEvent{Name: "x"})
+		if err == nil {
+			continue
+		}
+		var bf *BufferFullError
+		require.True(t, errors.As(err, &bf), "a publish that drops must fail with *BufferFullError, got %v", err)
 	}
 	go func() {
 		_ = bus.Publish(context.Background(), "A", sampleEvent{Name: "one-more"})
