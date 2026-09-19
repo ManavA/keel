@@ -81,6 +81,14 @@ func NewRouter(opts RouterOptions) *chi.Mux {
 
 	r := chi.NewRouter()
 
+	// A default-key limit with RealIP unconfigured shares one bucket across
+	// every client behind a proxy, and the 429s that follow read as abuse.
+	// Name it here, where the stack is assembled, rather than at the first
+	// 429.
+	if warning := middleware.RateLimitSharedBucketWarning(opts.RealIP, opts.RateLimit); warning != "" {
+		logger.Warn(warning)
+	}
+
 	// First, so that everything below — including the response helpers reached
 	// from a handler — logs through this router's logger.
 	r.Use(withLogger(logger))
