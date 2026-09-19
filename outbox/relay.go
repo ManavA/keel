@@ -52,6 +52,11 @@ type Options struct {
 	FailureBackoff    time.Duration
 	MaxFailureBackoff time.Duration
 
+	// MaxAttempts is how many failed publish attempts one row gets before
+	// Relay parks it and stops trying. Zero or negative means no cap: a
+	// poisoned row is retried at the capped backoff interval forever.
+	MaxAttempts int
+
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
 }
@@ -157,9 +162,11 @@ func (r *Relay) Tick(ctx context.Context) (published int, err error) {
 func (r *Relay) fetch(ctx context.Context) ([]row, error) {
 	// A failed row is hidden until next_attempt_at, so it cannot hold a slot
 	// in every batch; once due it is fetched in age order like any other row.
+	// A parked row is never fetched again.
 	rows, err := r.db.Query(ctx,
 		"select id, topic, payload, attempts from "+Table+
-			" where published_at is null and (next_attempt_at is null or next_attempt_at <= now())"+
+			" where published_at is null and parked_at is null"+
+			" and (next_attempt_at is null or next_attempt_at <= now())"+
 			" order by created_at limit $1",
 		r.opts.BatchSize)
 	if err != nil {
@@ -187,12 +194,59 @@ func (r *Relay) markPublished(ctx context.Context, id string) error {
 }
 
 func (r *Relay) recordFailure(ctx context.Context, rw row, publishErr error) error {
+	if r.opts.MaxAttempts > 0 && rw.attempts+1 >= r.opts.MaxAttempts {
+		_, err := r.db.Exec(ctx,
+			"update "+Table+" set attempts = attempts + 1, last_error = $2,"+
+				" parked_at = now(), next_attempt_at = null where id = $1",
+			rw.id, publishErr.Error())
+		if err != nil {
+			return err
+		}
+		r.opts.Logger.WarnContext(ctx, "outbox relay: parking row after max attempts",
+			"id", rw.id, "topic", rw.topic, "attempts", rw.attempts+1)
+		return nil
+	}
+
 	delay := failureBackoff(rw.attempts+1, r.opts.FailureBackoff, r.opts.MaxFailureBackoff)
 	_, err := r.db.Exec(ctx,
 		"update "+Table+" set attempts = attempts + 1, last_error = $2,"+
 			" next_attempt_at = now() + $3 * interval '1 microsecond' where id = $1",
 		rw.id, publishErr.Error(), delay.Microseconds())
 	return err
+}
+
+// RowState is the delivery state of one outbox row: how many times Relay
+// has attempted it, and whether it is parked or published.
+type RowState struct {
+	Attempts  int
+	Parked    bool
+	Published bool
+}
+
+// RowState reports the delivery state of the row with the given id. It is
+// the operator surface for a poisoned row: the attempt count shows how
+// sick the row is, and Parked tells whether Relay has stopped trying.
+func (r *Relay) RowState(ctx context.Context, id string) (RowState, error) {
+	rows, err := r.db.Query(ctx,
+		"select attempts, parked_at is not null, published_at is not null from "+Table+
+			" where id = $1",
+		id)
+	if err != nil {
+		return RowState{}, fmt.Errorf("outbox: read row state: %w", err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return RowState{}, fmt.Errorf("outbox: no row with id %s", id)
+	}
+	var state RowState
+	if err := rows.Scan(&state.Attempts, &state.Parked, &state.Published); err != nil {
+		return RowState{}, fmt.Errorf("outbox: scan row state: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return RowState{}, fmt.Errorf("outbox: read row state: %w", err)
+	}
+	return state, nil
 }
 
 // failureBackoff is base doubled once per failure after the first, capped at

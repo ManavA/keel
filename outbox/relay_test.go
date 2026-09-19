@@ -480,3 +480,78 @@ func TestRelay_FailureBackoffGrowsAndIsCapped(t *testing.T) {
 		require.NoError(t, err)
 	}
 }
+
+// TestRelay_PermanentlyFailingRowParksAndOthersFlow is issue #16: a row that
+// can never publish must park after a configured max attempts instead of
+// being retried forever, and rows behind it must keep flowing. A parked row
+// is never attempted again.
+func TestRelay_PermanentlyFailingRowParksAndOthersFlow(t *testing.T) {
+	pool := openEmptyPool(t)
+	ctx := context.Background()
+
+	poisoned := enqueueOne(t, pool, "poison", []byte("bad"))
+	healthy := enqueueOne(t, pool, "good", []byte("ok"))
+
+	publisher := newFakePublisher()
+	publisher.failAlways(poisoned)
+
+	relay, err := outbox.NewRelay(pool, outbox.Options{
+		Publisher:    publisher,
+		PublishRetry: retry.Options{MaxAttempts: 1, BaseDelay: time.Microsecond},
+		MaxAttempts:  3,
+	})
+	require.NoError(t, err)
+
+	// The healthy row flows on the first tick despite the poisoned one.
+	published, err := relay.Tick(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, published)
+	assertPublished(t, pool, healthy)
+	assertUnpublished(t, pool, poisoned)
+
+	// Tick until the poisoned row parks. The loop is bounded, so a
+	// regression that never parks fails here instead of hanging.
+	parked := false
+	for i := 0; i < 10 && !parked; i++ {
+		// Stand in for the backoff passing, without waiting for it.
+		_, err = pool.Exec(ctx,
+			"update outbox_events set next_attempt_at = now() where id = $1", poisoned)
+		require.NoError(t, err)
+
+		_, err = relay.Tick(ctx)
+		require.NoError(t, err)
+
+		state, err := relay.RowState(ctx, poisoned)
+		require.NoError(t, err)
+		parked = state.Parked
+	}
+	require.True(t, parked, "a permanently failing row must park after MaxAttempts")
+
+	state, err := relay.RowState(ctx, poisoned)
+	require.NoError(t, err)
+	assert.Equal(t, 3, state.Attempts)
+	assert.False(t, state.Published)
+
+	callsFor := func(id string) int {
+		n := 0
+		for _, c := range publisher.calls() {
+			if c.env.ID == id {
+				n++
+			}
+		}
+		return n
+	}
+
+	// A parked row is never attempted again.
+	before := callsFor(poisoned)
+	_, err = relay.Tick(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, before, callsFor(poisoned), "a parked row must not be published again")
+
+	// A row enqueued behind the parked row still flows.
+	late := enqueueOne(t, pool, "late", []byte("ok"))
+	published, err = relay.Tick(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, published)
+	assertPublished(t, pool, late)
+}

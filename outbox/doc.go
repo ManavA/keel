@@ -27,8 +27,13 @@
 // in every batch, and the rows behind it are fetched instead. Once a failed
 // row is due again it is fetched in creation order, ahead of anything
 // newer, so a transient failure does not push a row behind later arrivals.
-// There is no attempts cap and no dead-letter table: a poisoned row is
-// retried at the capped interval until someone deletes or fixes it.
+// A row that fails Options.MaxAttempts times is parked instead of retried
+// forever: Relay stamps parked_at and never fetches it again, so a poisoned
+// row (bad payload, permanently rejected by the broker) stops consuming
+// relay attention after a bounded number of attempts. [Relay.RowState]
+// reports each row's attempt count and whether it is parked. With MaxAttempts
+// unset a poisoned row is retried at the capped interval until someone
+// deletes or fixes it.
 //
 // # What is out of scope
 //
