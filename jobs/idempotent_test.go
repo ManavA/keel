@@ -3,7 +3,10 @@ package jobs
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -188,4 +191,39 @@ func TestMemoryGuard_DoneDefaultsFalse(t *testing.T) {
 	done, err := g.Done(context.Background(), "never-seen")
 	require.NoError(t, err)
 	assert.False(t, done)
+}
+
+// TestIdempotent_TwoSeparateGuardsBothRunSameKey pins the single-process
+// scope of Guard: two guards that share no store — two replicas — each find
+// the same key not done and each run fn. The slow fn keeps the two runs
+// overlapped the way two replicas on one schedule would be. Until a shared
+// store exists this duplication is the behavior, not a test race.
+func TestIdempotent_TwoSeparateGuardsBothRunSameKey(t *testing.T) {
+	g1 := NewMemoryGuard()
+	g2 := NewMemoryGuard()
+	var calls atomic.Int32
+	fn := func(ctx context.Context) error {
+		time.Sleep(50 * time.Millisecond)
+		calls.Add(1)
+		return nil
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i, g := range []*MemoryGuard{g1, g2} {
+		wg.Add(1)
+		go func(i int, g *MemoryGuard) {
+			defer wg.Done()
+			<-start
+			errs[i] = Idempotent(context.Background(), g, "job-a", "order-1", fn)
+		}(i, g)
+	}
+	close(start)
+	wg.Wait()
+
+	require.NoError(t, errs[0])
+	require.NoError(t, errs[1])
+	assert.Equal(t, int32(2), calls.Load(),
+		"two guards over separate stores each run fn for the same key; there is no shared lock")
 }
