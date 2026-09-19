@@ -170,6 +170,64 @@ func TestPostmarkSender_Send_RetriesA5xxWithAParseableBody(t *testing.T) {
 		"a 5xx must be retried even though its body parses")
 }
 
+// A non-2xx whose body parses as JSON but carries no Postmark ErrorCode
+// must still be a send failure: unmarshalling leaves the zero value,
+// ErrorCode reads 0, and without a status check Send would report success
+// for a message that was never accepted.
+func TestPostmarkSender_Send_Non2xxJsonWithoutErrorCodeIsAnError(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"slow down"}`))
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, PostmarkSenderOptions{ServerToken: testServerToken, FromEmail: testFromEmail}, srv.URL)
+
+	err := s.Send(context.Background(), "buyer@example.com", "welcome", nil)
+	require.Error(t, err, "a 429 with no Postmark ErrorCode must be a failed send, not success")
+}
+
+// The issue's acceptance check: a 502 carrying an HTML outage page is a
+// send failure, not success.
+func TestPostmarkSender_Send_502WithHTMLBodyIsAnError(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`<html><body>Bad Gateway</body></html>`))
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, PostmarkSenderOptions{ServerToken: testServerToken, FromEmail: testFromEmail}, srv.URL)
+
+	err := s.Send(context.Background(), "buyer@example.com", "welcome", nil)
+	require.Error(t, err, "a 502 with an HTML body must be a failed send, not success")
+}
+
+// A genuine Postmark API error arrives as a non-2xx (422) with a nonzero
+// ErrorCode in the body. The status must not turn it into a retried
+// transport failure: it is classified once, like its 200 counterpart.
+func TestPostmarkSender_Send_Non2xxWithErrorCodeIsClassifiedOnce(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_ = json.NewEncoder(w).Encode(postmark.EmailResponse{ErrorCode: 1101, Message: "template not found"})
+	}))
+	defer srv.Close()
+
+	s := newTestSender(t, PostmarkSenderOptions{ServerToken: testServerToken, FromEmail: testFromEmail}, srv.URL)
+
+	err := s.Send(context.Background(), "buyer@example.com", "missing-template", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "1101")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&calls),
+		"a parsed ErrorCode is a permanent API error, sent exactly once, not retried")
+}
+
 // Send's context reaches the retry loop: a canceled one stops before any
 // request is made.
 func TestPostmarkSender_Send_CanceledContextSendsNothing(t *testing.T) {
