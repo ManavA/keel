@@ -72,7 +72,7 @@
 // total as the real one past that point. [Config.MaxTotalHits] raises this
 // cap. Facet values are truncated alphabetically past
 // [Config.MaxValuesPerFacet]'s default of 100.
-
+//
 // # Cutover from PostgresIndex
 //
 // [search.PostgresIndex] is the right default while the table is small and

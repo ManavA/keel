@@ -49,7 +49,7 @@ func cutoverLiveSettings() *meilisearch.Settings {
 // the guide, not slip through silently.
 func TestCutover_SetupIndexAppliesSettingsInDocumentedOrder(t *testing.T) {
 	var order []string
-	record := func(name string) (*meilisearch.TaskInfo, error) {
+	record := func(name string) (*meilisearch.TaskInfo, error) { //nolint:unparam // signature dictated by the fakeIndex field type; the error is always nil
 		order = append(order, name)
 		return &meilisearch.TaskInfo{}, nil
 	}
