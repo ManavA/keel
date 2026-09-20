@@ -81,7 +81,8 @@ type dropWindow struct {
 // channel is a fixed-size buffer, and a message published while that buffer
 // is full is dropped for that subscriber rather than blocking Publish or
 // queuing without bound. A drop is never silent — it is logged, at Warn,
-// and counted (see [InMemoryBus.DroppedCount]) — but it is also never
+// counted (see [InMemoryBus.DroppedCount]), and reported to the publisher as
+// a [*BufferFullError] return from Publish — but it is also never
 // retried; there is no broker underneath to ask again. A handler that
 // assumes at-least-once delivery (built and tested against events/pubsub,
 // say) will silently lose messages under load if the same code is later
@@ -97,6 +98,20 @@ type InMemoryBus struct {
 	dropLog   map[string]*dropWindow
 }
 
+// BufferFullError is what [InMemoryBus.Publish] returns when a message was
+// dropped for at least one subscriber whose buffer was full. Dropped counts
+// the subscriber deliveries lost by that Publish call; Topic names the topic
+// it was published to. A caller that only needs to detect backpressure checks
+// for it with errors.As, without inspecting either field.
+type BufferFullError struct {
+	Topic   string
+	Dropped int
+}
+
+func (e *BufferFullError) Error() string {
+	return fmt.Sprintf("events: subscriber buffer full on topic %q (%d dropped)", e.Topic, e.Dropped)
+}
+
 // NewInMemoryBus builds an empty InMemoryBus.
 func NewInMemoryBus(opts InMemoryBusOptions) *InMemoryBus {
 	return &InMemoryBus{opts: opts, subs: make(map[string][]chan []byte)}
@@ -110,8 +125,10 @@ func (b *InMemoryBus) DroppedCount() int64 {
 }
 
 // Publish marshals event with [Marshal] and delivers it to every subscriber
-// currently registered on topic. See the type doc for what happens when a
-// subscriber's buffer is full.
+// currently registered on topic. A message published while a subscriber's
+// buffer is full is dropped for that subscriber — see the type doc — and
+// Publish then returns a [*BufferFullError] instead of nil, so the caller can
+// tell accepted from dropped without scraping logs or counters.
 func (b *InMemoryBus) Publish(_ context.Context, topic string, event any) error {
 	data, err := Marshal(event)
 	if err != nil {
@@ -137,6 +154,7 @@ func (b *InMemoryBus) Publish(_ context.Context, topic string, event any) error 
 
 	if dropped > 0 {
 		b.recordDrop(topic, dropped)
+		return &BufferFullError{Topic: topic, Dropped: dropped}
 	}
 	return nil
 }

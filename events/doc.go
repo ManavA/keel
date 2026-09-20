@@ -30,7 +30,8 @@
 // switch between InMemoryBus and events/pubsub without changing its own
 // calling code — but the two are not interchangeable in what they
 // guarantee about delivery. InMemoryBus is at-most-once and can drop a
-// message under load (loudly: logged and counted, never silently);
+// message under load (loudly: logged, counted, and reported to the publisher
+// as a [*BufferFullError], never silently);
 // events/pubsub is at-least-once and can redeliver a message, possibly out
 // of order. See [Subscriber] and [InMemoryBus] for the detail a Handler
 // needs to account for.
