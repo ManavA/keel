@@ -2,7 +2,8 @@
 {{template "flash" .}}
 <div>
 <label for="note-title">Title</label>
-<input id="note-title" name="title" type="text" required autocomplete="off" value="{{.Title}}">
+<input id="note-title" name="title" type="text" required autocomplete="off" value="{{.Title}}"{{if .TitleError}} aria-invalid="true" aria-describedby="note-title-error"{{end}}>
+{{if .TitleError}}<p class="field-error" id="note-title-error" role="alert">{{.TitleError}}</p>{{end}}
 </div>
 <div>
 <label for="note-body">Body</label>

@@ -39,10 +39,11 @@ func TestTemplatesParseAndExecuteEveryBlock(t *testing.T) {
 
 	note := sampleNote()
 	page := notesPageData{
-		Notes: []Note{note},
-		Flash: "A title is required.",
-		Title: "kept <input>",
-		Body:  "kept <textarea>",
+		Notes:      []Note{note},
+		Flash:      "A title is required.",
+		TitleError: "A title is required.",
+		Title:      "kept <input>",
+		Body:       "kept <textarea>",
 	}
 
 	for name, dot := range map[string]any{
@@ -52,6 +53,7 @@ func TestTemplatesParseAndExecuteEveryBlock(t *testing.T) {
 		"note_list":   page,
 		"flash":       page,
 		"empty_state": page,
+		"pagination":  page,
 	} {
 		var buf bytes.Buffer
 		require.NoError(t, tmpl.ExecuteTemplate(&buf, name, dot), "block %q failed to execute", name)
@@ -59,6 +61,11 @@ func TestTemplatesParseAndExecuteEveryBlock(t *testing.T) {
 		assert.NotContains(t, out, "<script>alert(1)", "block %q rendered markup unescaped", name)
 		assert.NotContains(t, out, "<b>south</b>", "block %q rendered markup unescaped", name)
 	}
+
+	var formBuf bytes.Buffer
+	require.NoError(t, tmpl.ExecuteTemplate(&formBuf, "note_form", page))
+	assert.Contains(t, formBuf.String(), "field-error", "a validation error must mark the field, not only flash")
+	assert.Contains(t, formBuf.String(), `aria-invalid="true"`, "the invalid field must say so to assistive tech")
 
 	var pageBuf bytes.Buffer
 	require.NoError(t, tmpl.ExecuteTemplate(&pageBuf, "notes", page))
@@ -224,6 +231,7 @@ func TestFormCreateRejectsAnEmptyTitleWith422AndFlash(t *testing.T) {
 	resp, raw := postForm(t, ts, token, values, true)
 	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode, string(raw))
 	assert.Contains(t, string(raw), "A title is required.", "a validation error must flash")
+	assert.Contains(t, string(raw), "field-error", "a validation error must mark the field, not only flash")
 	assert.Contains(t, string(raw), "the body survives", "a validation error must keep what was typed")
 
 	// Without htmx the answer is the whole page at the same status, so a plain
@@ -232,6 +240,24 @@ func TestFormCreateRejectsAnEmptyTitleWith422AndFlash(t *testing.T) {
 	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode, string(raw))
 	assert.Contains(t, string(raw), "<html", "a plain submit gets the page, not a fragment")
 	assert.Contains(t, string(raw), "A title is required.")
+}
+
+// TestPaginationBlockNamesItsBranches renders the pagination block with and
+// without a next page, so a truncated list says so instead of ending quietly.
+func TestPaginationBlockNamesItsBranches(t *testing.T) {
+	tmpl, err := ParseTemplates()
+	require.NoError(t, err)
+
+	var full bytes.Buffer
+	require.NoError(t, tmpl.ExecuteTemplate(&full, "pagination",
+		notesPageData{Notes: []Note{sampleNote()}}))
+	assert.Contains(t, full.String(), "Showing 1 note.", "the block names its count")
+
+	var more bytes.Buffer
+	require.NoError(t, tmpl.ExecuteTemplate(&more, "pagination",
+		notesPageData{Notes: []Note{sampleNote()}, HasMore: true}))
+	assert.Contains(t, more.String(), "Showing 1 note.", "the truncated list still names its count")
+	assert.Contains(t, more.String(), "Older notes are beyond this page.")
 }
 
 func TestNoteMarkupIsEscapedInTheUI(t *testing.T) {

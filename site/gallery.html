@@ -49,12 +49,12 @@ it is not running.</p>
 </section>
 <section id="note_form">
 <h2><code>note_form</code></h2>
-<p>The create form. It posts through hx-post and prepends the new card to the list. Rendered empty, as the notes page serves it on first load.</p>
+<p>The create form. It posts through hx-post and prepends the new card to the list. Rendered with a title error, as the notes page serves it after a 422 — flash above, the field marked below.</p>
 <h3>landing theme</h3>
-<iframe title="note_form block in the landing theme" src="gallery/note_form-landing.html" style="height:440px" loading="lazy"></iframe>
+<iframe title="note_form block in the landing theme" src="gallery/note_form-landing.html" style="height:500px" loading="lazy"></iframe>
 <p class="open"><a href="gallery/note_form-landing.html">Open standalone</a></p>
 <h3>dashboard theme</h3>
-<iframe title="note_form block in the dashboard theme" src="gallery/note_form-dashboard.html" style="height:440px" loading="lazy"></iframe>
+<iframe title="note_form block in the dashboard theme" src="gallery/note_form-dashboard.html" style="height:500px" loading="lazy"></iframe>
 <p class="open"><a href="gallery/note_form-dashboard.html">Open standalone</a></p>
 </section>
 <section id="note_list">
@@ -66,6 +66,16 @@ it is not running.</p>
 <h3>dashboard theme</h3>
 <iframe title="note_list block in the dashboard theme" src="gallery/note_list-dashboard.html" style="height:560px" loading="lazy"></iframe>
 <p class="open"><a href="gallery/note_list-dashboard.html">Open standalone</a></p>
+</section>
+<section id="pagination">
+<h2><code>pagination</code></h2>
+<p>The page status under the list. It names the count and says whether older notes lie beyond it. Rendered with two notes and a next page waiting.</p>
+<h3>landing theme</h3>
+<iframe title="pagination block in the landing theme" src="gallery/pagination-landing.html" style="height:100px" loading="lazy"></iframe>
+<p class="open"><a href="gallery/pagination-landing.html">Open standalone</a></p>
+<h3>dashboard theme</h3>
+<iframe title="pagination block in the dashboard theme" src="gallery/pagination-dashboard.html" style="height:100px" loading="lazy"></iframe>
+<p class="open"><a href="gallery/pagination-dashboard.html">Open standalone</a></p>
 </section>
 <p><a href="tutorial.html">Build this UI yourself in the tutorial →</a></p>
 </main>
