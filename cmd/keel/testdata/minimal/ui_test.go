@@ -75,10 +75,12 @@ func TestTemplatesParseAndExecuteEveryBlock(t *testing.T) {
 
 // postForm sends a form-encoded request, never following redirects: a 303 back
 // to the list is an assertion about the response, not a page to fetch.
-func postForm(t *testing.T, ts *testService, path, token string, values url.Values, hx bool) (*http.Response, []byte) {
+// postForm always targets the notes form: every UI write in these tests
+// goes through /notes, so the path is fixed rather than a parameter.
+func postForm(t *testing.T, ts *testService, token string, values url.Values, hx bool) (*http.Response, []byte) {
 	t.Helper()
 	req, err := http.NewRequestWithContext(context.Background(),
-		http.MethodPost, ts.srv.URL+path, strings.NewReader(values.Encode()))
+		http.MethodPost, ts.srv.URL+"/notes", strings.NewReader(values.Encode()))
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	if token != "" {
@@ -100,9 +102,10 @@ func postForm(t *testing.T, ts *testService, path, token string, values url.Valu
 
 // getHX is get with an HX-Request header, which is what asks a UI route for
 // its fragment instead of its page.
-func getHX(t *testing.T, ts *testService, path, token string) (*http.Response, []byte) {
+// getHX always reads the notes fragment: the only HX-Request surface under test.
+func getHX(t *testing.T, ts *testService, token string) (*http.Response, []byte) {
 	t.Helper()
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.srv.URL+path, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, ts.srv.URL+"/notes", nil)
 	require.NoError(t, err)
 	req.Header.Set("HX-Request", "true")
 	if token != "" {
@@ -143,7 +146,7 @@ func TestNotesPageRequiresAuth(t *testing.T) {
 	resp, _ := get(t, ts, "/notes", "")
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 
-	resp, _ = getHX(t, ts, "/notes", "")
+	resp, _ = getHX(t, ts, "")
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
 
@@ -167,7 +170,7 @@ func TestNotesFragmentOmitsThePage(t *testing.T) {
 	ts := newTestServer(t)
 	token := signup(t, ts, "fragment@example.com").Token
 
-	resp, raw := getHX(t, ts, "/notes", token)
+	resp, raw := getHX(t, ts, token)
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
 	assert.Contains(t, resp.Header.Get("Content-Type"), "text/html")
 	assert.Contains(t, string(raw), `id="notes-list"`, "the fragment is the list block on its own")
@@ -180,7 +183,7 @@ func TestFormCreateRendersACardAndAgreesWithJSON(t *testing.T) {
 	token := signup(t, ts, "author@example.com").Token
 
 	values := url.Values{"title": {"Garden fence"}, "body": {"Replace two panels"}}
-	resp, raw := postForm(t, ts, "/notes", token, values, true)
+	resp, raw := postForm(t, ts, token, values, true)
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(raw))
 	assert.Contains(t, resp.Header.Get("Content-Type"), "text/html")
 	assert.Contains(t, string(raw), "note-card", "an htmx create answers with the new card")
@@ -202,7 +205,7 @@ func TestFormCreateWithoutHtmxRedirectsToTheList(t *testing.T) {
 	token := signup(t, ts, "plain@example.com").Token
 
 	values := url.Values{"title": {"Plain submit"}, "body": {"no javascript"}}
-	resp, _ := postForm(t, ts, "/notes", token, values, false)
+	resp, _ := postForm(t, ts, token, values, false)
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
 	assert.Equal(t, "/notes", resp.Header.Get("Location"))
 
@@ -218,14 +221,14 @@ func TestFormCreateRejectsAnEmptyTitleWith422AndFlash(t *testing.T) {
 	// Over htmx the answer is the form block again, carrying the flash and the
 	// body the caller already typed.
 	values := url.Values{"title": {"   "}, "body": {"the body survives"}}
-	resp, raw := postForm(t, ts, "/notes", token, values, true)
+	resp, raw := postForm(t, ts, token, values, true)
 	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode, string(raw))
 	assert.Contains(t, string(raw), "A title is required.", "a validation error must flash")
 	assert.Contains(t, string(raw), "the body survives", "a validation error must keep what was typed")
 
 	// Without htmx the answer is the whole page at the same status, so a plain
 	// submit still explains itself.
-	resp, raw = postForm(t, ts, "/notes", token, values, false)
+	resp, raw = postForm(t, ts, token, values, false)
 	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode, string(raw))
 	assert.Contains(t, string(raw), "<html", "a plain submit gets the page, not a fragment")
 	assert.Contains(t, string(raw), "A title is required.")
@@ -240,7 +243,7 @@ func TestNoteMarkupIsEscapedInTheUI(t *testing.T) {
 
 	for _, fetch := range []func() (*http.Response, []byte){
 		func() (*http.Response, []byte) { return get(t, ts, "/notes", token) },
-		func() (*http.Response, []byte) { return getHX(t, ts, "/notes", token) },
+		func() (*http.Response, []byte) { return getHX(t, ts, token) },
 	} {
 		resp, raw := fetch()
 		require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -256,7 +259,7 @@ func TestNotesUIIsScopedToOwner(t *testing.T) {
 	tokenB := signup(t, ts, "bob-ui@example.com").Token
 
 	values := url.Values{"title": {"Alice roof"}, "body": {"Slate tiles"}}
-	resp, raw := postForm(t, ts, "/notes", tokenA, values, true)
+	resp, raw := postForm(t, ts, tokenA, values, true)
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(raw))
 	id := cardID(t, string(raw))
 
@@ -265,7 +268,7 @@ func TestNotesUIIsScopedToOwner(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.NotContains(t, string(raw), "Alice roof")
 
-	resp, raw = getHX(t, ts, "/notes", tokenB)
+	resp, raw = getHX(t, ts, tokenB)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.NotContains(t, string(raw), "Alice roof")
 	assert.Contains(t, string(raw), "No notes yet")
@@ -276,18 +279,18 @@ func TestNotesUIIsScopedToOwner(t *testing.T) {
 	// The owner's copy survived all of that, and their own delete works: over
 	// htmx the card answers 200 with nothing to swap in, without it a redirect
 	// back to the list.
-	resp, raw = getHX(t, ts, "/notes", tokenA)
+	resp, raw = getHX(t, ts, tokenA)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Contains(t, string(raw), "Alice roof")
 
 	assert.Equal(t, http.StatusOK, deleteNote(t, ts, "/notes/"+id, tokenA, true).StatusCode)
 
-	resp, raw = getHX(t, ts, "/notes", tokenA)
+	resp, raw = getHX(t, ts, tokenA)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.NotContains(t, string(raw), "Alice roof")
 
 	values = url.Values{"title": {"Second"}, "body": {""}}
-	resp, raw = postForm(t, ts, "/notes", tokenA, values, true)
+	resp, raw = postForm(t, ts, tokenA, values, true)
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(raw))
 	second := cardID(t, string(raw))
 	resp2 := deleteNote(t, ts, "/notes/"+second, tokenA, false)
