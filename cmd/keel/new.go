@@ -53,7 +53,7 @@ var profiles = []profile{
 			"admin", "app", "auth", "config", "events", "httpx", "idempotency", "jobs", "log", "outbox", "pg",
 		},
 		migrations: []string{
-			"auth: 0001_auth_users through 0005_auth_login_attempts",
+			"auth: 0001_auth_users through 0006_auth_session_windows",
 			"admin: 0001_admin_users, 0002_admin_audit",
 			"outbox: 001_outbox_events, 002_outbox_events_parked",
 			"idempotency: 001_idempotency_keys",
