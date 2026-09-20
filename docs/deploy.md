@@ -166,6 +166,32 @@ is what the database sees.
 `MaxConnLifetime` (an hour by default) is what lets a failover, a credential
 rotation or a resized instance take effect without a restart.
 
+On Cloud Run the multipliers are the service's maximum instances and its
+concurrency. Every instance holds its own pool of up to `MaxConns`
+connections, so at peak the database sees up to `MaxConns × max instances`
+connections, and each instance's concurrent requests share its pool: with
+concurrency above `MaxConns`, requests queue for a connection instead of
+running. The bound to size against is therefore
+
+```
+MaxConns <= (database connection limit - headroom) / max instances
+```
+
+where headroom is every connection outside the service: the migration job,
+ad-hoc sessions, and whatever else reaches the database. Keep `MinConns` at
+zero on Cloud Run: an instance scaled to zero holds no connections, and idle
+ones on a live instance only narrow the headroom above.
+
+When the sizing is wrong the symptom is slow queries, not pool errors, which
+is why the pool exposes `pg.Stat`. Poll it on a scrape interval and export
+`Acquired`, `Idle` and `Total` as gauges; the mean acquire wait is
+`TotalAcquireWait / Acquires`. Two counters say which side is wrong:
+`EmptyAcquires` rising steadily means acquirers routinely wait for a free
+connection — the pool is saturated, so raise `MaxConns` (within the bound
+above) or lower the request concurrency. `CanceledAcquires` rising means
+acquirers are giving up waiting, their contexts expiring before a connection
+frees — the failure the pool previously reported only as slow queries.
+
 Settings in the connection string are honoured, and the fields in `pg.Options`
 override them where set, so a deployment can tune `pool_max_conns`,
 `pool_max_conn_lifetime`, `pool_max_conn_idle_time` and `connect_timeout`
