@@ -1,5 +1,6 @@
 // Package pg is the Postgres plumbing a service needs before its first query: a
-// configured pgx pool, a transaction helper, and paging that does not silently
+// configured pgx pool, pool stats for sizing and watching it, a transaction
+// helper, and paging that does not silently
 // ignore the caller.
 //
 // It stops at the pool, transactions, and paging. Queries and repositories
