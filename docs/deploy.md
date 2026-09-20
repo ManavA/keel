@@ -61,7 +61,9 @@ every prober and load balancer polls on its own schedule and all of it would
 otherwise reach the database. A failure is cached too, including a timeout: a
 dependency that cannot answer inside the endpoint's budget is not ready by that
 endpoint's definition. The one result not cached is a check that failed because
-the *prober* hung up, which says nothing about the dependency.
+the *prober* hung up, which says nothing about the dependency. When the cache
+has expired, concurrent probes share a single in-flight check run instead of
+each running every check, waiting on it up to the endpoint's timeout.
 
 Leave `ExposeCheckErrors` off unless the endpoint is genuinely unreachable from
 outside. A driver error names your host, your database, and sometimes your

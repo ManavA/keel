@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -273,6 +274,82 @@ func TestReadinessDoesNotCacheACancelledCheck(t *testing.T) {
 	assert.Equal(t, int32(2), calls.Load())
 }
 
+func TestReadinessConcurrentProbesShareOneRun(t *testing.T) {
+	// When the cache is empty, N concurrent probes must not each run every
+	// check before one result is cached: one probe runs them and the rest wait
+	// on its result.
+	var runs atomic.Int32
+	h := httpx.Health(httpx.HealthOptions{
+		Logger:   log.New(log.Options{Output: io.Discard}),
+		CacheTTL: time.Hour,
+		Checks: map[string]httpx.Check{
+			"database": func(context.Context) error {
+				runs.Add(1)
+				time.Sleep(100 * time.Millisecond)
+				return nil
+			},
+		},
+	})
+
+	const probes = 20
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	recs := make([]*httptest.ResponseRecorder, probes)
+	for i := range probes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			recs[i] = rec
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, int32(1), runs.Load(), "concurrent probes each ran the checks")
+	for _, rec := range recs {
+		require.NotNil(t, rec)
+		assert.Equal(t, http.StatusOK, rec.Code,
+			"a probe waiting on the shared run must get its result")
+	}
+}
+
+func TestReadinessFollowerWaitIsBounded(t *testing.T) {
+	// A check that ignores its context must not wedge every concurrent probe:
+	// a follower waits on the in-flight run only up to Timeout, then fails
+	// closed.
+	release := make(chan struct{})
+	h := httpx.Health(httpx.HealthOptions{
+		Logger:   log.New(log.Options{Output: io.Discard}),
+		Timeout:  50 * time.Millisecond,
+		CacheTTL: time.Hour,
+		Checks: map[string]httpx.Check{
+			"hung": func(context.Context) error {
+				<-release
+				return nil
+			},
+		},
+	})
+	t.Cleanup(func() { close(release) })
+
+	leader := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		leader <- rec
+	}()
+	// Let the leader start the run before the follower arrives.
+	time.Sleep(20 * time.Millisecond)
+
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	assert.Less(t, time.Since(start), 5*time.Second, "follower waited past any bound")
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code,
+		"a probe that cannot get an answer inside the budget is not ready")
+}
 func TestReadinessCachesARealTimeout(t *testing.T) {
 	// A deadline is evidence about the dependency, unlike a cancellation, so it
 	// is cached like any other failure.
