@@ -46,7 +46,7 @@ func TestSessionIssuerTokenCarriesAbsoluteLifetime(t *testing.T) {
 	require.NoError(t, err)
 	exp, err := claims.GetExpirationTime()
 	require.NoError(t, err)
-	assert.Equal(t, ttl, exp.Time.Sub(iat.Time), "exp must be exactly iat plus ttl: the absolute lifetime")
+	assert.Equal(t, ttl, exp.Sub(iat.Time), "exp must be exactly iat plus ttl: the absolute lifetime")
 }
 
 func TestSessionIssuerZeroTTLUsesDefault(t *testing.T) {
