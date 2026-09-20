@@ -8,7 +8,7 @@ while writing; the output shown is real output with tokens and ids shortened
 (yours will differ).
 
 What you build: the `minimal` profile, a Postgres-backed notes API with
-local auth, search, a background job and a browser UI. It needs Postgres
+local auth, search and a background job. It needs Postgres
 and nothing else: search is a Postgres index, mail goes to the log in
 development, events are in-process.
 
@@ -93,7 +93,7 @@ $ cd /tmp/mynotes
 $ go mod edit -replace github.com/ManavA/keel=$PWD/../keel
 $ go mod tidy
 $ ls
-auth.go  config.go  go.mod  handlers.go  main.go  main_test.go  migrations  notes.go  README.md
+auth.go  config.go  go.mod  go.sum  handlers.go  main.go  main_test.go  migrations  notes.go  README.md
 ```
 
 `go.mod` names `module mynotes`, Go 1.26.0, and requires keel v0.1.0 with
@@ -281,7 +281,7 @@ keeps its main package at the project root, so `CMD_PATH` is `.`:
 docker build \
   --build-arg CMD_PATH=. \
   --build-arg GIT_REVISION=$(git rev-parse HEAD) \
-  --build-arg BUILDINFO_PACKAGE=mynotes \
+  --build-arg BUILDINFO_PACKAGE=github.com/ManavA/keel/httpx/buildinfo \
   -f /path/to/keel/deploy/Dockerfile -t mynotes .
 ```
 
@@ -302,7 +302,7 @@ the service URL:
 scripts/deploy-cloudbuild.sh deploy/cloudbuild.yaml --project PROJECT \
   --substitution _SERVICE_NAME=mynotes \
   --substitution _CMD_PATH=. \
-  --substitution _BUILDINFO_PACKAGE=mynotes \
+  --substitution _BUILDINFO_PACKAGE=github.com/ManavA/keel/httpx/buildinfo \
   --service-url https://mynotes-xxxx-uc.a.run.app
 ```
 
