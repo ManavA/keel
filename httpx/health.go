@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ManavA/keel/httpx/buildinfo"
+	"github.com/ManavA/keel/perf"
 )
 
 // A Check reports whether one dependency is usable right now, returning nil
@@ -122,6 +123,17 @@ type healthHandler struct {
 	cached   healthResponse
 	cachedOK bool
 	cachedAt time.Time
+
+	// flight collapses concurrent check runs into one: when the cache has
+	// expired, N probes arriving together would otherwise each run every
+	// check before one result is cached.
+	flight perf.SingleFlight
+}
+
+// readinessResult is the shared outcome of one check run.
+type readinessResult struct {
+	resp healthResponse
+	ok   bool
 }
 
 func (h *healthHandler) live(w http.ResponseWriter, _ *http.Request) {
@@ -149,15 +161,28 @@ func (h *healthHandler) evaluate(ctx context.Context) (healthResponse, bool) {
 	}
 	h.mu.Unlock()
 
-	resp, ok, cacheable := h.run(ctx)
-	if !cacheable {
-		return resp, ok
+	// One probe runs the checks and the rest wait on its result. The wait is
+	// detached from any one request and bounded by Timeout, like the run
+	// itself: a prober hanging up must neither cancel the shared run nor wait
+	// on it forever. A wait that outlasts Timeout is a hung check, and a
+	// probe that cannot get an answer inside the budget this endpoint set
+	// fails closed.
+	waitCtx, cancel := context.WithTimeout(context.Background(), h.timeout)
+	defer cancel()
+	v, _, err := h.flight.Do(waitCtx, "readyz", func(context.Context) (any, error) {
+		resp, ok, cacheable := h.run(ctx)
+		if cacheable {
+			h.mu.Lock()
+			h.cached, h.cachedOK, h.cachedAt = resp, ok, time.Now()
+			h.mu.Unlock()
+		}
+		return readinessResult{resp: resp, ok: ok}, nil
+	})
+	if err != nil {
+		return healthResponse{Status: "degraded", Build: buildinfo.Get()}, false
 	}
-
-	h.mu.Lock()
-	h.cached, h.cachedOK, h.cachedAt = resp, ok, time.Now()
-	h.mu.Unlock()
-	return resp, ok
+	r := v.(readinessResult)
+	return r.resp, r.ok
 }
 
 // run executes the checks. The result is cacheable unless a check failed
