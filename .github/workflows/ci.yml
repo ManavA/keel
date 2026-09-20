@@ -24,6 +24,12 @@ jobs:
       - name: Test
         run: go test -race -count=1 ./...
 
+      # The seed corpus runs inside `go test ./...` above; this runs the
+      # fuzzer itself for a fixed short budget, so every push explores beyond
+      # the seeds without making CI wait on open-ended fuzzing.
+      - name: Fuzz Normalize (short budget)
+        run: go test -run=NONE -fuzz='^FuzzNormalize$' -fuzztime=30s ./textpolicy/
+
       # The same suite again with a missing Docker turned into a failure. A
       # database-backed test that skips itself is indistinguishable from one
       # that passes, and the runner has Docker, so there is nothing to skip.
