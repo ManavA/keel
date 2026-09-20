@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ManavA/keel/outbox"
+	keelpg "github.com/ManavA/keel/pg"
 	"github.com/ManavA/keel/retry"
 )
 
@@ -554,4 +555,109 @@ func TestRelay_PermanentlyFailingRowParksAndOthersFlow(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, published)
 	assertPublished(t, pool, late)
+}
+
+// enqueueOneWithPartition is enqueueOne for a row carrying a partition key.
+// Rows sharing a key belong to one aggregate whose delivery order matters;
+// see Options.OrderedPartitions.
+// The partition is fixed: every ordering test in this file shares one
+// aggregate, so a parameter would only ever carry "order-1".
+func enqueueOneWithPartition(t *testing.T, pool *pgxpool.Pool, payload []byte) string {
+	t.Helper()
+	ctx := context.Background()
+
+	require.NoError(t, keelpg.InTx(ctx, pool, func(tx pgx.Tx) error {
+		return outbox.Enqueue(ctx, tx, outbox.Event{Topic: "orders.events", Payload: payload, PartitionKey: "order-1"})
+	}))
+
+	var id string
+	require.NoError(t, pool.QueryRow(ctx,
+		"select id from outbox_events where topic = $1 order by created_at desc limit 1", "orders.events",
+	).Scan(&id))
+	return id
+}
+
+// TestRelay_OrderedPartitionsHoldLaterRowUntilHeadSucceeds is issue #36: in
+// ordered mode two rows for one aggregate publish in creation order. The
+// head row fails once, and the later row must not publish until the head
+// has actually succeeded — not on the tick the head fails, and not on the
+// tick the head succeeds either, because the later row was already held
+// out of that tick's batch.
+func TestRelay_OrderedPartitionsHoldLaterRowUntilHeadSucceeds(t *testing.T) {
+	pool := openEmptyPool(t)
+	ctx := context.Background()
+
+	head := enqueueOneWithPartition(t, pool, []byte(`{"seq":1}`))
+	tail := enqueueOneWithPartition(t, pool, []byte(`{"seq":2}`))
+
+	publisher := newFakePublisher()
+	publisher.failOnce(head)
+
+	relay, err := outbox.NewRelay(pool, outbox.Options{
+		Publisher:         publisher,
+		PublishRetry:      retry.Options{MaxAttempts: 1, BaseDelay: time.Microsecond},
+		FailureBackoff:    time.Hour,
+		OrderedPartitions: true,
+	})
+	require.NoError(t, err)
+
+	// The head fails; the tail must not be attempted while the head is out.
+	published, err := relay.Tick(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, published)
+	assertUnpublished(t, pool, head)
+	assertUnpublished(t, pool, tail)
+	for _, call := range publisher.calls() {
+		assert.Equal(t, head, call.env.ID, "only the head row may be attempted while it is unpublished")
+	}
+
+	// Stand in for the backoff passing, without waiting an hour.
+	_, err = pool.Exec(ctx, "update outbox_events set next_attempt_at = now() where id = $1", head)
+	require.NoError(t, err)
+
+	// The head succeeds, but the tail was already held out of this tick's
+	// batch, so it stays unpublished until the next tick.
+	published, err = relay.Tick(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, published)
+	assertPublished(t, pool, head)
+	assertUnpublished(t, pool, tail)
+
+	published, err = relay.Tick(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, published)
+	assertPublished(t, pool, tail)
+
+	calls := publisher.calls()
+	require.Len(t, calls, 3)
+	assert.Equal(t, head, calls[0].env.ID)
+	assert.Equal(t, head, calls[1].env.ID)
+	assert.Equal(t, tail, calls[2].env.ID, "the later row publishes only after the head succeeds")
+}
+
+// TestRelay_UnorderedByDefaultPublishesAroundBlockedHead pins the default:
+// without OrderedPartitions, rows sharing a partition key still publish
+// independently, so a blocked head does not hold the rows behind it.
+func TestRelay_UnorderedByDefaultPublishesAroundBlockedHead(t *testing.T) {
+	pool := openEmptyPool(t)
+	ctx := context.Background()
+
+	head := enqueueOneWithPartition(t, pool, []byte(`{"seq":1}`))
+	tail := enqueueOneWithPartition(t, pool, []byte(`{"seq":2}`))
+
+	publisher := newFakePublisher()
+	publisher.failAlways(head)
+
+	relay, err := outbox.NewRelay(pool, outbox.Options{
+		Publisher:      publisher,
+		PublishRetry:   retry.Options{MaxAttempts: 1, BaseDelay: time.Microsecond},
+		FailureBackoff: time.Hour,
+	})
+	require.NoError(t, err)
+
+	published, err := relay.Tick(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, published)
+	assertUnpublished(t, pool, head)
+	assertPublished(t, pool, tail)
 }

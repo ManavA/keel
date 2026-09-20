@@ -35,12 +35,18 @@
 // unset a poisoned row is retried at the capped interval until someone
 // deletes or fixes it.
 //
-// # What is out of scope
+// # Ordering within an aggregate is opt-in
 //
-// Relay does not serialize retries per aggregate: two rows for the same
-// aggregate can still be published out of order if the earlier one is
-// being retried when the later one succeeds. Ordering delivery strictly
-// per aggregate would need a partition key on the outbox table and a
-// relay that tracks in-flight rows per partition; nothing here does
-// either.
+// By default Relay does not serialize retries per aggregate: two rows for
+// the same aggregate can still be published out of order if the earlier one
+// is being retried when the later one succeeds. A consumer that applies
+// events in order opts in with a partition key and [Options.OrderedPartitions]:
+// enqueue each aggregate's events with Event.PartitionKey set (usually the
+// aggregate's id) and run the Relay with OrderedPartitions true. The Relay
+// then publishes one partition's rows in creation order — a row waits while
+// an older unpublished row with the same key exists, and a row that fails
+// holds the rest of its partition for the rest of the tick. Rows with an
+// empty key publish independently, as do rows in different partitions. A
+// parked head row does not block its partition: it will never publish, so
+// the rows behind it flow.
 package outbox

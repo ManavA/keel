@@ -22,6 +22,13 @@ type Event struct {
 	// Payload is marshaled with events.Marshal: a []byte value is stored
 	// as-is, anything else is JSON-encoded.
 	Payload any
+
+	// PartitionKey optionally groups rows whose delivery order matters,
+	// typically one aggregate's id. Empty means no ordering: the row
+	// publishes independently of every other row, as before. A non-empty
+	// key takes effect only when the Relay runs with
+	// Options.OrderedPartitions; otherwise it is stored and ignored.
+	PartitionKey string
 }
 
 // Enqueue writes event as a new outbox row inside tx, so it commits or
@@ -38,8 +45,8 @@ func Enqueue(ctx context.Context, tx pgx.Tx, event Event) error {
 	}
 
 	_, err = tx.Exec(ctx,
-		"insert into "+Table+" (topic, payload) values ($1, $2)",
-		event.Topic, payload)
+		"insert into "+Table+" (topic, payload, partition_key) values ($1, $2, $3)",
+		event.Topic, payload, event.PartitionKey)
 	if err != nil {
 		return fmt.Errorf("outbox: enqueue for topic %s: %w", event.Topic, err)
 	}
