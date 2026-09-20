@@ -17,21 +17,32 @@
 migrations, auth, search, jobs and graceful shutdown. About 30 minutes.</p>
 
 <h2>0. Prerequisites</h2>
-<p>Go 1.26 or later, and Docker for the local Postgres. Fetch the module:</p>
-<pre><code>go get github.com/ManavA/keel</code></pre>
+<p>Go 1.26 or later, Docker for the Postgres below (or a database you
+already have), and Git with access to clone the repository (it is private).
+There is no published release yet, so fetch a checkout instead of a
+version:</p>
+<pre><code>git clone https://github.com/ManavA/keel.git keel
+cd keel</code></pre>
 
-<h2>1. Scaffold the example</h2>
+<h2>1. Scaffold and start it</h2>
 <p><code>keel new</code> copies a template profile into a project. The
 <code>minimal</code> profile is a notes API built out of keel, meant to be read
-rather than deployed:</p>
+rather than deployed. From inside the checkout:</p>
 <pre><code>go run ./cmd/keel new mynotes
 cd mynotes
-make run-local</code></pre>
-<p><code>make run-local</code> starts a Postgres in Docker, points the service
-at it and serves on :8080. Against a database you already have:</p>
-<pre><code>DATABASE_URL='postgres://user:pass@localhost:5432/db?sslmode=disable' go run ./examples/minimal</code></pre>
-<p>Only <code>DATABASE_URL</code> is required. Every other default is chosen so
-the service comes up with none of them set.</p>
+go mod edit -replace github.com/ManavA/keel=../keel
+go mod tidy</code></pre>
+<p>The <code>replace</code> stands in until keel has a published release:
+without it <code>go mod tidy</code> fails because <code>v0.1.0</code> does
+not exist yet. Then start a throwaway Postgres and run the scaffolded
+project against it:</p>
+<pre><code>docker run -d --rm --name keel-tut-db \
+  -e POSTGRES_USER=keel -e POSTGRES_PASSWORD=keel -e POSTGRES_DB=keel \
+  -p 127.0.0.1:5432:5432 postgres:16-alpine
+DATABASE_URL='postgres://keel:keel@127.0.0.1:5432/keel?sslmode=disable' go run .</code></pre>
+<p>The service serves on :8080. Only <code>DATABASE_URL</code> is required.
+Every other default is chosen so the service comes up with none of them
+set.</p>
 
 <h2>2. Walk through the wiring</h2>
 <p>The service entry point (<code>main.go</code>) follows the same order every
