@@ -37,6 +37,11 @@
 //     another job's claimed effect actually happened. A watchdog that found
 //     no evidence to check must not report the same result as one that
 //     checked and found everything correct.
+//   - [RunRecord] and [HistoryStore]: one finished run's counts with the
+//     status and exit code they compute to, recorded for every entry that
+//     carries a store (jobs/pg persists it), so an operator can answer
+//     what ran, what it did, and whether the last run was StatusDidNothing
+//     or a success.
 //
 // Every dependency on an external system here — [Trigger] above all — is
 // reached through a small interface, so this package's own tests use fakes

@@ -39,6 +39,14 @@ func NewRunner(opts RunnerOptions) Runner {
 // the process exit code that corresponds to the run's outcome. name identifies the job in the
 // terminal log line ("<name> complete" / "<name> failed").
 func (r Runner) Run(ctx context.Context, name string, fn Func) int {
+	_, exit := r.RunOutcome(ctx, name, fn)
+	return exit
+}
+
+// RunOutcome executes fn like [Runner.Run] and also returns the Outcome the
+// exit code was computed from, for callers — the Scheduler's run history —
+// that need the counts as well as the code.
+func (r Runner) RunOutcome(ctx context.Context, name string, fn Func) (Outcome, int) {
 	if r.opts.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.opts.Timeout)
@@ -51,9 +59,9 @@ func (r Runner) Run(ctx context.Context, name string, fn Func) int {
 		// distinct from one that measured and found failures, but no less
 		// fatal, so it takes the same terminal status.
 		outcome.Fatal = true
-		return Complete(r.opts.Logger, name+" complete", name+" failed", outcome, "error", err)
+		return outcome, Complete(r.opts.Logger, name+" complete", name+" failed", outcome, "error", err)
 	}
-	return Complete(r.opts.Logger, name+" complete", name+" failed", outcome)
+	return outcome, Complete(r.opts.Logger, name+" complete", name+" failed", outcome)
 }
 
 // runRecovered calls fn and converts a panic into an error instead of

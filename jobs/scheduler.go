@@ -16,6 +16,9 @@ type Entry struct {
 	Interval time.Duration
 	// Func is the job body, run once per tick.
 	Func Func
+	// History receives one [RunRecord] per finished run. Nil records
+	// nothing: an entry without a store runs exactly as before.
+	History HistoryStore
 }
 
 // SchedulerOptions configures a [Scheduler]. The zero value works: logging
@@ -97,7 +100,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 // runLoop runs one entry immediately and then on every tick of its own
 // ticker, until ctx is canceled.
 func (s *Scheduler) runLoop(ctx context.Context, runner Runner, e Entry) {
-	runner.Run(ctx, e.Name, e.Func)
+	s.runOnce(ctx, runner, e)
 
 	ticker := time.NewTicker(e.Interval)
 	defer ticker.Stop()
@@ -106,7 +109,27 @@ func (s *Scheduler) runLoop(ctx context.Context, runner Runner, e Entry) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runner.Run(ctx, e.Name, e.Func)
+			s.runOnce(ctx, runner, e)
 		}
+	}
+}
+
+// runOnce runs one tick of e and records it when the entry carries a
+// [HistoryStore]. A recording failure is logged, not returned: the job
+// already ran, and failing the process over its history would turn the
+// record into the run's most dangerous side effect.
+func (s *Scheduler) runOnce(ctx context.Context, runner Runner, e Entry) {
+	if e.History == nil {
+		runner.Run(ctx, e.Name, e.Func)
+		return
+	}
+	started := time.Now()
+	outcome, _ := runner.RunOutcome(ctx, e.Name, e.Func)
+	if err := e.History.Record(ctx, NewRunRecord(e.Name, started, time.Now(), outcome)); err != nil {
+		logger := s.opts.Logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Error("scheduler history record failed", "entry", e.Name, "error", err)
 	}
 }
