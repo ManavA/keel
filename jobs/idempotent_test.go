@@ -202,7 +202,8 @@ func TestIdempotent_TwoSeparateGuardsBothRunSameKey(t *testing.T) {
 	g1 := NewMemoryGuard()
 	g2 := NewMemoryGuard()
 	var calls atomic.Int32
-	fn := func(ctx context.Context) error {
+	//nolint:unparam // both runs must succeed for the calls==2 pin; a failing fn tests another path.
+	fn := func(context.Context) error {
 		time.Sleep(50 * time.Millisecond)
 		calls.Add(1)
 		return nil
