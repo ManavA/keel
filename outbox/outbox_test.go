@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -25,9 +26,9 @@ func TestMain(m *testing.M) {
 }
 
 // openPool gives a test its own pool over the package's shared database,
-// applying the migration first. The migration is idempotent (CREATE TABLE
-// IF NOT EXISTS), so running it once per test is cheap and safe against a
-// table other tests are also using.
+// applying the migrations first. Each migration is idempotent, so running
+// them once per test is cheap and safe against a table other tests are
+// also using.
 func openPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	db := testdb.Shared(t)
@@ -36,10 +37,17 @@ func openPool(t *testing.T) *pgxpool.Pool {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
-	migration, err := os.ReadFile("pg/migrations/001_outbox_events.up.sql")
+	entries, err := os.ReadDir("pg/migrations")
 	require.NoError(t, err)
-	_, err = pool.Exec(context.Background(), string(migration))
-	require.NoError(t, err)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".up.sql") {
+			continue
+		}
+		migration, err := os.ReadFile("pg/migrations/" + entry.Name())
+		require.NoError(t, err)
+		_, err = pool.Exec(context.Background(), string(migration))
+		require.NoError(t, err, "apply migration %s", entry.Name())
+	}
 
 	return pool
 }
