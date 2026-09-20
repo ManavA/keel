@@ -8,6 +8,9 @@
 //
 //	migrate.Run(ctx, pool, migrate.Options{FS: adminpg.MigrationsFS, Dir: "migrations"})
 //
+// The same schema holds the admin_audit table behind [AuditStore], the
+// append-only trail the admin package's Audit middleware writes.
+//
 // The email column uses Postgres's citext type, making the uniqueness
 // constraint and every lookup case-insensitive at the database level.
 package pg

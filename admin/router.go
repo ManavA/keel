@@ -10,6 +10,7 @@ import (
 //
 //	POST /login     (rate-limited)
 //	POST /refresh   (requires RequireAdmin)
+//	GET  /audit     (requires RequireAdmin; the audit trail, oldest first)
 //
 // and this Service's CORS policy applied to every route, including ones a
 // caller adds afterward. A caller mounts its own operator-only routes on the
@@ -40,6 +41,7 @@ func (s *Service) Router() chi.Router {
 	r.Group(func(r chi.Router) {
 		r.Use(s.RequireAdmin)
 		r.Post("/refresh", s.Refresh)
+		r.Get("/audit", s.AuditList)
 	})
 
 	return r
