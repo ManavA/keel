@@ -36,6 +36,7 @@ events/          publish and subscribe
 mail/            transactional email
   testing/         a Recorder for tests
   deliverycheck/   reconciling delivery claims against a provider
+  reconcile/       the scheduled delivery-reconciliation job
 media/           object storage and image derivatives
 geocode/         address to coordinate lookup
 perf/            response caching, ETag, gzip, and singleflight middleware
