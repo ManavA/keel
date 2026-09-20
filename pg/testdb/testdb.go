@@ -36,16 +36,23 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// DefaultImage is the Postgres image started when Options.Image is empty.
-// Pinned to a version rather than :latest, so the database version does not
-// change when a mirror updates.
+// DefaultImage is the Postgres image started when Options.Image is empty and
+// the version variable is unset. Pinned to a version rather than :latest, so
+// the database version does not change when a mirror updates.
 const DefaultImage = "postgres:16-alpine"
+
+// EnvVersion names the environment variable that selects the Postgres major
+// version started when Options.Image is empty. Set it to a major like "17" to
+// start postgres:17-alpine instead of DefaultImage. An explicit Image wins over
+// it. CI runs the database-backed suite once per supported major this way.
+const EnvVersion = "KEEL_TESTDB_PG_VERSION"
 
 // Options configures Start. The zero value starts DefaultImage on a free port
 // with a session-unique container name.
 type Options struct {
-	// Image defaults to DefaultImage. Any image with the official Postgres
-	// entrypoint works, including postgis/postgis.
+	// Image defaults to DefaultImage, or to the major named by EnvVersion when
+	// it is set. Any image with the official Postgres entrypoint works,
+	// including postgis/postgis.
 	Image string
 
 	// Name is the container name. The default is unique per process, so two
@@ -81,6 +88,14 @@ type DB struct {
 	Name string
 	Port int
 
+	// Image is the container image the database was started from, after the
+	// explicit Image, the version variable and the default were resolved.
+	Image string
+
+	// ServerVersion is what the server reports for server_version, e.g.
+	// "17.4". Start refuses to return a database it could not ask.
+	ServerVersion string
+
 	stop     func()
 	stopOnce sync.Once
 }
@@ -95,7 +110,7 @@ func Start(ctx context.Context, opts Options) (*DB, error) {
 		return nil, err
 	}
 
-	image := orString(opts.Image, DefaultImage)
+	image := resolveImage(opts.Image)
 	user := orString(opts.User, "keel")
 	password := orString(opts.Password, "keel")
 	database := orString(opts.Database, "keel")
@@ -137,8 +152,9 @@ func Start(ctx context.Context, opts Options) (*DB, error) {
 	db := &DB{
 		URL: fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable",
 			user, password, port, database),
-		Name: name,
-		Port: port,
+		Name:  name,
+		Port:  port,
+		Image: image,
 	}
 	db.stop = func() { removeContainer(name) }
 	unregister := registerForSignals(name)
@@ -152,13 +168,55 @@ func Start(ctx context.Context, opts Options) (*DB, error) {
 		return nil, err
 	}
 
+	version, err := queryServerVersion(readyCtx, db.URL)
+	if err != nil {
+		unregister()
+		removeContainer(name)
+		return nil, err
+	}
+	db.ServerVersion = version
+
 	prevStop := db.stop
 	db.stop = func() {
 		unregister()
 		prevStop()
 	}
-	logf("testdb: %s ready", name)
+	logf("testdb: %s ready (%s, postgres %s)", name, image, version)
 	return db, nil
+}
+
+// resolveImage reports which image Start will use. An explicit Image wins,
+// then the major named by EnvVersion, then DefaultImage.
+func resolveImage(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return imageForVersion(os.Getenv(EnvVersion))
+}
+
+// imageForVersion maps a major like "17" to its image. Empty means the
+// default.
+func imageForVersion(major string) string {
+	if major = strings.TrimSpace(major); major == "" {
+		return DefaultImage
+	}
+	return "postgres:" + major + "-alpine"
+}
+
+// queryServerVersion asks the database what it is, so the test log names the
+// version that actually came up rather than the image that was requested.
+func queryServerVersion(ctx context.Context, url string) (string, error) {
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		return "", fmt.Errorf("testdb: read server version: %w", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	var version string
+	if err := conn.QueryRow(ctx, "show server_version").Scan(&version); err != nil {
+		return "", fmt.Errorf("testdb: read server version: %w", err)
+	}
+	return version, nil
 }
 
 // Close removes the container. Safe to call more than once.

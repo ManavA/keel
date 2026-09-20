@@ -41,6 +41,21 @@ Every caller of `Shared` gets the same database, so a test that writes needs its
 own schema, its own table names, or a transaction it rolls back. The migration
 tests create a schema per test and drop it in `t.Cleanup`.
 
+### Postgres versions
+
+The image defaults to Postgres 16. Setting `KEEL_TESTDB_PG_VERSION` to a major
+like `17` starts that major instead; an explicit `Options.Image` wins over both.
+`Start` reports what came up — the image on `DB.Image`, the server's own
+`server_version` on `DB.ServerVersion` — and the test log names both, so a run
+records which server it verified.
+
+```
+KEEL_TESTDB_PG_VERSION=17 go test -count=1 ./pg/...
+```
+
+CI runs the database-backed suite once per supported major (15, 16, 17), so
+version-specific behavior is tested on every server the suite claims to cover.
+
 ### What `RunMain` refuses
 
 A run where every test passed and not one of them asked for the database fails,
