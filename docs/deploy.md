@@ -157,6 +157,10 @@ migrations shipped with which build:
 var migrations embed.FS
 ```
 
+Backups and restores — what to dump, Meilisearch snapshots, bucket
+versioning, what the migration ledger looks like after a restore, and the
+checklist that says a restore worked — are in `docs/backup.md`.
+
 ## The pool
 
 Size `MaxConns` against the database's connection limit divided by the number of

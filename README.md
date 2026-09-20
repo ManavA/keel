@@ -150,7 +150,8 @@ configuration, and scripts that check a deployed revision is the one that was
 pushed. `scripts/` holds the repository's own developer and CI scripts.
 
 See `docs/deploy.md` for health checks, proxy configuration, migrations,
-shutdown, pool sizing and build identification.
+shutdown, pool sizing and build identification, and `docs/backup.md` for
+the backup and restore runbook.
 
 ## Contributing
 
