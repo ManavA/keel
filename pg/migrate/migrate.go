@@ -14,12 +14,12 @@
 // and a new database, a restored one or a dropped ledger table replays
 // everything.
 //
-// Run migrations from one place. There is no advisory lock yet, so two
-// instances deploying at once can both reach the same pending file. The
-// outcome is safe — one transaction wins and the other fails on the ledger's
-// primary key or on the DDL, stopping the run and naming the file — but in a
-// rolling deploy that shows up as one replica failing while another succeeds,
-// which costs an investigation.
+// One run holds an advisory lock for its whole duration
+// (pg_advisory_xact_lock on lockKey), so two instances deploying at once
+// serialize: the second waits for the first, then finds every file already in
+// the ledger and applies nothing. Run holds one pooled connection for its
+// duration for that lock, so a pool of one would deadlock; size MaxConns for
+// the migrator plus the application.
 package migrate
 
 import (
@@ -42,6 +42,11 @@ import (
 
 // DefaultTable is the ledger table.
 const DefaultTable = "schema_migrations"
+
+// lockKey is the advisory-lock key serializing concurrent runs. It is the
+// FNV-1a 64 hash of "keel:migrate", fixed so that every binary running these
+// migrations takes the same lock.
+const lockKey int64 = -4732929956302618157
 
 // UpSuffix and DownSuffix are the file names this package reads. A migration
 // with no down file is fine and common; one is only needed for a change you
@@ -143,6 +148,14 @@ func Run(ctx context.Context, db pg.Beginner, opts Options) (Result, error) {
 		return Result{}, fmt.Errorf("migrate: no %s files found in %q", UpSuffix, path.Join(opts.Dir, "."))
 	}
 
+	// First, so the ledger's own CREATE TABLE is inside the lock too: two
+	// runs creating it at once trip a duplicate-key error on the catalog.
+	release, err := holdLock(ctx, db)
+	if err != nil {
+		return Result{}, err
+	}
+	defer release()
+
 	if err := ensureLedger(ctx, db, table); err != nil {
 		return Result{}, err
 	}
@@ -198,6 +211,38 @@ func plural(n int, one, many string) string {
 		return one
 	}
 	return many
+}
+
+// holdLock takes the run-wide advisory lock and returns its release. The lock
+// is pg_advisory_xact_lock, so it lives on a transaction opened here for
+// exactly the length of the run and is released when that transaction ends —
+// even if the run panics or the context is cancelled.
+//
+// Each migration still commits in its own transaction as before; the holder
+// transaction carries nothing but the lock, so a failed file rolls back only
+// itself, not the files before it.
+//
+// When db is already a transaction, the lock is taken on it directly and the
+// release is a no-op: the caller's transaction already spans the run, and
+// rolling back a savepoint here would undo the run's own work.
+func holdLock(ctx context.Context, db pg.Beginner) (release func(), err error) {
+	if tx, ok := db.(pgx.Tx); ok {
+		if _, err := tx.Exec(ctx, "select pg_advisory_xact_lock($1)", lockKey); err != nil {
+			return nil, fmt.Errorf("migrate: take the migration lock: %w", err)
+		}
+		return func() {}, nil
+	}
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("migrate: take the migration lock: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "select pg_advisory_xact_lock($1)", lockKey); err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return nil, fmt.Errorf("migrate: take the migration lock: %w", err)
+	}
+	return func() {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+	}, nil
 }
 
 // apply runs one migration and records it, in a single transaction, so a

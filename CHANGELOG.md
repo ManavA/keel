@@ -19,7 +19,8 @@ behaviour:
 - `pg.ParsePage` reads `page` as 1-based, and refuses a pagination parameter it
   cannot act on rather than ignoring it.
 - `migrate.Run` returns `ErrChecksumDrift` when a file no longer matches the
-  ledger. It has no advisory lock, so migrations should run from one place.
+  ledger. It holds a transaction-scoped advisory lock for the whole run, so two
+  deploys at once serialize and the second applies nothing.
 - `middleware.CORS` allows nothing when no origins are configured, and panics on
   a `"*"` origin combined with credentials.
 - `middleware.RateLimit` panics when `Requests` or `Window` is missing, rather
