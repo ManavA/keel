@@ -50,7 +50,13 @@ type Options struct {
 	// least minSecretLength bytes.
 	Secret string
 	// TokenTTL is how long an issued session token is valid. Defaults to
-	// DefaultTokenTTL.
+	// DefaultTokenTTL. It is the token's absolute lifetime — exp is always
+	// iat plus this duration, and no activity extends it. There is no idle
+	// timeout: admin sessions are stateless JWTs with no activity record to
+	// measure idleness against. Keep this short (the 12-hour default is
+	// already generous for a privileged console) and require re-login rather
+	// than relying on Refresh to carry a session indefinitely; every refresh
+	// issues a full new ttl.
 	TokenTTL time.Duration
 	// CORSOrigin is the single origin Router's CORS policy allows, typically
 	// the admin console's own origin. Required to allow any cross-origin

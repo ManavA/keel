@@ -11,6 +11,15 @@
 // in-memory implementation for tests; admin/pg provides a Postgres-backed
 // one, along with the migrations it needs.
 //
+// The session lifetime model is absolute only: a token is valid until its exp
+// (iat plus Options.TokenTTL) and no activity extends it. There is no idle
+// timeout, because these tokens are stateless — validation checks signature
+// and expiry with no storage lookup, so there is no activity record to
+// measure idleness against. End-user sessions under auth's SessionOpaque can
+// enforce both windows (see auth.SessionLimits); an admin deployment that
+// needs idle control must keep TokenTTL short and require re-login. Every
+// refresh issues a full new ttl, so Refresh is not a bounded extension.
+//
 // Options.Secret must be at least 16 bytes, and must be a DIFFERENT secret
 // from whatever auth.Options.Secret this deployment's end-user sessions use.
 // Every token this package issues carries an "aud" claim ("keel:admin") that

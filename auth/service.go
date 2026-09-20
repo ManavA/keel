@@ -142,6 +142,19 @@ type Options struct {
 	// TokenTTL is how long an issued session token is valid. Defaults to
 	// DefaultTokenTTL.
 	TokenTTL time.Duration
+	// SessionIdleTimeout is how long an opaque session may go without a
+	// successful validation before it stops validating; each validation
+	// slides the deadline forward. Applied to the default in-memory
+	// Sessions store (see SessionLimits); a caller-supplied Sessions store
+	// enforces its own windows instead. Zero disables the window. Unused
+	// under SessionJWT — a self-contained token carries only its expiry, so
+	// there is no activity to observe; TokenTTL is the whole lifetime there.
+	SessionIdleTimeout time.Duration
+	// SessionAbsoluteLifetime caps how long after creation an opaque
+	// session may validate, however active. Same scope as
+	// SessionIdleTimeout: the default Sessions store only, zero disables.
+	// Under SessionJWT the cap is TokenTTL itself, enforced by expiry.
+	SessionAbsoluteLifetime time.Duration
 
 	// Users backs SourceLocal's accounts and every source's identity
 	// records. Defaults to an in-memory UserStore.
@@ -251,7 +264,10 @@ func NewService(opts Options) (*Service, error) {
 	case SessionOpaque, "":
 		store := opts.Sessions
 		if store == nil {
-			store = NewMemorySessionStore()
+			store = NewMemorySessionStoreWithLimits(SessionLimits{
+				IdleTimeout:      opts.SessionIdleTimeout,
+				AbsoluteLifetime: opts.SessionAbsoluteLifetime,
+			})
 		}
 		backend = &opaqueSessionBackend{store: store, ttl: ttl}
 	default:

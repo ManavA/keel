@@ -21,6 +21,34 @@ func TestSessionIssuerRoundTrip(t *testing.T) {
 	assert.Equal(t, "admin_1", subject)
 }
 
+// TestSessionIssuerTokenCarriesAbsoluteLifetime pins the admin session's one
+// lifetime control: exp is exactly iat plus the configured ttl, so the token
+// carries a fixed absolute lifetime that no activity extends. Admin tokens
+// are stateless JWTs with no activity record, so there is no idle window to
+// pin — TokenTTL is the whole lifetime model, and deployments that need idle
+// control must keep it short and require re-login.
+func TestSessionIssuerTokenCarriesAbsoluteLifetime(t *testing.T) {
+	const ttl = 12 * time.Hour
+	const secret = "lifetime-test-secret"
+	s := newSessionIssuer(secret, ttl)
+
+	token, err := s.IssueToken("admin_1")
+	require.NoError(t, err)
+
+	parsed, err := jwt.Parse(token, func(t *jwt.Token) (any, error) {
+		return []byte(secret), nil
+	}, jwt.WithValidMethods([]string{"HS256"}))
+	require.NoError(t, err)
+
+	claims, ok := parsed.Claims.(jwt.MapClaims)
+	require.True(t, ok, "issuer must sign MapClaims")
+	iat, err := claims.GetIssuedAt()
+	require.NoError(t, err)
+	exp, err := claims.GetExpirationTime()
+	require.NoError(t, err)
+	assert.Equal(t, ttl, exp.Time.Sub(iat.Time), "exp must be exactly iat plus ttl: the absolute lifetime")
+}
+
 func TestSessionIssuerZeroTTLUsesDefault(t *testing.T) {
 	s := newSessionIssuer("secret", 0)
 	assert.Equal(t, DefaultTokenTTL, s.ttl)

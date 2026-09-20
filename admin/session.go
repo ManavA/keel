@@ -34,6 +34,13 @@ var ErrInvalidToken = errors.New("admin: invalid token")
 // separate implementation from auth's (see that package's session.go): admin
 // and auth sit at the same layer and neither imports the other, so each
 // carries its own small JWT wrapper rather than sharing one.
+//
+// The ttl is the token's absolute lifetime: exp is always iat plus ttl, and
+// no activity extends it. There is deliberately no idle timeout here. These
+// tokens are stateless — validation is a signature and expiry check with no
+// storage lookup — so there is no record of last activity to measure idleness
+// against. A deployment that needs idle control must keep ttl short and have
+// the console re-authenticate; see Options.TokenTTL.
 type sessionIssuer struct {
 	secret string
 	ttl    time.Duration
