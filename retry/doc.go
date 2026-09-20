@@ -1,6 +1,8 @@
 // Package retry runs a function with exponential backoff, stopping on the
 // first success, the first error [Options.Retryable] rejects, the attempt
-// limit, or context cancellation, whichever comes first.
+// limit, or context cancellation, whichever comes first. [Breaker] counts
+// consecutive call failures and short-circuits callers with [ErrOpen] while
+// the downstream is out, letting one probe through after its reset timeout.
 //
 // # Full jitter
 //
