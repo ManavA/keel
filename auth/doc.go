@@ -47,6 +47,15 @@
 // on any server holding the secret until it expires (see SessionJWT's own
 // doc comment).
 //
+// Opaque sessions can additionally carry [SessionLimits]: an idle timeout
+// that each successful validation slides forward, and an absolute lifetime
+// measured from creation that no activity extends. Both are enforced on
+// validation by the in-memory and Postgres stores, configured through
+// Options.SessionIdleTimeout and Options.SessionAbsoluteLifetime for the
+// default store. JWT sessions have neither — a self-contained token carries
+// only its expiry, so TokenTTL is the whole lifetime there and there is no
+// activity to observe.
+//
 // # Identity-token verifiers and typed nil
 //
 // [Service.SetIDTokenVerifier] is a method rather than a public field. A

@@ -26,6 +26,11 @@ var ErrSessionNotFound = errors.New("auth: session not found or expired")
 // itself — a leaked database dump must not hand out live bearer credentials.
 // [MemorySessionStore] stores the token directly because it never leaves
 // process memory.
+//
+// A store may additionally bound sessions with [SessionLimits]: an idle
+// timeout that successful validations slide forward, and an absolute lifetime
+// measured from creation that no activity extends. Both are enforced on
+// validation alongside the ttl passed to Create.
 type SessionStore interface {
 	// Create issues a new session for userID, valid for ttl, and returns the
 	// opaque token a client will present.
@@ -43,9 +48,32 @@ type SessionStore interface {
 	RevokeAllForUser(ctx context.Context, userID string) error
 }
 
+// SessionLimits configures the two windows that bound an opaque session
+// beyond its per-session ttl: an idle timeout (sliding) and an absolute
+// lifetime (hard cap). Both are enforced on validation, by the in-memory
+// store in this file and the Postgres store in auth/pg alike. A zero value
+// for either disables that window, leaving only the ttl passed to Create —
+// which is exactly how a store built by NewMemorySessionStore behaves, so
+// existing callers see no change until they opt in.
+type SessionLimits struct {
+	// IdleTimeout is how long a session may go without a successful
+	// validation before it stops validating. Each successful Validate moves
+	// the deadline forward — activity extends the window — so a stolen
+	// token goes dead on its own once the thief stops using it, instead of
+	// staying valid until explicit revocation. Zero disables the window.
+	IdleTimeout time.Duration
+	// AbsoluteLifetime is how long after creation a session may validate,
+	// no matter how active it has been. Activity never extends it: this is
+	// the cap that forces eventual re-authentication. Zero disables the
+	// cap, leaving the ttl passed to Create as the only fixed bound.
+	AbsoluteLifetime time.Duration
+}
+
 type sessionRecord struct {
-	userID    string
-	expiresAt time.Time
+	userID     string
+	expiresAt  time.Time
+	createdAt  time.Time
+	lastSeenAt time.Time
 }
 
 // sweepInterval bounds how often the in-memory stores in this file scan for
@@ -66,13 +94,31 @@ type MemorySessionStore struct {
 	byToken map[string]sessionRecord
 	byUser  map[string]map[string]struct{} // userID -> set of tokens
 	writes  int
+	limits  SessionLimits
+	nowFunc func() time.Time
 }
 
-// NewMemorySessionStore returns an empty MemorySessionStore.
+// NewMemorySessionStore returns an empty MemorySessionStore with no idle or
+// absolute windows: only the ttl passed to Create bounds a session.
 func NewMemorySessionStore() *MemorySessionStore {
 	return &MemorySessionStore{
 		byToken: make(map[string]sessionRecord),
 		byUser:  make(map[string]map[string]struct{}),
+		nowFunc: time.Now,
+	}
+}
+
+// NewMemorySessionStoreWithLimits returns an empty MemorySessionStore that
+// enforces limits on validation: a session idle longer than IdleTimeout
+// stops validating (successful validations slide the deadline forward), and
+// no session validates past AbsoluteLifetime after its creation, however
+// active. A non-positive value for either disables that window.
+func NewMemorySessionStoreWithLimits(limits SessionLimits) *MemorySessionStore {
+	return &MemorySessionStore{
+		byToken: make(map[string]sessionRecord),
+		byUser:  make(map[string]map[string]struct{}),
+		limits:  limits,
+		nowFunc: time.Now,
 	}
 }
 
@@ -92,7 +138,13 @@ func (s *MemorySessionStore) Create(_ context.Context, userID string, ttl time.D
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.byToken[token] = sessionRecord{userID: userID, expiresAt: time.Now().Add(ttl)}
+	now := s.nowFunc()
+	s.byToken[token] = sessionRecord{
+		userID:     userID,
+		expiresAt:  now.Add(ttl),
+		createdAt:  now,
+		lastSeenAt: now,
+	}
 	if s.byUser[userID] == nil {
 		s.byUser[userID] = make(map[string]struct{})
 	}
@@ -101,14 +153,19 @@ func (s *MemorySessionStore) Create(_ context.Context, userID string, ttl time.D
 	return token, nil
 }
 
-// Validate implements SessionStore.
+// Validate implements SessionStore. A successful validation records the
+// session as seen now, sliding the idle window forward; a session past its
+// ttl, idle past IdleTimeout, or older than AbsoluteLifetime reports
+// ErrSessionNotFound.
 func (s *MemorySessionStore) Validate(_ context.Context, token string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec, ok := s.byToken[token]
-	if !ok || time.Now().After(rec.expiresAt) {
+	if !ok || s.expiredLocked(rec, s.nowFunc()) {
 		return "", ErrSessionNotFound
 	}
+	rec.lastSeenAt = s.nowFunc()
+	s.byToken[token] = rec
 	return rec.userID, nil
 }
 
@@ -146,6 +203,21 @@ func (s *MemorySessionStore) deleteLocked(token string) {
 	}
 }
 
+// expiredLocked reports whether rec is past any enforced deadline at now:
+// its ttl, its idle window, or its absolute lifetime. Callers hold s.mu.
+func (s *MemorySessionStore) expiredLocked(rec sessionRecord, now time.Time) bool {
+	if now.After(rec.expiresAt) {
+		return true
+	}
+	if s.limits.IdleTimeout > 0 && now.After(rec.lastSeenAt.Add(s.limits.IdleTimeout)) {
+		return true
+	}
+	if s.limits.AbsoluteLifetime > 0 && now.After(rec.createdAt.Add(s.limits.AbsoluteLifetime)) {
+		return true
+	}
+	return false
+}
+
 // maybeSweepLocked evicts every expired session once every sweepInterval
 // writes. Callers hold s.mu.
 func (s *MemorySessionStore) maybeSweepLocked() {
@@ -153,9 +225,9 @@ func (s *MemorySessionStore) maybeSweepLocked() {
 	if s.writes%sweepInterval != 0 {
 		return
 	}
-	now := time.Now()
+	now := s.nowFunc()
 	for token, rec := range s.byToken {
-		if now.After(rec.expiresAt) {
+		if s.expiredLocked(rec, now) {
 			s.deleteLocked(token)
 		}
 	}
