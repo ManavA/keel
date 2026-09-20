@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -342,6 +343,224 @@ func TestStandardProfileBuildsAndBoots(t *testing.T) {
 		`{"email":"admin@example.com","password":"adminpassword123"}`)
 	require.Equal(t, http.StatusOK, status, "POST /admin/login: %s", adminSession)
 	assert.Contains(t, adminSession, "admin@example.com")
+}
+
+// TestMinimalProfileBuildsAndBoots is the minimal profile's acceptance check:
+// a project made with the default profile builds and boots against a real
+// database, and the browser UI it ships answers on the same store as the JSON
+// API. The landing shell owns GET /, so the walk starts there — the shell,
+// its htmx fragment and the static policy — then a form signup whose cookie
+// opens the dashboard and whose fragment agrees with the JSON API, scoped to
+// its owner and escaped at render.
+func TestMinimalProfileBuildsAndBoots(t *testing.T) {
+	db := testdb.Shared(t)
+
+	dir := filepath.Join(t.TempDir(), "notes")
+	require.NoError(t, createProject(dir, "example.com/notes", "minimal"))
+
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	require.NoError(t, err)
+	goRun := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("go", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "go %s: %s", strings.Join(args, " "), out)
+	}
+	goRun("mod", "edit", "-replace", keelModule+"="+root)
+	goRun("mod", "tidy")
+	bin := filepath.Join(dir, "notes")
+	goRun("build", "-o", bin, ".")
+
+	port := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"DATABASE_URL="+db.URL,
+		"PORT="+strconv.Itoa(port),
+	)
+	var serverLog bytes.Buffer
+	cmd.Stdout = &serverLog
+	cmd.Stderr = &serverLog
+	require.NoError(t, cmd.Start())
+
+	base := "http://127.0.0.1:" + strconv.Itoa(port)
+	require.NoError(t, waitForStatus(t, base+"/readyz", http.StatusOK, time.Minute),
+		"minimal scaffold never became ready; server log:\n%s", &serverLog)
+
+	// The landing shell owns GET /.
+	resp, landing := bootGet(t, base, "/", false)
+	require.Equal(t, http.StatusOK, resp.StatusCode, landing)
+	assert.Contains(t, landing, `data-theme="landing"`)
+	assert.Contains(t, landing, "/static/css/tokens.css")
+	assert.Contains(t, landing, "/static/vendor/htmx.min.js")
+
+	// Over htmx it is the main block on its own, not the document.
+	resp, frag := bootGet(t, base, "/", true)
+	require.Equal(t, http.StatusOK, resp.StatusCode, frag)
+	assert.Contains(t, frag, "landing-main")
+	assert.NotContains(t, frag, "<html")
+
+	// The static policy the unit suite pins holds on the wire too.
+	resp, _ = bootGet(t, base, "/static/css/tokens.css", false)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, resp.Header.Get("Cache-Control"), "no-cache")
+	resp, _ = bootGet(t, base, "/static/vendor/htmx.min.js", false)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, resp.Header.Get("Cache-Control"), "immutable")
+
+	// A signup through the form sets a session cookie and lands on verify-sent.
+	resp, _ = bootPostForm(t, base, "/signup",
+		url.Values{"email": {"browser@example.com"}, "password": {"password123"}}, false)
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	assert.Equal(t, "/verify-sent", resp.Header.Get("Location"))
+	cookie := bootCookie(t, resp)
+	assert.True(t, cookie.HttpOnly, "the session cookie must not reach JavaScript")
+	assert.Equal(t, http.SameSiteLaxMode, cookie.SameSite)
+
+	// The cookie opens the dashboard shell.
+	resp, dash := bootGet(t, base, "/app", false, cookie)
+	require.Equal(t, http.StatusOK, resp.StatusCode, dash)
+	assert.Contains(t, dash, "Your notes")
+
+	// A note written through the fragment renders its card, escaped at render.
+	resp, card := bootPostForm(t, base, "/ui/notes",
+		url.Values{"title": {"<script>alert(1)</script>"}, "body": {"markup"}}, true, cookie)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, card)
+	assert.Contains(t, card, "note-card")
+	id := bootCardID(t, card)
+
+	resp, list := bootGet(t, base, "/ui/notes", true, cookie)
+	require.Equal(t, http.StatusOK, resp.StatusCode, list)
+	assert.Contains(t, list, "&lt;script&gt;")
+	assert.NotContains(t, list, "<script>alert(1)")
+
+	// The JSON API agrees the note is there: the cookie carries the same
+	// session token a bearer header would. encoding/json escapes markup on the
+	// wire, so decode first and compare verbatim.
+	var listed struct {
+		Notes []struct {
+			Title string `json:"title"`
+		} `json:"notes"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(getBody(t, base+"/api/notes", cookie.Value)), &listed))
+	require.Len(t, listed.Notes, 1, "a form-created note must be listed")
+	assert.Equal(t, "<script>alert(1)</script>", listed.Notes[0].Title)
+
+	// Another account's fragment shows none of it, and its delete is a 404.
+	status, _ := postJSON(t, base+"/auth/signup", "",
+		`{"email":"other@example.com","password":"password123"}`)
+	require.Equal(t, http.StatusCreated, status)
+	resp, _ = bootPostForm(t, base, "/login",
+		url.Values{"email": {"other@example.com"}, "password": {"password123"}}, false)
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	other := bootCookie(t, resp)
+
+	resp, otherList := bootGet(t, base, "/ui/notes", true, other)
+	require.Equal(t, http.StatusOK, resp.StatusCode, otherList)
+	assert.NotContains(t, otherList, "alert(1)")
+	assert.Contains(t, otherList, "No notes yet")
+
+	assert.Equal(t, http.StatusNotFound, bootDelete(t, base, "/ui/notes/"+id, true, other).StatusCode)
+
+	// The owner's copy survived, and their own delete works.
+	resp, list = bootGet(t, base, "/ui/notes", true, cookie)
+	require.Equal(t, http.StatusOK, resp.StatusCode, list)
+	assert.Contains(t, list, "&lt;script&gt;")
+	assert.Equal(t, http.StatusOK, bootDelete(t, base, "/ui/notes/"+id, true, cookie).StatusCode)
+}
+
+// bootGet sends a GET against a booted scaffold. hx asks for the fragment
+// rather than the page; cookies ride along the way a browser sends them.
+func bootGet(t *testing.T, base, path string, hx bool, cookies ...*http.Cookie) (*http.Response, string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, base+path, nil)
+	require.NoError(t, err)
+	if hx {
+		req.Header.Set("HX-Request", "true")
+	}
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp, string(raw)
+}
+
+// bootPostForm sends a form-encoded POST against a booted scaffold without
+// following redirects, so a 303 and its Location are assertions, not a page.
+func bootPostForm(t *testing.T, base, path string, values url.Values, hx bool, cookies ...*http.Cookie) (*http.Response, string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(),
+		http.MethodPost, base+path, strings.NewReader(values.Encode()))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if hx {
+		req.Header.Set("HX-Request", "true")
+	}
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	client := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp, string(raw)
+}
+
+// bootDelete sends a DELETE the way htmx does against a booted scaffold.
+func bootDelete(t *testing.T, base, path string, hx bool, cookies ...*http.Cookie) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodDelete, base+path, nil)
+	require.NoError(t, err)
+	if hx {
+		req.Header.Set("HX-Request", "true")
+	}
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	client := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	return resp
+}
+
+// bootCookie returns the session cookie from a response, failing when the
+// handler did not set one. The name is the literal the scaffold ships, which
+// is what a browser outside this module would match on.
+func bootCookie(t *testing.T, resp *http.Response) *http.Cookie {
+	t.Helper()
+	for _, c := range resp.Cookies() {
+		if c.Name == "keel_session" {
+			return c
+		}
+	}
+	t.Fatal("response set no session cookie")
+	return nil
+}
+
+// bootCardID reads a new card's note id out of the fragment that rendered it.
+func bootCardID(t *testing.T, fragment string) string {
+	t.Helper()
+	const prefix = `id="note-`
+	i := strings.Index(fragment, prefix)
+	require.NotEqual(t, -1, i, "the card fragment must carry the note id: %s", fragment)
+	rest := fragment[i+len(prefix):]
+	j := strings.IndexByte(rest, '"')
+	require.NotEqual(t, -1, j, "the card fragment must close the note id: %s", fragment)
+	return rest[:j]
 }
 
 func freePort(t *testing.T) int {
