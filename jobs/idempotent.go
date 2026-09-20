@@ -11,6 +11,12 @@ import (
 // runs from overlapping, but not two runs in sequence, such as a retried
 // scheduler tick or a redelivered webhook — a more common cause of
 // duplicate work than concurrent overlap.
+//
+// A Guard dedupes only as far as its store reaches. Two Guards that share
+// no store — two replicas each holding their own memory — both report the
+// same key as not done, and both run it. A deployment with more than one
+// replica needs a Guard backed by shared storage; a process-local Guard
+// such as [MemoryGuard] covers one process only.
 type Guard interface {
 	// Done reports whether key has already completed. An error means the
 	// check itself failed (the store was unreachable), which callers must
@@ -35,6 +41,11 @@ type Guard interface {
 // done". Treating it as "not done" would re-run fn whenever the guard's
 // store is briefly unreachable, which is unsafe for a fn whose side effect
 // (an email send, a charge) is not itself idempotent.
+//
+// Single-process scope: Idempotent skips fn only when g's store already
+// holds this key. Two separate Guards over the same fn — two replicas —
+// each run it once. Callers that must run fn exactly once across replicas
+// need a Guard backed by shared storage.
 func Idempotent(ctx context.Context, g Guard, job, key string, fn func(ctx context.Context) error) error {
 	if job == "" {
 		return fmt.Errorf("jobs: Idempotent requires a non-empty job name")
