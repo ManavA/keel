@@ -17,9 +17,13 @@ type memStore struct {
 	sends     []Send
 	outcomes  map[string]Status
 	recordErr map[string]error
+	listErr   error
 }
 
 func (m *memStore) RecentSends(_ context.Context, _ int) ([]Send, error) {
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
 	return m.sends, nil
 }
 
@@ -131,4 +135,78 @@ func TestNewRefusesAnIncompleteJob(t *testing.T) {
 	assert.Error(t, err)
 	_, err = New(Options{Store: &memStore{}})
 	assert.Error(t, err)
+}
+
+// TestABrokenSendLogFailsTheRun: a send list the job cannot read fails the
+// run outright. Without the authoritative send set, "measured, and fine" is a
+// claim this run cannot make, so it reports Fatal rather than a failure
+// count.
+func TestABrokenSendLogFailsTheRun(t *testing.T) {
+	store := &memStore{listErr: errors.New("send log unavailable")}
+	job, err := New(Options{Store: store, Provider: &fakeProvider{}})
+	require.NoError(t, err)
+
+	outcome, err := job.Run(context.Background())
+	assert.Error(t, err)
+	assert.True(t, outcome.Fatal)
+	assert.Equal(t, jobs.StatusFailed, outcome.Status())
+	assert.False(t, outcome.OK())
+	assert.Equal(t, 1, outcome.ExitCode())
+}
+
+// TestARecordWriteFailureCountsAsFailed: a send the provider confirmed but
+// the store refused still counts as work attempted, and lands in Failed
+// rather than vanishing or failing the whole run. The good neighbor records
+// normally, so the run reads partial.
+func TestARecordWriteFailureCountsAsFailed(t *testing.T) {
+	store := &memStore{
+		sends: []Send{
+			{ID: "1", MessageID: "msg-good", Recipient: "a@example.com"},
+			{ID: "2", MessageID: "msg-unwritable", Recipient: "b@example.com"},
+		},
+		recordErr: map[string]error{"2": errors.New("outcome write refused")},
+	}
+	provider := &fakeProvider{statuses: map[string]Status{
+		"msg-good":       StatusConfirmed,
+		"msg-unwritable": StatusConfirmed,
+	}}
+
+	job, err := New(Options{Store: store, Provider: provider})
+	require.NoError(t, err)
+
+	outcome, err := job.Run(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, StatusConfirmed, store.outcomes["1"])
+	assert.NotContains(t, store.outcomes, "2", "refused write stays unrecorded")
+	assert.Equal(t, 2, outcome.Attempted)
+	assert.Equal(t, 1, outcome.Succeeded)
+	assert.Equal(t, 1, outcome.Failed)
+	assert.Equal(t, jobs.StatusPartial, outcome.Status())
+}
+
+// TestASendWithNoMessageIDCountsAsFailed: a send logged with no provider key
+// cannot be checked, so it counts as failed without consulting the provider
+// at all. The checkable neighbor records normally, so the run reads partial.
+func TestASendWithNoMessageIDCountsAsFailed(t *testing.T) {
+	store := &memStore{sends: []Send{
+		{ID: "1", MessageID: "msg-good", Recipient: "a@example.com"},
+		{ID: "2", Recipient: "noid@example.com"},
+	}}
+	provider := &fakeProvider{statuses: map[string]Status{
+		"msg-good": StatusConfirmed,
+	}}
+
+	job, err := New(Options{Store: store, Provider: provider})
+	require.NoError(t, err)
+
+	outcome, err := job.Run(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, StatusConfirmed, store.outcomes["1"])
+	assert.NotContains(t, store.outcomes, "2", "keyless send stays unrecorded")
+	assert.Equal(t, 2, outcome.Attempted)
+	assert.Equal(t, 1, outcome.Succeeded)
+	assert.Equal(t, 1, outcome.Failed)
+	assert.Equal(t, jobs.StatusPartial, outcome.Status())
 }
