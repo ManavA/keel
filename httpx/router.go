@@ -13,8 +13,8 @@ import (
 )
 
 // RouterOptions configures NewRouter. The zero value gives you request ids,
-// request logging, panic recovery, a 30 second timeout and HEAD routed to GET —
-// no CORS, no rate limit, and forwarding headers ignored.
+// security headers, request logging, panic recovery, a 30 second timeout and
+// HEAD routed to GET — no CORS, no rate limit, and forwarding headers ignored.
 type RouterOptions struct {
 	// Logger defaults to slog.Default, and is passed to the middleware that
 	// logs.
@@ -26,6 +26,12 @@ type RouterOptions struct {
 	// forwarding headers, so a service reachable directly cannot be told what
 	// its clients' addresses are.
 	RealIP middleware.RealIPOptions
+
+	// SecurityHeaders, when set, overrides the default security headers. Nil
+	// applies the safe defaults; set SkipSecurityHeaders to leave them out
+	// entirely, for a service whose proxy in front already sets them.
+	SecurityHeaders     *middleware.SecurityHeadersOptions
+	SkipSecurityHeaders bool
 
 	// RequestLog configures the request log. Set SkipRequestLog to leave it out
 	// entirely — for a service that logs somewhere else.
@@ -70,6 +76,8 @@ const DefaultTimeout = 30 * time.Second
 //	RealIP              after the rate limiter it would have no effect, the
 //	                    limiter having already bucketed every client behind the
 //	                    proxy together
+//	SecurityHeaders     above Recoverer, so the 500 it writes carries the same
+//	                    headers as every other response
 //	RequestLog          above Recoverer, so a panic is still logged as a request
 //	Observe             with the request log when Metrics is set, above
 //	                    Recoverer, so a recovered panic is recorded as the
@@ -103,6 +111,14 @@ func NewRouter(opts RouterOptions) *chi.Mux {
 	r.Use(middleware.RequestID(opts.RequestID))
 	r.Use(chimw.GetHead)
 	r.Use(middleware.RealIP(opts.RealIP))
+
+	if !opts.SkipSecurityHeaders {
+		secOpts := middleware.SecurityHeadersOptions{}
+		if opts.SecurityHeaders != nil {
+			secOpts = *opts.SecurityHeaders
+		}
+		r.Use(middleware.SecurityHeaders(secOpts))
+	}
 
 	if !opts.SkipRequestLog {
 		logOpts := opts.RequestLog

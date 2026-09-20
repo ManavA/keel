@@ -154,6 +154,39 @@ func TestRouterCORS(t *testing.T) {
 	assert.Equal(t, "https://app.example.com", rec.Header().Get("Access-Control-Allow-Origin"))
 }
 
+func TestRouterSecurityHeadersByDefault(t *testing.T) {
+	r := newTestRouter(t, httpx.RouterOptions{})
+	r.Get("/", func(http.ResponseWriter, *http.Request) {})
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	assert.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
+	assert.Equal(t, "SAMEORIGIN", rec.Header().Get("X-Frame-Options"))
+	assert.Equal(t, "strict-origin-when-cross-origin", rec.Header().Get("Referrer-Policy"))
+	assert.Empty(t, rec.Header().Get("Strict-Transport-Security"))
+}
+
+func TestRouterSecurityHeadersOverrideAndSkip(t *testing.T) {
+	r := newTestRouter(t, httpx.RouterOptions{
+		SecurityHeaders: &middleware.SecurityHeadersOptions{FrameOptions: "DENY"},
+	})
+	r.Get("/", func(http.ResponseWriter, *http.Request) {})
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	assert.Equal(t, "DENY", rec.Header().Get("X-Frame-Options"))
+
+	r = newTestRouter(t, httpx.RouterOptions{SkipSecurityHeaders: true})
+	r.Get("/", func(http.ResponseWriter, *http.Request) {})
+
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	assert.Empty(t, rec.Header().Get("X-Content-Type-Options"))
+	assert.Empty(t, rec.Header().Get("X-Frame-Options"))
+	assert.Empty(t, rec.Header().Get("Referrer-Policy"))
+}
+
 func TestRouterSkipRequestLog(t *testing.T) {
 	var buf writeCounter
 	r := httpx.NewRouter(httpx.RouterOptions{
