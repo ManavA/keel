@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -89,10 +90,19 @@ const DefaultTimeout = 30 * time.Second
 // all, ServeHTTP goes straight to the NotFound handler without running the
 // middleware chain, so that 404 carries no request id and logs through
 // slog.Default. Register one route and both 404 and 405 behave normally.
-func NewRouter(opts RouterOptions) *chi.Mux {
+//
+// It returns an error when the CORS options cannot work, a "*" origin combined
+// with credentials: browsers reject that pairing, so it must not deploy.
+func NewRouter(opts RouterOptions) (*chi.Mux, error) {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+
+	if opts.CORS != nil {
+		if err := opts.CORS.Validate(); err != nil {
+			return nil, fmt.Errorf("httpx: invalid CORS options: %w", err)
+		}
 	}
 
 	r := chi.NewRouter()
@@ -163,5 +173,5 @@ func NewRouter(opts RouterOptions) *chi.Mux {
 		Error(w, req, http.StatusMethodNotAllowed, nil)
 	})
 
-	return r
+	return r, nil
 }

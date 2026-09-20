@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"errors"
 	"net/http"
 	"slices"
 	"time"
@@ -40,6 +41,17 @@ type CORSOptions struct {
 	MaxAge time.Duration
 }
 
+// Validate reports whether the options can work in a browser. A "*" origin
+// combined with AllowCredentials is rejected by browsers, so it deploys a
+// configuration that works in curl and fails in every browser.
+func (o CORSOptions) Validate() error {
+	if o.AllowCredentials && slices.Contains(o.AllowedOrigins, "*") {
+		return errors.New(`AllowCredentials cannot be combined with the "*" origin; ` +
+			`browsers reject it. List the origins that may send credentials`)
+	}
+	return nil
+}
+
 // CORS answers cross-origin preflights and adds the response headers a browser
 // needs to hand a response to JavaScript.
 //
@@ -51,9 +63,8 @@ type CORSOptions struct {
 // reject that pairing, so the alternative is a configuration that deploys,
 // works in curl, and fails in every browser.
 func CORS(opts CORSOptions) func(http.Handler) http.Handler {
-	if opts.AllowCredentials && slices.Contains(opts.AllowedOrigins, "*") {
-		panic(`middleware.CORS: AllowCredentials cannot be combined with the "*" origin; ` +
-			`browsers reject it. List the origins that may send credentials.`)
+	if err := opts.Validate(); err != nil {
+		panic("middleware.CORS: " + err.Error())
 	}
 	if len(opts.AllowedOrigins) == 0 {
 		return denyCORS
