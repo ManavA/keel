@@ -3,7 +3,7 @@ package auth
 import (
 	"bufio"
 	"context"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // G505: SHA-1 is mandated by the HIBP k-anonymity range protocol, not a security choice
 	"encoding/hex"
 	"fmt"
 	"net/http"
