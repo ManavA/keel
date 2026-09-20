@@ -39,7 +39,7 @@ var profiles = []profile{
 			"app", "auth", "config", "events", "httpx", "jobs", "log", "mail", "pg", "search",
 		},
 		migrations: []string{
-			"auth: 0001_auth_users through 0005_auth_login_attempts",
+			"auth: 0001_auth_users through 0006_auth_session_windows",
 			"001_notes",
 			"002_notes_owner",
 		},

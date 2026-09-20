@@ -59,7 +59,7 @@ Profiles:
 	minimal
 		a Postgres-backed notes API with local auth, search and a background job.
 		packages: app, auth, config, events, httpx, jobs, log, mail, pg, search
-		migrations: auth: 0001_auth_users through 0005_auth_login_attempts; 001_notes; 002_notes_owner
+		migrations: auth: 0001_auth_users through 0006_auth_session_windows; 001_notes; 002_notes_owner
 
 	standard
 		the minimal API plus operator auth, an outbox relay and idempotent writes.
