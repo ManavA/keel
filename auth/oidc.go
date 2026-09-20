@@ -94,7 +94,7 @@ type OIDCOptions struct {
 // IssuerURL and Audience for common providers:
 //
 //	Provider   IssuerURL                              Audience
-//	Auth0      https://<tenant>.auth0.com/            the API identifier configured in Auth0
+//	Auth0      https://<tenant>.auth0.com/            the application Client ID (ID tokens; the API identifier is for access tokens)
 //	Google     https://accounts.google.com             your OAuth client ID
 //	Apple      https://appleid.apple.com               your Services ID (client ID)
 //	Cognito    https://cognito-idp.<region>.amazonaws.com/<pool id>   your app client ID
