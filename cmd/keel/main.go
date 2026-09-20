@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -29,13 +30,22 @@ func run(argv []string) int {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `keel scaffolds projects built on keel.
+	var b strings.Builder
+	fmt.Fprint(&b, `keel scaffolds projects built on keel.
 
 Usage:
-	keel new <name> [-module <module-path>]
+	keel new <name> [-module <module-path>] [-profile <profile>]
 
-	new creates <name>/ from the minimal example: a Postgres-backed service
-	with a small JSON API, migrations, health checks and a background job.
+	new creates <name>/ from one of the maintained examples.
 	<module-path> sets the go.mod module; it defaults to <name>.
+	-profile picks the template; the default is minimal.
+
+Profiles:
 `)
+	for _, p := range profiles {
+		fmt.Fprintf(&b, "\n\t%s\n\t\t%s.\n", p.name, p.blurb)
+		fmt.Fprintf(&b, "\t\tpackages: %s\n", strings.Join(p.packages, ", "))
+		fmt.Fprintf(&b, "\t\tmigrations: %s\n", strings.Join(p.migrations, "; "))
+	}
+	fmt.Fprint(os.Stderr, b.String())
 }
