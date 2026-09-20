@@ -3,7 +3,7 @@ package media
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
+	"crypto/md5" //nolint:gosec // G501: MD5 is GCS's server-side integrity checksum, not a security primitive
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -98,7 +98,7 @@ const maxPutAttempts = 3
 func (s *GCSStore) Put(ctx context.Context, key string, body []byte, contentType string) error {
 	sum := sha256.Sum256(body)
 	wantSHA256 := hex.EncodeToString(sum[:])
-	wantMD5 := md5.Sum(body)
+	wantMD5 := md5.Sum(body) //nolint:gosec // G401: MD5 is GCS's server-side integrity checksum, sent via Writer.MD5
 
 	var err error
 	for attempt := 1; attempt <= maxPutAttempts; attempt++ {

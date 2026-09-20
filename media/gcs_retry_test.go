@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"hash/crc32"
 	"io"
 	"mime"
@@ -150,7 +151,7 @@ func (f *fakeGCS) handleUpload(w http.ResponseWriter, r *http.Request) {
 	var media []byte
 	for {
 		part, err := mr.NextPart()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
