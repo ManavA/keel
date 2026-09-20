@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tutorial: your first keel service — keel showcase</title>
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<nav class="top"><a href="index.html">keel showcase</a> · <a href="tour.html">Tour</a> · <a href="gallery.html">Gallery</a> · <strong>Tutorial</strong></nav>
+<main>
+<h1>Tutorial: your first keel service</h1>
+<p>Scaffold the notes example, run it against Postgres, and walk the API and the browser UI.
+You need Go 1.26 and Docker. Every command below was run to write this page.</p>
+
+<h2>1. Scaffold a project</h2>
+<p>From a keel checkout, <code>keel new</code> copies the minimal profile — a Postgres-backed
+notes API with local auth, search, a background job and a server-rendered web UI — into a new
+directory:</p>
+<pre><code>go run ./cmd/keel new notesapp -module example.com/notesapp
+# created notesapp/ from keel's minimal profile: a Postgres-backed notes API
+# with local auth, search, a background job and a server-rendered web UI.</code></pre>
+<p>Until keel has a published release, point the require at your checkout, then tidy and build:</p>
+<pre><code>cd notesapp
+go mod edit -replace github.com/ManavA/keel=&lt;path-to-keel&gt;
+go mod tidy
+go build ./...</code></pre>
+
+<h2>2. Start Postgres and serve</h2>
+<p>Only <code>DATABASE_URL</code> is required; every other default is chosen so the service
+comes up under a compose file holding an app and a database:</p>
+<pre><code>docker run -d --name keel-pg -e POSTGRES_USER=keel \
+  -e POSTGRES_PASSWORD=keel -e POSTGRES_DB=keel -p 5432:5432 postgres:16
+DATABASE_URL='postgres://keel:keel@127.0.0.1:5432/keel?sslmode=disable' go run .</code></pre>
+<p>The service applies its embedded migrations before it listens, then reports ready:</p>
+<pre><code>{"msg":"migrations complete","applied":2,"already_applied":0}
+curl -s localhost:8080/readyz
+{"status":"ok","build":{"revision":"unknown"},"checks":{"database":"ok","search":"ok"}}</code></pre>
+
+<h2>3. Walk the API</h2>
+<p>Sign up for a bearer token, then create, list and search notes. Every notes request needs
+the token; without one the API answers 401.</p>
+<pre><code>TOKEN=$(curl -s -X POST localhost:8080/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"password123"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+
+curl -s localhost:8080/api/notes \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"Roof repair quote","body":"Slate tiles, south side"}'
+# {"id":"&lt;uuid&gt;","user_id":"&lt;uuid&gt;","title":"Roof repair quote",
+#  "body":"Slate tiles, south side","created_at":"..."}
+
+curl -s 'localhost:8080/api/notes?limit=2' -H "Authorization: Bearer $TOKEN"
+curl -s 'localhost:8080/api/notes/search?q=tile' -H "Authorization: Bearer $TOKEN"</code></pre>
+<p>In development the verification link is written to the service log, so the signup → verify
+→ login flow can be walked through from the terminal.</p>
+
+<h2>4. Open the browser UI</h2>
+<p>The same service serves HTML. The landing page at <code>/</code> needs no session; an
+unsigned visit to <code>/app</code> redirects to <code>/login</code>, while
+<code>/notes</code> without a session answers 401. Sign up through the form, follow the
+verification link from the log, and the dashboard lists the same rows the API just returned —
+the form writes through the same store, index and event path as a JSON create. A missing title
+is a 422 with the form re-rendered around a flash.</p>
+<p>Pages are shells composed out of blocks; a fragment is a block rendered on its own for htmx,
+never a second copy. One stylesheet holds both themes — a page picks its with nothing but
+<code>&lt;html data-theme="..."&gt;</code> — and htmx is vendored with its version pinned.</p>
+
+<h2>Next</h2>
+<ul>
+<li><a href="tour.html">Tour the packages</a> behind the service: retry, textpolicy, flags, jobs, httpx, config.</li>
+<li><a href="gallery.html">Browse the template gallery</a>: every block above, in both themes.</li>
+<li>Try the <code>standard</code> profile (<code>keel new -profile standard</code>): the minimal API plus operator auth, an outbox relay and idempotent writes.</li>
+</ul>
+</main>
+<footer>Verified against the minimal example on this branch: scaffold, build, migrate, signup,
+create, list, search, and every page status quoted above.</footer>
+</body>
+</html>
