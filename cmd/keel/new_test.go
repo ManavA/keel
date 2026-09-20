@@ -22,8 +22,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jackc/pgx/v5"
+
 	keellog "github.com/ManavA/keel/log"
 	"github.com/ManavA/keel/pg/testdb"
+	"github.com/ManavA/keel/webhooks"
 )
 
 // A scaffold nobody boots stops working quietly. TestMain starts the shared
@@ -149,6 +152,24 @@ func TestProfilesDescribePackagesAndMigrations(t *testing.T) {
 	for _, want := range []string{"auth", "admin", "outbox", "idempotency", "001_fullstack_notes"} {
 		assert.Contains(t, strings.Join(standard.migrations, " "), want, "standard must list %s", want)
 	}
+
+	api := byName["api"]
+	for _, want := range []string{"app", "auth", "search", "mail", "jobs"} {
+		assert.Contains(t, api.packages, want, "api must list %s", want)
+	}
+	assert.Contains(t, strings.Join(api.migrations, " "), "001_notes")
+
+	worker := byName["worker"]
+	for _, want := range []string{"config", "jobs", "log", "pg"} {
+		assert.Contains(t, worker.packages, want, "worker must list %s", want)
+	}
+	assert.Contains(t, strings.Join(worker.migrations, " "), "001_worker_heartbeats")
+
+	webhook := byName["webhook"]
+	for _, want := range []string{"app", "httpx", "pg", "webhooks"} {
+		assert.Contains(t, webhook.packages, want, "webhook must list %s", want)
+	}
+	assert.Contains(t, strings.Join(webhook.migrations, " "), "001_webhook_deliveries")
 }
 
 func TestNewGeneratesAMinimalProject(t *testing.T) {
@@ -204,6 +225,69 @@ func TestNewStandardProfileGeneratesFullstackShape(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(dir, "go.mod"))
 	require.NoError(t, err)
 	assert.Contains(t, string(raw), "module example.com/portal\n")
+	assert.Contains(t, string(raw), "require "+keelModule+" "+keelVersion+"\n")
+}
+
+func TestNewApiProfileGeneratesJSONOnlyShape(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "api")
+	require.NoError(t, createProject(dir, "example.com/api", "api"))
+
+	for _, name := range []string{
+		"main.go", "config.go", "handlers.go", "notes.go", "auth.go", "main_test.go",
+		"README.md",
+		filepath.Join("migrations", "001_notes.up.sql"),
+		filepath.Join("migrations", "001_notes.down.sql"),
+	} {
+		assert.FileExists(t, filepath.Join(dir, name))
+	}
+	assert.NoFileExists(t, filepath.Join(dir, "ui.go"), "api must not carry the minimal profile's browser UI")
+	assert.NoDirExists(t, filepath.Join(dir, "templates"), "api must not carry templates")
+	assert.NoDirExists(t, filepath.Join(dir, "static"), "api must not carry static assets")
+
+	raw, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "module example.com/api\n")
+	assert.Contains(t, string(raw), "require "+keelModule+" "+keelVersion+"\n")
+}
+
+func TestNewWorkerProfileGeneratesJobsOnlyShape(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sweeper")
+	require.NoError(t, createProject(dir, "example.com/sweeper", "worker"))
+
+	for _, name := range []string{
+		"main.go", "config.go", "heartbeat.go", "main_test.go",
+		"README.md",
+		filepath.Join("migrations", "001_worker_heartbeats.up.sql"),
+		filepath.Join("migrations", "001_worker_heartbeats.down.sql"),
+	} {
+		assert.FileExists(t, filepath.Join(dir, name))
+	}
+	assert.NoFileExists(t, filepath.Join(dir, "handlers.go"), "worker must not carry an HTTP API")
+	assert.NoFileExists(t, filepath.Join(dir, "notes.go"), "worker must not carry the notes table")
+
+	raw, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "module example.com/sweeper\n")
+	assert.Contains(t, string(raw), "require "+keelModule+" "+keelVersion+"\n")
+}
+
+func TestNewWebhookProfileGeneratesReceiverShape(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "hook")
+	require.NoError(t, createProject(dir, "example.com/hook", "webhook"))
+
+	for _, name := range []string{
+		"main.go", "config.go", "receiver.go", "main_test.go",
+		"README.md",
+		filepath.Join("migrations", "001_webhook_deliveries.up.sql"),
+		filepath.Join("migrations", "001_webhook_deliveries.down.sql"),
+	} {
+		assert.FileExists(t, filepath.Join(dir, name))
+	}
+	assert.NoFileExists(t, filepath.Join(dir, "auth.go"), "webhook answers signatures, not sessions")
+
+	raw, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "module example.com/hook\n")
 	assert.Contains(t, string(raw), "require "+keelModule+" "+keelVersion+"\n")
 }
 
@@ -344,6 +428,182 @@ func TestStandardProfileBuildsAndBoots(t *testing.T) {
 		`{"email":"admin@example.com","password":"adminpassword123"}`)
 	require.Equal(t, http.StatusOK, status, "POST /admin/login: %s", adminSession)
 	assert.Contains(t, adminSession, "admin@example.com")
+}
+
+// TestApiProfileBuildsAndBoots is the api profile's acceptance check: a project
+// made without the browser UI builds and boots against a real database, and
+// the JSON API answers while the UI paths stay 404.
+func TestApiProfileBuildsAndBoots(t *testing.T) {
+	db := testdb.Shared(t)
+
+	dir := filepath.Join(t.TempDir(), "api")
+	require.NoError(t, createProject(dir, "example.com/api", "api"))
+
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	require.NoError(t, err)
+	goRun := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("go", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "go %s: %s", strings.Join(args, " "), out)
+	}
+	goRun("mod", "edit", "-replace", keelModule+"="+root)
+	goRun("mod", "tidy")
+	bin := filepath.Join(dir, "api")
+	goRun("build", "-o", bin, ".")
+
+	port := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"DATABASE_URL="+db.URL,
+		"PORT="+strconv.Itoa(port),
+	)
+	var serverLog bytes.Buffer
+	cmd.Stdout = &serverLog
+	cmd.Stderr = &serverLog
+	require.NoError(t, cmd.Start())
+
+	base := "http://127.0.0.1:" + strconv.Itoa(port)
+	require.NoError(t, waitForStatus(t, base+"/readyz", http.StatusOK, time.Minute),
+		"api scaffold never became ready; server log:\n%s", &serverLog)
+
+	token := signupToken(t, base, "api-owner@example.com")
+	status, created := postJSON(t, base+"/api/notes", token, `{"title":"Roof repair","body":"Slate tiles"}`)
+	require.Equal(t, http.StatusCreated, status, "POST /api/notes: %s", created)
+	assert.Contains(t, created, "Roof repair")
+
+	searched := getBody(t, base+"/api/notes/search?q=Roof", token)
+	assert.Contains(t, searched, "Roof repair")
+
+	// And the browser surface is gone: GET / is a 404, not a landing page.
+	resp, err := http.Get(base + "/") //nolint:gosec // G107: test polls its own server
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+// TestWorkerProfileBuildsAndBoots is the worker profile's acceptance check: a
+// project with no HTTP server builds and proves it runs against a real
+// database by writing heartbeat rows. The test polls the table the migration
+// created, so a worker that starts but never ticks fails rather than passes.
+func TestWorkerProfileBuildsAndBoots(t *testing.T) {
+	db := testdb.Shared(t)
+
+	dir := filepath.Join(t.TempDir(), "sweeper")
+	require.NoError(t, createProject(dir, "example.com/sweeper", "worker"))
+
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	require.NoError(t, err)
+	goRun := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("go", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "go %s: %s", strings.Join(args, " "), out)
+	}
+	goRun("mod", "edit", "-replace", keelModule+"="+root)
+	goRun("mod", "tidy")
+	bin := filepath.Join(dir, "sweeper")
+	goRun("build", "-o", bin, ".")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"DATABASE_URL="+db.URL,
+		"HEARTBEAT_INTERVAL=1s",
+		"HEARTBEAT_JOB=boot-heartbeat",
+	)
+	var workerLog bytes.Buffer
+	cmd.Stdout = &workerLog
+	cmd.Stderr = &workerLog
+	require.NoError(t, cmd.Start())
+
+	conn, err := pgx.Connect(ctx, db.URL)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close(context.Background()) }()
+
+	deadline := time.Now().Add(time.Minute)
+	for {
+		var count int
+		err := conn.QueryRow(ctx,
+			`SELECT count(*) FROM worker_heartbeats WHERE job = $1`, "boot-heartbeat").Scan(&count)
+		if err == nil && count > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("worker never wrote a heartbeat (last error: %v); log:\n%s", err, &workerLog)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// TestWebhookProfileBuildsAndBoots is the webhook profile's acceptance check:
+// a project made with the webhook profile builds and boots against a real
+// database, stores a signed delivery at 202, and refuses an unsigned one.
+func TestWebhookProfileBuildsAndBoots(t *testing.T) {
+	db := testdb.Shared(t)
+
+	dir := filepath.Join(t.TempDir(), "hook")
+	require.NoError(t, createProject(dir, "example.com/hook", "webhook"))
+
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	require.NoError(t, err)
+	goRun := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("go", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "go %s: %s", strings.Join(args, " "), out)
+	}
+	goRun("mod", "edit", "-replace", keelModule+"="+root)
+	goRun("mod", "tidy")
+	bin := filepath.Join(dir, "hook")
+	goRun("build", "-o", bin, ".")
+
+	port := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"DATABASE_URL="+db.URL,
+		"WEBHOOK_SECRET=test-boot-secret",
+		"PORT="+strconv.Itoa(port),
+	)
+	var serverLog bytes.Buffer
+	cmd.Stdout = &serverLog
+	cmd.Stderr = &serverLog
+	require.NoError(t, cmd.Start())
+
+	base := "http://127.0.0.1:" + strconv.Itoa(port)
+	require.NoError(t, waitForStatus(t, base+"/readyz", http.StatusOK, time.Minute),
+		"webhook scaffold never became ready; server log:\n%s", &serverLog)
+
+	body := `{"id":"abc"}`
+	signed, err := http.NewRequestWithContext(context.Background(),
+		http.MethodPost, base+"/hooks/events", strings.NewReader(body))
+	require.NoError(t, err)
+	signed.Header.Set("Content-Type", "application/json")
+	signed.Header.Set(webhooks.TopicHeader, "note.created")
+	signed.Header.Set(webhooks.SignatureHeader, webhooks.Sign("test-boot-secret", []byte(body)))
+	status, stored := doRequest(t, signed)
+	require.Equal(t, http.StatusAccepted, status, "POST /hooks/events: %s", stored)
+	assert.Contains(t, stored, "note.created")
+
+	unsigned, err := http.NewRequestWithContext(context.Background(),
+		http.MethodPost, base+"/hooks/events", strings.NewReader(body))
+	require.NoError(t, err)
+	unsigned.Header.Set("Content-Type", "application/json")
+	unsigned.Header.Set(webhooks.TopicHeader, "note.created")
+	status, _ = doRequest(t, unsigned)
+	assert.Equal(t, http.StatusUnauthorized, status)
 }
 
 // TestMinimalProfileBuildsAndBoots is the minimal profile's acceptance check:
@@ -574,6 +834,8 @@ func freePort(t *testing.T) int {
 
 // waitForStatus polls url until it answers want, so migrations and the first
 // listen do not race the assertions.
+//
+//nolint:unparam // every scaffold's readiness is 200; the parameter keeps the failure message honest about what was wanted.
 func waitForStatus(t *testing.T, url string, want int, timeout time.Duration) error {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
