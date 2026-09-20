@@ -1,6 +1,6 @@
 // Package pg is a Postgres-backed implementation of the auth package's
-// storage interfaces: UserStore, SessionStore, VerificationStore and
-// PasswordResetStore. It lives in its own package, importing both auth and
+// storage interfaces: UserStore, SessionStore, VerificationStore,
+// PasswordResetStore and AttemptStore. It lives in its own package, importing both auth and
 // keel's pg package, rather than inside auth itself, so auth continues to
 // build without ever importing database/sql or pgx.
 //
