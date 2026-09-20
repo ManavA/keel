@@ -560,12 +560,14 @@ func TestRelay_PermanentlyFailingRowParksAndOthersFlow(t *testing.T) {
 // enqueueOneWithPartition is enqueueOne for a row carrying a partition key.
 // Rows sharing a key belong to one aggregate whose delivery order matters;
 // see Options.OrderedPartitions.
-func enqueueOneWithPartition(t *testing.T, pool *pgxpool.Pool, payload []byte, partition string) string {
+// The partition is fixed: every ordering test in this file shares one
+// aggregate, so a parameter would only ever carry "order-1".
+func enqueueOneWithPartition(t *testing.T, pool *pgxpool.Pool, payload []byte) string {
 	t.Helper()
 	ctx := context.Background()
 
 	require.NoError(t, keelpg.InTx(ctx, pool, func(tx pgx.Tx) error {
-		return outbox.Enqueue(ctx, tx, outbox.Event{Topic: "orders.events", Payload: payload, PartitionKey: partition})
+		return outbox.Enqueue(ctx, tx, outbox.Event{Topic: "orders.events", Payload: payload, PartitionKey: "order-1"})
 	}))
 
 	var id string
@@ -585,8 +587,8 @@ func TestRelay_OrderedPartitionsHoldLaterRowUntilHeadSucceeds(t *testing.T) {
 	pool := openEmptyPool(t)
 	ctx := context.Background()
 
-	head := enqueueOneWithPartition(t, pool, []byte(`{"seq":1}`), "order-1")
-	tail := enqueueOneWithPartition(t, pool, []byte(`{"seq":2}`), "order-1")
+	head := enqueueOneWithPartition(t, pool, []byte(`{"seq":1}`))
+	tail := enqueueOneWithPartition(t, pool, []byte(`{"seq":2}`))
 
 	publisher := newFakePublisher()
 	publisher.failOnce(head)
@@ -640,8 +642,8 @@ func TestRelay_UnorderedByDefaultPublishesAroundBlockedHead(t *testing.T) {
 	pool := openEmptyPool(t)
 	ctx := context.Background()
 
-	head := enqueueOneWithPartition(t, pool, []byte(`{"seq":1}`), "order-1")
-	tail := enqueueOneWithPartition(t, pool, []byte(`{"seq":2}`), "order-1")
+	head := enqueueOneWithPartition(t, pool, []byte(`{"seq":1}`))
+	tail := enqueueOneWithPartition(t, pool, []byte(`{"seq":2}`))
 
 	publisher := newFakePublisher()
 	publisher.failAlways(head)
