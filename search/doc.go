@@ -21,8 +21,9 @@
 // The search/meili subpackage wraps Meilisearch and adds facets, typo
 // tolerance and synonyms. Switch to it once result-set size, facets, or
 // typo tolerance justify running Meilisearch — see its own package doc for
-// what it adds and the gotchas specific to it (settings drift, filter value
-// quoting, result caps). It is a separate package, not a type in this one,
+// what it adds, the gotchas specific to it (settings drift, filter value
+// quoting, result caps), and the cutover guide for moving a live service
+// from PostgresIndex over. It is a separate package, not a type in this one,
 // so that a caller using only PostgresIndex does not pull in the
 // Meilisearch client.
 //
