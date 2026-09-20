@@ -6,8 +6,11 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sort"
+	"sync"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
@@ -328,4 +331,52 @@ func TestRunRollsBackAFileWhoseLedgerRowCannotBeWritten(t *testing.T) {
 
 	assert.False(t, tableExists(t, pool, "survivor"),
 		"the file committed without a ledger row, so the next run will apply it again")
+}
+
+func TestConcurrentRunsSerializeOnALock(t *testing.T) {
+	// Two deployers running the same migrations at once must not race. Both
+	// runs start together, so without a lock the loser reads an empty ledger
+	// while the winner is inside pg_sleep, applies the same file, and fails
+	// on the DDL or the ledger's primary key.
+	pool := freshSchema(t)
+	ctx := context.Background()
+
+	slow := map[string]string{
+		"001_slow.up.sql": `select pg_sleep(2);
+			create table serialized (id int primary key);`,
+		"002_quick.up.sql": `create table serialized_two (id int primary key);`,
+	}
+
+	start := make(chan struct{})
+	type outcome struct {
+		result migrate.Result
+		err    error
+	}
+	outcomes := make(chan outcome, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			result, err := migrate.Run(ctx, pool, migrate.Options{FS: files(slow)})
+			outcomes <- outcome{result, err}
+		}()
+	}
+	begin := time.Now()
+	close(start)
+	wg.Wait()
+	elapsed := time.Since(begin)
+	close(outcomes)
+
+	var applied []string
+	for o := range outcomes {
+		require.NoError(t, o.err, "the run that loses the race must wait, not fail")
+		applied = append(applied, o.result.Applied...)
+	}
+	sort.Strings(applied)
+	assert.Equal(t, []string{"001_slow.up.sql", "002_quick.up.sql"}, applied,
+		"each file is applied exactly once across both runs")
+	assert.GreaterOrEqual(t, elapsed, 2*time.Second,
+		"the second run waited for the first instead of running alongside it")
 }
