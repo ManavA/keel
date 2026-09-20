@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>keel — reusable Go packages for a web backend</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="site">
+<span class="brand">keel</span><a href="./">Home</a><a href="tutorial/">Tutorial</a><a href="showcase/">Showcase</a>
+</nav>
+
+<h1>keel</h1>
+<p>Reusable Go packages for building a web backend: configuration, structured
+logging, HTTP serving, Postgres access and migrations, search, background jobs,
+events and transactional email. Each package is usable on its own, and every
+package that talks to an external service ships an in-process default, so a
+project running only Postgres gets a complete backend.</p>
+
+<p><a href="tutorial/">Read the tutorial: build a notes backend with keel</a>,
+or <a href="showcase/">browse the package showcase</a>.</p>
+
+<h2>Install</h2>
+<pre><code>git clone https://github.com/ManavA/keel.git keel</code></pre>
+<p>Go 1.26 or later. There is no published release yet, so new projects
+point at a checkout with a <code>replace</code> directive (the tutorial
+shows how). Docker is needed for the local Postgres in the tutorial, and
+by <code>pg/testdb</code>.</p>
+
+<h2>Start from a working service</h2>
+<pre><code>go run ./cmd/keel new myservice
+cd myservice
+go mod edit -replace github.com/ManavA/keel=../keel
+go mod tidy
+DATABASE_URL='postgres://keel:keel@127.0.0.1:5432/keel?sslmode=disable' go run .</code></pre>
+<p>That scaffolds the <code>minimal</code> profile (a notes API over Postgres)
+into <code>myservice/</code> and starts that same tree against a local
+database on :8080. The
+<a href="tutorial/">tutorial</a> walks through what each part does.</p>
+
+<h2>Packages at a glance</h2>
+<table>
+<tr><th>Package</th><th>Description</th></tr>
+<tr><td><code>config</code></td><td>Environment loading, validation, secret trimming and redaction</td></tr>
+<tr><td><code>log</code></td><td>JSON <code>slog</code> handler with request ids and redacted credentials</td></tr>
+<tr><td><code>httpx</code></td><td>HTTP server, chi router, middleware, health endpoints</td></tr>
+<tr><td><code>pg</code></td><td>pgx v5 pool, transactions, offset and keyset paging</td></tr>
+<tr><td><code>pg/migrate</code></td><td>Migration runner with a ledger, and a replay check</td></tr>
+<tr><td><code>pg/testdb</code></td><td>Docker Postgres harness for tests</td></tr>
+<tr><td><code>search</code></td><td>Document index over Postgres, or Meilisearch via <code>search/meili</code></td></tr>
+<tr><td><code>jobs</code></td><td>Background work with run outcomes, an in-process scheduler, and <code>jobs/cloudrun</code> triggers</td></tr>
+<tr><td><code>auth</code></td><td>Local, Firebase and OIDC auth; sessions, verification, reset</td></tr>
+<tr><td><code>app</code></td><td>Service lifecycle: logger, pool, migrations, router, jobs, shutdown</td></tr>
+</table>
+<p>The full list, with defaults and external options, is in the
+<a href="showcase/">showcase</a>.</p>
+
+<footer>
+<p>Source: <a href="https://github.com/ManavA/keel">github.com/ManavA/keel</a>
+(Apache 2.0). This site is published from <code>site/</code> on pushes to
+<code>main</code>.</p>
+</footer>
+</div>
+</body>
+</html>

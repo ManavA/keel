@@ -1,10 +1,14 @@
 # keel
 
+[![Pages](https://github.com/ManavA/keel/actions/workflows/pages.yml/badge.svg)](https://github.com/ManavA/keel/actions/workflows/pages.yml)
+
 Reusable Go packages for building a web backend: configuration, structured
 logging, HTTP serving, Postgres access and migrations, search, background jobs,
 events and transactional email. Each package is usable on its own, and every
 package that talks to an external service ships an in-process default, so a
 project running only Postgres gets a complete backend.
+
+Tutorial and package showcase: https://manava.github.io/keel/
 
 ## Install
 
