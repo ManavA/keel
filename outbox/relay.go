@@ -58,6 +58,17 @@ type Options struct {
 	// poisoned row is retried at the capped backoff interval forever.
 	MaxAttempts int
 
+	// OrderedPartitions makes Relay publish rows sharing a non-empty
+	// partition key (see Event.PartitionKey) in creation order: a row is
+	// held out of the batch while an older unpublished row with the same
+	// key exists, and a row that fails holds the rest of its partition
+	// for the remainder of the tick. Rows with an empty key publish
+	// independently, as do rows in different partitions. A parked head
+	// row does not block its partition: it will never publish, so the
+	// rows behind it flow. False keeps the long-standing behavior, where
+	// a backing-off head row does not hold the rows behind it.
+	OrderedPartitions bool
+
 	// Metrics receives one publish count, lag and attempt count per
 	// relayed row, and one failure count per failed attempt. Nil records
 	// nothing.
@@ -121,11 +132,12 @@ func (r *Relay) Run(ctx context.Context) error {
 }
 
 type row struct {
-	id        string
-	topic     string
-	payload   []byte
-	attempts  int
-	createdAt time.Time
+	id           string
+	topic        string
+	payload      []byte
+	partitionKey string
+	attempts     int
+	createdAt    time.Time
 }
 
 // Tick runs one poll-publish cycle and reports how many rows it published.
@@ -138,7 +150,18 @@ func (r *Relay) Tick(ctx context.Context) (published int, err error) {
 		return 0, err
 	}
 
+	// blocked holds the partitions whose head row already failed in this
+	// tick. The fetch holds a partition's later rows out of the batch when
+	// the head is still unpublished, but a head that fails mid-tick leaves
+	// its partition's later rows already fetched, so they are skipped
+	// here instead of being attempted out of order.
+	blocked := map[string]bool{}
+
 	for _, rw := range rows {
+		if r.opts.OrderedPartitions && rw.partitionKey != "" && blocked[rw.partitionKey] {
+			continue
+		}
+
 		publishErr := retry.Do(ctx, func() error {
 			return r.opts.Publisher.Publish(ctx, rw.topic, Envelope{ID: rw.id, Payload: rw.payload})
 		}, r.opts.PublishRetry)
@@ -149,6 +172,9 @@ func (r *Relay) Tick(ctx context.Context) (published int, err error) {
 				r.opts.Logger.ErrorContext(ctx, "outbox relay: record publish failure",
 					"id", rw.id, "topic", rw.topic, "publish_error", publishErr, "error", markErr)
 			}
+			if r.opts.OrderedPartitions && rw.partitionKey != "" {
+				blocked[rw.partitionKey] = true
+			}
 			continue
 		}
 
@@ -158,6 +184,9 @@ func (r *Relay) Tick(ctx context.Context) (published int, err error) {
 			// and republishes it. See the package doc.
 			r.opts.Logger.ErrorContext(ctx, "outbox relay: publish succeeded but marking it published failed; "+
 				"the row will be republished", "id", rw.id, "topic", rw.topic, "error", markErr)
+			if r.opts.OrderedPartitions && rw.partitionKey != "" {
+				blocked[rw.partitionKey] = true
+			}
 			continue
 		}
 
@@ -172,12 +201,22 @@ func (r *Relay) fetch(ctx context.Context) ([]row, error) {
 	// A failed row is hidden until next_attempt_at, so it cannot hold a slot
 	// in every batch; once due it is fetched in age order like any other row.
 	// A parked row is never fetched again.
-	rows, err := r.db.Query(ctx,
-		"select id, topic, payload, attempts, created_at from "+Table+
-			" where published_at is null and parked_at is null"+
-			" and (next_attempt_at is null or next_attempt_at <= now())"+
-			" order by created_at limit $1",
-		r.opts.BatchSize)
+	//
+	// In ordered mode a row with a non-empty partition key is additionally
+	// held out while an older row with the same key is still unpublished,
+	// so a head row hidden in its backoff still holds its partition. Rows
+	// with an empty key, and the head row of each partition, pass through.
+	query := "select id, topic, payload, partition_key, attempts, created_at from " + Table +
+		" where published_at is null and parked_at is null" +
+		" and (next_attempt_at is null or next_attempt_at <= now())"
+	if r.opts.OrderedPartitions {
+		query += " and (partition_key = '' or not exists (select 1 from " + Table + " older" +
+			" where older.partition_key = " + Table + ".partition_key" +
+			" and older.published_at is null and older.parked_at is null" +
+			" and older.created_at < " + Table + ".created_at))"
+	}
+	query += " order by created_at limit $1"
+	rows, err := r.db.Query(ctx, query, r.opts.BatchSize)
 	if err != nil {
 		return nil, fmt.Errorf("outbox: fetch unpublished rows: %w", err)
 	}
@@ -186,7 +225,7 @@ func (r *Relay) fetch(ctx context.Context) ([]row, error) {
 	var out []row
 	for rows.Next() {
 		var rw row
-		if err := rows.Scan(&rw.id, &rw.topic, &rw.payload, &rw.attempts, &rw.createdAt); err != nil {
+		if err := rows.Scan(&rw.id, &rw.topic, &rw.payload, &rw.partitionKey, &rw.attempts, &rw.createdAt); err != nil {
 			return nil, fmt.Errorf("outbox: scan unpublished row: %w", err)
 		}
 		out = append(out, rw)
