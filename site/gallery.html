@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Template gallery — keel showcase</title>
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<nav class="top"><a href="index.html">keel showcase</a> · <a href="tour.html">Tour</a> · <strong>Gallery</strong> · <a href="tutorial.html">Tutorial</a></nav>
+<main>
+<h1>Template gallery</h1>
+<p>Every block the notes UI is built from, rendered from the real templates with the real
+stylesheets, in both themes. The landing theme is the public face; the dashboard theme is the
+signed-in workspace. Buttons and forms are inert here: the markup is identical, the service behind
+it is not running.</p>
+<p>Sources live at <code>examples/minimal/templates/blocks/</code>; the themes at
+<code>examples/minimal/static/css/tokens.css</code>, where a page picks its theme with nothing but
+<code>&lt;html data-theme="..."&gt;</code>.</p>
+<section id="empty_state">
+<h2><code>empty_state</code></h2>
+<p>The list's empty branch. note_list renders this when there are no notes to show. No data: the block takes none.</p>
+<h3>landing theme</h3>
+<iframe title="empty_state block in the landing theme" src="gallery/empty_state-landing.html" style="height:140px" loading="lazy"></iframe>
+<p class="open"><a href="gallery/empty_state-landing.html">Open standalone</a></p>
+<h3>dashboard theme</h3>
+<iframe title="empty_state block in the dashboard theme" src="gallery/empty_state-dashboard.html" style="height:140px" loading="lazy"></iframe>
+<p class="open"><a href="gallery/empty_state-dashboard.html">Open standalone</a></p>
+</section>
+<section id="flash">
+<h2><code>flash</code></h2>
+<p>The one inline message. A form re-rendered with a 422 carries the reason here. Rendered with .Flash set to "Title is required."</p>
+<h3>landing theme</h3>
+<iframe title="flash block in the landing theme" src="gallery/flash-landing.html" style="height:120px" loading="lazy"></iframe>
+<p class="open"><a href="gallery/flash-landing.html">Open standalone</a></p>
+<h3>dashboard theme</h3>
+<iframe title="flash block in the dashboard theme" src="gallery/flash-dashboard.html" style="height:120px" loading="lazy"></iframe>
+<p class="open"><a href="gallery/flash-dashboard.html">Open standalone</a></p>
+</section>
+<section id="note_card">
+<h2><code>note_card</code></h2>
+<p>One note in the list. Deleting goes through hx-delete, retargeting the card itself. Rendered with one stored note, title and body set.</p>
+<h3>landing theme</h3>
+<iframe title="note_card block in the landing theme" src="gallery/note_card-landing.html" style="height:220px" loading="lazy"></iframe>
+<p class="open"><a href="gallery/note_card-landing.html">Open standalone</a></p>
+<h3>dashboard theme</h3>
+<iframe title="note_card block in the dashboard theme" src="gallery/note_card-dashboard.html" style="height:220px" loading="lazy"></iframe>
+<p class="open"><a href="gallery/note_card-dashboard.html">Open standalone</a></p>
+</section>
+<section id="note_form">
+<h2><code>note_form</code></h2>
+<p>The create form. It posts through hx-post and prepends the new card to the list. Rendered empty, as the notes page serves it on first load.</p>
+<h3>landing theme</h3>
+<iframe title="note_form block in the landing theme" src="gallery/note_form-landing.html" style="height:440px" loading="lazy"></iframe>
+<p class="open"><a href="gallery/note_form-landing.html">Open standalone</a></p>
+<h3>dashboard theme</h3>
+<iframe title="note_form block in the dashboard theme" src="gallery/note_form-dashboard.html" style="height:440px" loading="lazy"></iframe>
+<p class="open"><a href="gallery/note_form-dashboard.html">Open standalone</a></p>
+</section>
+<section id="note_list">
+<h2><code>note_list</code></h2>
+<p>The list. Cards while there are notes, the empty state otherwise — never a second copy of either. Rendered with two notes, one without a body to show the card's short form.</p>
+<h3>landing theme</h3>
+<iframe title="note_list block in the landing theme" src="gallery/note_list-landing.html" style="height:560px" loading="lazy"></iframe>
+<p class="open"><a href="gallery/note_list-landing.html">Open standalone</a></p>
+<h3>dashboard theme</h3>
+<iframe title="note_list block in the dashboard theme" src="gallery/note_list-dashboard.html" style="height:560px" loading="lazy"></iframe>
+<p class="open"><a href="gallery/note_list-dashboard.html">Open standalone</a></p>
+</section>
+<p><a href="tutorial.html">Build this UI yourself in the tutorial →</a></p>
+</main>
+<footer>Rendered from the real templates by <code>go generate ./site</code>.</footer>
+</body>
+</html>

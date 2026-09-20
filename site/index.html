@@ -4,64 +4,47 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>keel — reusable Go packages for a web backend</title>
-<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="assets/site.css">
 </head>
 <body>
-<div class="wrap">
-<nav class="site">
-<span class="brand">keel</span><a href="./">Home</a><a href="tutorial/">Tutorial</a><a href="showcase/">Showcase</a>
-</nav>
-
+<nav class="top"><strong>keel showcase</strong> · <a href="tour.html">Tour</a> · <a href="gallery.html">Gallery</a> · <a href="tutorial.html">Tutorial</a></nav>
+<main>
 <h1>keel</h1>
-<p>Reusable Go packages for building a web backend: configuration, structured
-logging, HTTP serving, Postgres access and migrations, search, background jobs,
-events and transactional email. Each package is usable on its own, and every
-package that talks to an external service ships an in-process default, so a
-project running only Postgres gets a complete backend.</p>
-
-<p><a href="tutorial/">Read the tutorial: build a notes backend with keel</a>,
-or <a href="showcase/">browse the package showcase</a>.</p>
-
-<h2>Install</h2>
-<pre><code>git clone https://github.com/ManavA/keel.git keel</code></pre>
-<p>Go 1.26 or later. There is no published release yet, so new projects
-point at a checkout with a <code>replace</code> directive (the tutorial
-shows how). Docker is needed for the local Postgres in the tutorial, and
-by <code>pg/testdb</code>.</p>
-
-<h2>Start from a working service</h2>
-<pre><code>go run ./cmd/keel new myservice
-cd myservice
-go mod edit -replace github.com/ManavA/keel=../keel
-go mod tidy
-DATABASE_URL='postgres://keel:keel@127.0.0.1:5432/keel?sslmode=disable' go run .</code></pre>
-<p>That scaffolds the <code>minimal</code> profile (a notes API over Postgres)
-into <code>myservice/</code> and starts that same tree against a local
-database on :8080. The
-<a href="tutorial/">tutorial</a> walks through what each part does.</p>
-
-<h2>Packages at a glance</h2>
-<table>
-<tr><th>Package</th><th>Description</th></tr>
-<tr><td><code>config</code></td><td>Environment loading, validation, secret trimming and redaction</td></tr>
-<tr><td><code>log</code></td><td>JSON <code>slog</code> handler with request ids and redacted credentials</td></tr>
-<tr><td><code>httpx</code></td><td>HTTP server, chi router, middleware, health endpoints</td></tr>
-<tr><td><code>pg</code></td><td>pgx v5 pool, transactions, offset and keyset paging</td></tr>
-<tr><td><code>pg/migrate</code></td><td>Migration runner with a ledger, and a replay check</td></tr>
-<tr><td><code>pg/testdb</code></td><td>Docker Postgres harness for tests</td></tr>
-<tr><td><code>search</code></td><td>Document index over Postgres, or Meilisearch via <code>search/meili</code></td></tr>
-<tr><td><code>jobs</code></td><td>Background work with run outcomes, an in-process scheduler, and <code>jobs/cloudrun</code> triggers</td></tr>
-<tr><td><code>auth</code></td><td>Local, Firebase and OIDC auth; sessions, verification, reset</td></tr>
-<tr><td><code>app</code></td><td>Service lifecycle: logger, pool, migrations, router, jobs, shutdown</td></tr>
-</table>
-<p>The full list, with defaults and external options, is in the
-<a href="showcase/">showcase</a>.</p>
-
-<footer>
-<p>Source: <a href="https://github.com/ManavA/keel">github.com/ManavA/keel</a>
-(Apache 2.0). This site is published from <code>site/</code> on pushes to
-<code>main</code>.</p>
-</footer>
+<p>Reusable Go packages for building a web backend: configuration, structured logging, HTTP
+serving, Postgres access and migrations, search, background jobs, events and transactional email.
+Each package is usable on its own, and every package that talks to an external service ships an
+in-process default, so a project running only Postgres gets a complete backend.</p>
+<pre><code>git clone https://github.com/ManavA/keel.git keel
+keel new notesapp   # scaffold a service: see the tutorial</code></pre>
+<p>No published release yet: new projects point at a checkout with a
+<code>replace</code> directive (the tutorial shows how).</p>
+<div class="cards">
+<div class="card"><h2><a href="tutorial.html">Start here: the tutorial →</a></h2><p>Scaffold the notes service, run it against Postgres, and click through the browser UI. About fifteen minutes.</p></div>
+<div class="card"><h2><a href="tour.html">Tour the packages →</a></h2><p>Six stops across retry, textpolicy, flags, jobs, httpx and config, each with a short sample taken from the real tree.</p></div>
+<div class="card"><h2><a href="gallery.html">Browse the gallery →</a></h2><p>Every UI block the example app is built from, rendered from the real templates in both themes.</p></div>
 </div>
+<h2>One service, two surfaces</h2>
+<p>The minimal example is a notes service over Postgres and nothing else: a JSON API
+(<code>/api/notes</code>, keyset pages, owner-scoped search) and a server-rendered browser UI
+(landing page, auth shells, notes dashboard) over the same store. A form post writes through the
+same store, index and event path as a JSON create, so the two surfaces list and search the same
+rows.</p>
+<h2>Package map</h2>
+<table class="packages">
+<tr><th>HTTP</th><td><code>httpx</code> server, router, middleware and responses · <code>admin</code> operator sessions · <code>app</code> service lifecycle</td></tr>
+<tr><th>Data</th><td><code>pg</code> pool, transactions, paging, migrations · <code>outbox</code> transactional events · <code>search</code> document index · <code>idempotency</code> replayed responses</td></tr>
+<tr><th>Work</th><td><code>jobs</code> background runs and outcomes · <code>events</code> publish and subscribe · <code>webhooks</code> outbound delivery · <code>mail</code> transactional email · <code>notifyprefs</code> send-path enforcement</td></tr>
+<tr><th>Edge</th><td><code>auth</code> local, Firebase and OIDC sign-in · <code>flags</code> percentage rollouts · <code>textpolicy</code> normalize-then-match text guard · <code>retry</code> backoff with full jitter · <code>media</code> object storage · <code>geocode</code> address lookup</td></tr>
+<tr><th>Foundation</th><td><code>config</code> environment loading and redaction · <code>log</code> slog setup and request ids · <code>metrics</code> instrumentation · <code>perf</code> caching and compression · <code>deploy</code> templates · <code>cmd/keel</code> project scaffolding</td></tr>
+</table>
+<h2>Conventions</h2>
+<ul>
+<li>No root package: importing <code>github.com/ManavA/keel</code> gets you nothing. Import the package you need.</li>
+<li>Options are structs whose zero value works. Interfaces are small and declared where they are used.</li>
+<li>Errors are wrapped with context. Context comes first. Logging goes through <code>slog</code>.</li>
+<li>Packages that reach an external service take an in-process default, selected by configuration.</li>
+</ul>
+</main>
+<footer>keel is a Go module at <code>github.com/ManavA/keel</code>. The tour samples are executed by <code>site/tour_test.go</code>; the gallery is rendered from the real templates by <code>go generate ./site</code>.</footer>
 </body>
 </html>

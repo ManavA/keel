@@ -1,0 +1,117 @@
+/* Layout and components. Reads the tokens in tokens.css and names no color
+   directly, so re-theming stays in that file. Shared by the landing shell and
+   the notes dashboard; both set data-theme on <html> and nothing else moves. */
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-body);
+}
+
+main.landing,
+main.dashboard {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: var(--space-5) var(--space-3);
+}
+
+h1, h3 {
+  font-family: var(--font-heading);
+  margin: 0 0 var(--space-3);
+}
+
+a {
+  color: var(--accent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* The note form. */
+#note-form {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+#note-form div {
+  margin-bottom: var(--space-2);
+}
+
+#note-form label {
+  display: block;
+  color: var(--muted);
+  margin-bottom: var(--space-1);
+}
+
+#note-form input,
+#note-form textarea {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--space-2);
+  font: inherit;
+}
+
+#note-form button {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border: 0;
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+}
+
+/* Inline feedback for a form that was re-rendered with a 422. */
+.flash {
+  background: var(--danger-surface);
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+}
+
+/* One note in the list. */
+.note-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--space-3);
+  margin-bottom: var(--space-2);
+}
+
+.note-card p {
+  margin: 0 0 var(--space-2);
+}
+
+.note-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--muted);
+}
+
+.note-meta button {
+  background: none;
+  color: var(--danger);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--space-1) var(--space-2);
+  font: inherit;
+}
+
+.empty-state {
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  text-align: center;
+}

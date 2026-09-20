@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="landing">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>note_form in the landing theme — keel template gallery</title>
+<link rel="stylesheet" href="../assets/tokens.css">
+<link rel="stylesheet" href="../assets/layout.css">
+</head>
+<body>
+<main class="dashboard">
+<form id="note-form" action="/notes" method="post" hx-post="/notes" hx-target="#notes-list" hx-swap="afterbegin">
+
+<div>
+<label for="note-title">Title</label>
+<input id="note-title" name="title" type="text" required autocomplete="off" value="">
+</div>
+<div>
+<label for="note-body">Body</label>
+<textarea id="note-body" name="body" rows="3"></textarea>
+</div>
+<button type="submit">Add note</button>
+</form>
+</main>
+</body>
+</html>

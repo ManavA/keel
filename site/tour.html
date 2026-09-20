@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Package tour — keel showcase</title>
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<nav class="top"><a href="index.html">keel showcase</a> · <strong>Tour</strong> · <a href="gallery.html">Gallery</a> · <a href="tutorial.html">Tutorial</a></nav>
+<main>
+<h1>Package tour</h1>
+<p>Six stops across the tree. Every sample below is taken from the real packages and executed by
+<code>site/tour_test.go</code>, so the code you read is the code that runs.</p>
+
+<section class="tour-stop">
+<h2>1. <code>retry</code> — backoff with full jitter</h2>
+<p><code>retry.Do</code> calls until success, a rejected error, cancellation, or the attempt
+budget, sleeping with full jitter between attempts. The zero options retry five times from a
+100&nbsp;ms base; <code>Retryable</code> decides which errors deserve another try.</p>
+<pre><code>calls := 0
+err := retry.Do(ctx, func() error {
+    calls++
+    if calls &lt; 3 {
+        return errTourFlaky
+    }
+    return nil
+}, retry.Options{MaxAttempts: 5, BaseDelay: time.Millisecond})
+// err == nil, calls == 3</code></pre>
+</section>
+
+<section class="tour-stop">
+<h2>2. <code>textpolicy</code> — one guard for generated text</h2>
+<p>A policy normalizes text, then matches rules in order and reports the first hit. The error
+names the rule, never the text that tripped it, so a log line built from it is safe to paste
+into an incident channel. (The rule below is a placeholder token in the shape of the
+package's own examples, not a production list.)</p>
+<pre><code>policy := textpolicy.New(textpolicy.Rule{
+    Name:    "spam-payout",
+    Pattern: regexp.MustCompile(`(?i)\bfree-money-now\b`),
+})
+policy.Check("a note about the roof repair quote") // nil
+err := policy.Check("claim your free-money-now prize today")
+// err is *textpolicy.ViolationError with Rule == "spam-payout"</code></pre>
+</section>
+
+<section class="tour-stop">
+<h2>3. <code>flags</code> — percentage rollouts</h2>
+<p>Evaluation is pure and deterministic: the percentage check hashes the flag key with the
+subject, so the same pair always decides the same way and a rollout survives a restart. The
+memory store here stands in for the Postgres one; the decision function is the same.</p>
+<pre><code>store := flags.NewMemoryStore()
+store.Upsert(ctx, flags.Flag{
+    Key:     "new-editor",
+    Enabled: true,
+    Allow:   []string{"you@example.com"},
+})
+flag, _ := store.Get(ctx, "new-editor")
+flags.Evaluate(flag, "you@example.com")      // true: allowlisted
+flags.Evaluate(flag, "stranger@example.com") // false at 0%</code></pre>
+</section>
+
+<section class="tour-stop">
+<h2>4. <code>jobs</code> — outcomes computed from counts</h2>
+<p>A run's word is derived from what it counted rather than chosen by the code that logs the
+last line. An empty queue reports <code>idle</code>, not <code>success</code>; a run that had
+work and landed none of it reports <code>did-nothing</code> and exits non-zero, so a scheduler
+that only restarts non-zero exits retries it.</p>
+<pre><code>run := jobs.Outcome{Attempted: 3, Succeeded: 2, Failed: 1}
+run.Status() // "partial"
+jobs.Outcome{}.Status()              // "idle"
+jobs.Outcome{Attempted: 2}.Status()  // "did-nothing"</code></pre>
+<p>The notes app's search-reconcile job reports its <code>Outcome</code> this way: an empty
+table logs <code>idle</code> rather than claiming success.</p>
+</section>
+
+<section class="tour-stop">
+<h2>5. <code>httpx</code> — responses that do not leak</h2>
+<p>JSON writes a value with the status; a nil slice becomes <code>[]</code>, never
+<code>null</code>, because <code>null.length</code> throws in browser clients. Error bodies
+carry the status phrase and a request id — never the input, the Go error, or the schema.</p>
+<pre><code>httpx.JSON(w, http.StatusOK, map[string]string{"title": "Roof repair quote"})
+// {"title":"Roof repair quote"}
+
+httpx.JSON(w, http.StatusOK, []string(nil))
+// []
+
+httpx.NotFound(w, r)
+// 404 {"error":"not found"}</code></pre>
+<p>The notes API answers a missing note and a malformed id the same 404 way; the reason lives
+in the log line the request id leads to.</p>
+</section>
+
+<section class="tour-stop">
+<h2>6. <code>config</code> — secrets stay out of logs</h2>
+<p><code>RedactURL</code> strips credentials from a connection string and keeps the scheme,
+host, port and path — the username stays, because it identifies the database without
+authenticating to it. The example service logs its configuration at startup through
+<code>config.Redacted</code>, so <code>DATABASE_URL</code> appears with its host intact and
+its password replaced.</p>
+<pre><code>config.RedactURL("postgres://keel:s3cret@127.0.0.1:5544/keel?sslmode=disable")
+// "postgres://keel:[redacted]@127.0.0.1:5544/keel?sslmode=disable"
+config.RedactURL("") // "[unset]"</code></pre>
+</section>
+
+<p><a href="gallery.html">See the UI these packages serve in the gallery →</a></p>
+</main>
+<footer>Sources: <code>retry/retry.go</code>, <code>textpolicy/policy.go</code>,
+<code>flags/flags.go</code>, <code>jobs/outcome.go</code>, <code>httpx/respond.go</code>,
+<code>config/redact.go</code>, all at <code>github.com/ManavA/keel/tree/main</code>.</footer>
+</body>
+</html>
