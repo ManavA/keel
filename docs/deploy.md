@@ -210,7 +210,10 @@ docker compose -f deploy/compose.yaml up
 
 Add `--profile search` to also start Meilisearch, for a service that uses
 keel's `search` package. A service that only uses Postgres does not need
-this profile.
+this profile. With the production overlay, still export `MEILI_MASTER_KEY`:
+compose interpolates the search service while rendering even when its
+profile is inactive, so a missing key fails config for a Postgres-only
+stack too.
 
 ### Promoting the local compose file toward production
 

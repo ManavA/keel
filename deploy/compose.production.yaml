@@ -5,7 +5,9 @@
 #
 #   export POSTGRES_USER=... POSTGRES_PASSWORD=... POSTGRES_DB=...
 #   export APP_DB_USER=... APP_DB_PASSWORD=...
-#   export MEILI_MASTER_KEY=...   # only if the service uses the search profile
+#   export MEILI_MASTER_KEY=...   # always: compose interpolates the search
+#   service even when its profile is inactive, so a missing key fails
+#   config whether or not the service uses the search profile
 #   docker compose -f deploy/compose.yaml -f deploy/compose.production.yaml up -d
 #
 # Every value it needs comes from the environment, which in production is
@@ -79,7 +81,7 @@ services:
   # Only started with --profile search, same as in the local file.
   meilisearch:
     environment:
-      MEILI_MASTER_KEY: "${MEILI_MASTER_KEY:?MEILI_MASTER_KEY must be set when the search profile is enabled}"
+      MEILI_MASTER_KEY: "${MEILI_MASTER_KEY:?MEILI_MASTER_KEY must be set even for a Postgres-only stack: compose interpolates this service when rendering, whether or not the search profile is enabled}"
       # Production mode: turns off the development conveniences the local
       # default leaves on.
       MEILI_ENV: production
