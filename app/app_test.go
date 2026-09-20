@@ -558,3 +558,101 @@ func TestConfigEmbedsAndMaps(t *testing.T) {
 
 	assert.Error(t, serviceConfig{App: Config{Port: 0}}.App.Validate())
 }
+
+func waitForServer(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		resp, err := http.Get("http://" + addr + "/healthz") //nolint:noctx,bodyclose // a shutdown test, not a handler test
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server never accepted traffic")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestShutdownReportsCleanWhenJobsDrain(t *testing.T) {
+	a := openTestApp(t, func(o *Options) {
+		o.Addr = "127.0.0.1:0"
+		o.ShutdownTimeout = 10 * time.Second
+		o.Jobs = []jobs.Entry{{
+			Name:     "quick",
+			Interval: time.Hour,
+			Func: func(context.Context) (jobs.Outcome, error) {
+				return jobs.Outcome{Attempted: 1, Succeeded: 1}, nil
+			},
+		}}
+	})
+	require.NoError(t, a.Listen())
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- a.Run(ctx) }()
+
+	waitForServer(t, a.Addr())
+
+	stop()
+	select {
+	case err := <-runErr:
+		assert.NoError(t, err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("Run did not return after its context was cancelled")
+	}
+	assert.Equal(t, ShutdownClean, a.LastShutdown().Stage)
+}
+
+func TestShutdownReportsJobsStageOnTimeout(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	a := openTestApp(t, func(o *Options) {
+		o.Addr = "127.0.0.1:0"
+		o.ShutdownTimeout = 300 * time.Millisecond
+		o.Jobs = []jobs.Entry{{
+			Name:     "slow",
+			Interval: time.Hour,
+			Func: func(context.Context) (jobs.Outcome, error) {
+				close(started)
+				select {
+				case <-release:
+				case <-time.After(10 * time.Second):
+				}
+				return jobs.Outcome{Attempted: 1, Succeeded: 1}, nil
+			},
+		}}
+	})
+	require.NoError(t, a.Listen())
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- a.Run(ctx) }()
+
+	waitForServer(t, a.Addr())
+
+	// The scheduler runs each entry once immediately, so by now the job is
+	// inside its select.
+	<-started
+	stop()
+	start := time.Now()
+	select {
+	case <-runErr:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Run did not return after its context was cancelled")
+	}
+	elapsed := time.Since(start)
+	close(release)
+
+	assert.GreaterOrEqual(t, elapsed, 250*time.Millisecond, "shutdown must wait for the job up to the timeout, not return at once")
+	assert.Less(t, elapsed, 10*time.Second, "shutdown must give up at the timeout, not wait for the slow job")
+	report := a.LastShutdown()
+	assert.Equal(t, ShutdownJobs, report.Stage, "the report must name the stage that timed out")
+}
