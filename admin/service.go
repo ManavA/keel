@@ -66,6 +66,11 @@ type Options struct {
 	RealIP middleware.RealIPOptions
 	// LoginRateLimit bounds requests per client IP to POST /login.
 	LoginRateLimit middleware.RateLimitOptions
+	// Audit is the append-only store the Audit middleware writes to and the
+	// AuditList handler reads from. When nil, NewService uses an in-memory
+	// store: fine for tests, but a deployment that needs the trail to
+	// survive a restart passes the Postgres-backed store from admin/pg.
+	Audit AuditStore
 	// Logger receives this package's diagnostic output. Defaults to
 	// slog.Default(); never overridden globally by this package.
 	Logger *slog.Logger
@@ -75,6 +80,7 @@ type Options struct {
 // checks. Build one with NewService and mount its Router.
 type Service struct {
 	users          AdminStore
+	audit          AuditStore
 	session        *sessionIssuer
 	corsOrigin     string
 	realIP         middleware.RealIPOptions
@@ -97,8 +103,13 @@ func NewService(opts Options) (*Service, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	audit := opts.Audit
+	if audit == nil {
+		audit = NewMemoryAuditStore()
+	}
 	return &Service{
 		users:          opts.Users,
+		audit:          audit,
 		session:        newSessionIssuer(opts.Secret, opts.TokenTTL),
 		corsOrigin:     opts.CORSOrigin,
 		realIP:         opts.RealIP,

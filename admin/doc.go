@@ -30,6 +30,14 @@
 // adds its own operator-only routes to the returned router, protected by the
 // same [Service.RequireAdmin] middleware.
 //
+// # Audit trail
+//
+// [Service.Audit] is middleware that appends one [AuditEntry] per request —
+// actor, action, target, timestamp, and outcome — to the store in
+// Options.Audit (in-memory by default, Postgres-backed via admin/pg). Mount
+// it inside [Service.RequireAdmin] on every operator-only route, and review
+// the trail through GET /audit, served by [Service.AuditList].
+//
 // # Protecting fields that must not reach a public response
 //
 // [CheckNoForbiddenFields] inspects an encoded JSON response for a set of
