@@ -402,3 +402,14 @@ func TestLogoutClearsTheCookie(t *testing.T) {
 	resp, _ = getAuthPage(t, client, ts, "/app", false, cookie)
 	assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
 }
+
+func TestSessionCookieSecureFollowsSiteURL(t *testing.T) {
+	https := (&API{siteURL: "https://example.com"}).sessionCookie("token")
+	assert.True(t, https.HttpOnly, "the session cookie must not reach JavaScript")
+	assert.Equal(t, http.SameSiteLaxMode, https.SameSite)
+	assert.Equal(t, "/", https.Path)
+	assert.True(t, https.Secure, "an https site that set a non-Secure cookie would send the token in the clear")
+
+	plain := (&API{siteURL: "http://localhost:8080"}).sessionCookie("token")
+	assert.False(t, plain.Secure, "an http site that set Secure would never send the cookie at all")
+}
