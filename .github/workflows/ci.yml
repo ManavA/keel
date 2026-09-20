@@ -47,6 +47,28 @@ jobs:
           KEEL_REQUIRE_DB: "1"
         run: go test -count=1 -run 'TestRepositoryMigrations|TestDiscoverMigrationDirs' -v ./pg/migrate/
 
+  # The database-backed suite once per supported Postgres major. The harness
+  # reads the major from KEEL_TESTDB_PG_VERSION, so this is the check that
+  # version-specific behavior (collation, text search configs, advisory lock
+  # semantics) holds on every server the tests claim to cover. The range is
+  # the default major plus one on each side; widening it is a one-line change.
+  pg-versions:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "16", "17"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Database-backed tests on Postgres ${{ matrix.pg }}
+        env:
+          KEEL_REQUIRE_DB: "1"
+          KEEL_TESTDB_PG_VERSION: ${{ matrix.pg }}
+        run: go test -count=1 ./pg/...
+
   lint:
     runs-on: ubuntu-latest
     steps:
