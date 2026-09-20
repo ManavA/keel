@@ -316,7 +316,7 @@ func (a *App) Open(ctx context.Context) error {
 		}
 	}
 
-	r := httpx.NewRouter(httpx.RouterOptions{
+	r, err := httpx.NewRouter(httpx.RouterOptions{
 		Logger:     a.logger,
 		RealIP:     middleware.RealIPOptions{TrustedProxies: a.opts.TrustedProxies},
 		RequestLog: middleware.RequestLogOptions{Logger: a.logger, Skip: a.requestLogSkip()},
@@ -324,6 +324,9 @@ func (a *App) Open(ctx context.Context) error {
 		Timeout:    a.opts.RequestTimeout,
 		CORS:       corsOptions(a.opts.CORSOrigins),
 	})
+	if err != nil {
+		return err
+	}
 	a.router = r
 
 	checks := map[string]httpx.Check{"database": pg.HealthCheck(pool)}

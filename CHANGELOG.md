@@ -23,6 +23,8 @@ behaviour:
   deploys at once serialize and the second applies nothing.
 - `middleware.CORS` allows nothing when no origins are configured, and panics on
   a `"*"` origin combined with credentials.
+- `httpx.NewRouter` returns an error on that same `"*"`-with-credentials
+  pairing instead of building a router that fails in every browser.
 - `middleware.RateLimit` panics when `Requests` or `Window` is missing, rather
   than returning a limiter that admits everything.
 - `httpx.Health` serves liveness and readiness separately. Liveness runs no

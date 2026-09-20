@@ -24,11 +24,13 @@ func newTestRouter(t *testing.T, opts httpx.RouterOptions) *chi.Mux {
 	if opts.Logger == nil {
 		opts.Logger = log.New(log.Options{Output: io.Discard})
 	}
-	return httpx.NewRouter(opts)
+	r, err := httpx.NewRouter(opts)
+	require.NoError(t, err)
+	return r
 }
 
 func TestRouterServes(t *testing.T) {
-	r := httpx.NewRouter(httpx.RouterOptions{Logger: log.New(log.Options{Output: io.Discard})})
+	r := newTestRouter(t, httpx.RouterOptions{Logger: log.New(log.Options{Output: io.Discard})})
 	r.Get("/things", func(w http.ResponseWriter, _ *http.Request) {
 		httpx.JSON(w, http.StatusOK, map[string]string{"ok": "yes"})
 	})
@@ -44,7 +46,7 @@ func TestRouterAnswersHEADWhereverItAnswersGET(t *testing.T) {
 	// chi returns 405 for HEAD on a GET route. RFC 9110 says HEAD is available
 	// wherever GET is, and uptime checks and `curl -sI` both use it — a 405
 	// there reads as a broken endpoint.
-	r := httpx.NewRouter(httpx.RouterOptions{Logger: log.New(log.Options{Output: io.Discard})})
+	r := newTestRouter(t, httpx.RouterOptions{Logger: log.New(log.Options{Output: io.Discard})})
 	r.Get("/things", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("body"))
 	})
@@ -84,7 +86,7 @@ func TestRouterNotFoundAndMethodNotAllowedAreJSON(t *testing.T) {
 }
 
 func TestRouterRecoversFromAPanic(t *testing.T) {
-	r := httpx.NewRouter(httpx.RouterOptions{Logger: log.New(log.Options{Output: io.Discard})})
+	r := newTestRouter(t, httpx.RouterOptions{Logger: log.New(log.Options{Output: io.Discard})})
 	r.Get("/boom", func(http.ResponseWriter, *http.Request) { panic("secret detail") })
 
 	rec := httptest.NewRecorder()
@@ -96,7 +98,7 @@ func TestRouterRecoversFromAPanic(t *testing.T) {
 }
 
 func TestRouterRateLimit(t *testing.T) {
-	r := httpx.NewRouter(httpx.RouterOptions{
+	r := newTestRouter(t, httpx.RouterOptions{
 		Logger:    log.New(log.Options{Output: io.Discard}),
 		RateLimit: &middleware.RateLimitOptions{Requests: 1, Window: time.Minute},
 	})
@@ -117,7 +119,7 @@ func TestRouterRealIPRunsBeforeTheRateLimiter(t *testing.T) {
 	// With these the wrong way round, every client behind the proxy shares one
 	// bucket.
 	var seenRemote string
-	r := httpx.NewRouter(httpx.RouterOptions{
+	r := newTestRouter(t, httpx.RouterOptions{
 		Logger: log.New(log.Options{Output: io.Discard}),
 		RealIP: middleware.RealIPOptions{TrustedProxies: []string{"10.0.0.0/8"}},
 		RateLimit: &middleware.RateLimitOptions{
@@ -140,7 +142,7 @@ func TestRouterRealIPRunsBeforeTheRateLimiter(t *testing.T) {
 }
 
 func TestRouterCORS(t *testing.T) {
-	r := httpx.NewRouter(httpx.RouterOptions{
+	r := newTestRouter(t, httpx.RouterOptions{
 		Logger: log.New(log.Options{Output: io.Discard}),
 		CORS:   &middleware.CORSOptions{AllowedOrigins: []string{"https://app.example.com"}},
 	})
@@ -187,9 +189,41 @@ func TestRouterSecurityHeadersOverrideAndSkip(t *testing.T) {
 	assert.Empty(t, rec.Header().Get("Referrer-Policy"))
 }
 
+func TestRouterRefusesWildcardOriginWithCredentials(t *testing.T) {
+	// Browsers reject Access-Control-Allow-Origin "*" paired with credentials,
+	// so the behaviour differs by environment: curl works, every browser fails.
+	// The constructor must refuse the pairing instead of deploying it.
+	_, err := httpx.NewRouter(httpx.RouterOptions{
+		Logger: log.New(log.Options{Output: io.Discard}),
+		CORS: &middleware.CORSOptions{
+			AllowedOrigins:   []string{"*"},
+			AllowCredentials: true,
+		},
+	})
+	require.Error(t, err, "wildcard origin with credentials must be a configuration error")
+	assert.Contains(t, err.Error(), "*")
+
+	r, err := httpx.NewRouter(httpx.RouterOptions{
+		Logger: log.New(log.Options{Output: io.Discard}),
+		CORS:   &middleware.CORSOptions{AllowedOrigins: []string{"*"}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, r)
+
+	r, err = httpx.NewRouter(httpx.RouterOptions{
+		Logger: log.New(log.Options{Output: io.Discard}),
+		CORS: &middleware.CORSOptions{
+			AllowedOrigins:   []string{"https://app.example.com"},
+			AllowCredentials: true,
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, r)
+}
+
 func TestRouterSkipRequestLog(t *testing.T) {
 	var buf writeCounter
-	r := httpx.NewRouter(httpx.RouterOptions{
+	r := newTestRouter(t, httpx.RouterOptions{
 		Logger:         log.New(log.Options{Output: &buf}),
 		SkipRequestLog: true,
 	})
@@ -213,7 +247,7 @@ func TestRouterInstallsItsLoggerOnTheRequest(t *testing.T) {
 	var buf bytes.Buffer
 	logger := log.New(log.Options{Output: &buf})
 
-	r := httpx.NewRouter(httpx.RouterOptions{Logger: logger, SkipRequestLog: true})
+	r := newTestRouter(t, httpx.RouterOptions{Logger: logger, SkipRequestLog: true})
 	r.Get("/thing", func(w http.ResponseWriter, req *http.Request) {
 		assert.Same(t, logger, httpx.Logger(req.Context()))
 		httpx.InternalError(w, req, errors.New("handler reason"))
@@ -231,7 +265,7 @@ func TestRouterWarnsWhenRateLimitIsBlindBehindAProxy(t *testing.T) {
 	// behind a proxy together; the startup log is where that misconfiguration
 	// surfaces, because the 429s it produces read as abuse.
 	var buf bytes.Buffer
-	r := httpx.NewRouter(httpx.RouterOptions{
+	r := newTestRouter(t, httpx.RouterOptions{
 		Logger:    log.New(log.Options{Output: &buf}),
 		RateLimit: &middleware.RateLimitOptions{Requests: 100, Window: time.Minute},
 	})
@@ -239,7 +273,7 @@ func TestRouterWarnsWhenRateLimitIsBlindBehindAProxy(t *testing.T) {
 	assert.Contains(t, buf.String(), "shares one bucket")
 
 	var quiet bytes.Buffer
-	r = httpx.NewRouter(httpx.RouterOptions{
+	r = newTestRouter(t, httpx.RouterOptions{
 		Logger:    log.New(log.Options{Output: &quiet}),
 		RealIP:    middleware.RealIPOptions{TrustedProxies: []string{"10.0.0.0/8"}},
 		RateLimit: &middleware.RateLimitOptions{Requests: 100, Window: time.Minute},
@@ -248,7 +282,7 @@ func TestRouterWarnsWhenRateLimitIsBlindBehindAProxy(t *testing.T) {
 	assert.NotContains(t, quiet.String(), "shares one bucket")
 
 	var norate bytes.Buffer
-	r = httpx.NewRouter(httpx.RouterOptions{
+	r = newTestRouter(t, httpx.RouterOptions{
 		Logger: log.New(log.Options{Output: &norate}),
 	})
 	r.Get("/", func(http.ResponseWriter, *http.Request) {})
@@ -258,7 +292,7 @@ func TestRouterWarnsWhenRateLimitIsBlindBehindAProxy(t *testing.T) {
 func TestRouterNotFoundLogsThroughItsLogger(t *testing.T) {
 	// The 404 and 405 the router answers itself go through the same logger.
 	var buf bytes.Buffer
-	r := httpx.NewRouter(httpx.RouterOptions{
+	r := newTestRouter(t, httpx.RouterOptions{
 		Logger:         log.New(log.Options{Output: &buf}),
 		SkipRequestLog: true,
 	})
