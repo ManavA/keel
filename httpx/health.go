@@ -181,7 +181,10 @@ func (h *healthHandler) evaluate(ctx context.Context) (healthResponse, bool) {
 	if err != nil {
 		return healthResponse{Status: "degraded", Build: buildinfo.Get()}, false
 	}
-	r := v.(readinessResult)
+	r, ok := v.(readinessResult)
+	if !ok {
+		return healthResponse{Status: "degraded", Build: buildinfo.Get()}, false
+	}
 	return r.resp, r.ok
 }
 
