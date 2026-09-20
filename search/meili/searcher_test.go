@@ -48,6 +48,9 @@ func TestSearcher_HonorsAnAlreadyCanceledContext(t *testing.T) {
 	assert.Error(t, err)
 	_, err = s.Search(ctx, search.Query{})
 	assert.Error(t, err)
+	assert.Error(t, s.RequireSettings(ctx))
+	_, err = s.DriftCheck()(ctx)
+	assert.Error(t, err)
 
 	assert.False(t, called, "an already-canceled context must stop every call before it reaches Meilisearch")
 	assert.Zero(t, client.createIndexN)
