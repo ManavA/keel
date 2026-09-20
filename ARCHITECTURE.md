@@ -59,6 +59,7 @@ deploy/          deployment templates and checks
 examples/
   minimal/       a runnable service over Postgres and nothing else
 docs/
+  backup.md
   deploy.md
   testing.md
 ```
