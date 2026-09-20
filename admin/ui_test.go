@@ -31,18 +31,22 @@ func newUITestRouter(t *testing.T) (*Service, chi.Router) {
 	return s, r
 }
 
-func seedUITestAdmin(t *testing.T, s *Service, email, password string) {
+// testAdminPassword is the one password every test account uses. Unused
+// flexibility here would be a lint finding, not coverage.
+const testAdminPassword = "hunter2hunter2"
+
+func seedUITestAdmin(t *testing.T, s *Service, email string) {
 	t.Helper()
 	require.NoError(t, s.users.Create(context.Background(), &Admin{
-		Email: email, Name: "Ops", Role: "admin", PasswordHash: mustHashAdmin(t, password),
+		Email: email, Name: "Ops", Role: "admin", PasswordHash: mustHashAdmin(t, testAdminPassword),
 	}))
 }
 
-func uiLogin(t *testing.T, r http.Handler, email, password string) *http.Cookie {
+func uiLogin(t *testing.T, r http.Handler, email string) *http.Cookie {
 	t.Helper()
-	rec := doUIForm(t, r, http.MethodPost, uiBasePath+"/login", url.Values{
+	rec := doUIForm(t, r, uiBasePath+"/login", url.Values{
 		"email":    {email},
-		"password": {password},
+		"password": {testAdminPassword},
 	})
 	require.Equal(t, http.StatusSeeOther, rec.Code, "setup login failed: %s", rec.Body.String())
 	for _, c := range rec.Result().Cookies() {
@@ -54,13 +58,14 @@ func uiLogin(t *testing.T, r http.Handler, email, password string) *http.Cookie 
 	return nil
 }
 
-func doUIForm(t *testing.T, r http.Handler, method, path string, values url.Values, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+// doUIForm always posts: every UI write in these tests is a form POST.
+func doUIForm(t *testing.T, r http.Handler, path string, values url.Values, cookies ...*http.Cookie) *httptest.ResponseRecorder {
 	t.Helper()
 	var body io.Reader
 	if values != nil {
 		body = strings.NewReader(values.Encode())
 	}
-	req := httptest.NewRequestWithContext(context.Background(), method, path, body)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, path, body)
 	if values != nil {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
@@ -102,11 +107,11 @@ func TestAdminUILoginPageRenders(t *testing.T) {
 
 func TestAdminUILoginSuccessSetsCookieAndRedirects(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "ops@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "ops@example.com")
 
-	rec := doUIForm(t, r, http.MethodPost, uiBasePath+"/login", url.Values{
+	rec := doUIForm(t, r, uiBasePath+"/login", url.Values{
 		"email":    {"ops@example.com"},
-		"password": {"hunter2hunter2"},
+		"password": {testAdminPassword},
 	})
 	require.Equal(t, http.StatusSeeOther, rec.Code, "a form login lands on the users list: %s", rec.Body.String())
 	assert.Equal(t, uiBasePath+"/users", rec.Header().Get("Location"))
@@ -127,9 +132,9 @@ func TestAdminUILoginSuccessSetsCookieAndRedirects(t *testing.T) {
 
 func TestAdminUILoginFailureReRendersWithoutCookie(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "ops@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "ops@example.com")
 
-	rec := doUIForm(t, r, http.MethodPost, uiBasePath+"/login", url.Values{
+	rec := doUIForm(t, r, uiBasePath+"/login", url.Values{
 		"email":    {"ops@example.com"},
 		"password": {"wrongpassword"},
 	})
@@ -142,7 +147,7 @@ func TestAdminUILoginFailureReRendersWithoutCookie(t *testing.T) {
 
 func TestAdminUIUsersRequiresAdmin(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "ops@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "ops@example.com")
 
 	rec := doUIGet(t, r, uiBasePath+"/users", false)
 	require.Equal(t, http.StatusSeeOther, rec.Code, "an anonymous page load leaves for the login page")
@@ -152,7 +157,7 @@ func TestAdminUIUsersRequiresAdmin(t *testing.T) {
 
 func TestAdminUIUsersRejectsForgedToken(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "ops@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "ops@example.com")
 
 	forged := uiSessionCookie("not-a-valid-token")
 	rec := doUIGet(t, r, uiBasePath+"/users", false, forged)
@@ -162,7 +167,7 @@ func TestAdminUIUsersRejectsForgedToken(t *testing.T) {
 
 func TestAdminUIUsersRejectsEndUserToken(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "ops@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "ops@example.com")
 
 	// An end-user session from the sibling auth package shares the shape but
 	// not the audience; it must not open the admin console even when both
@@ -184,8 +189,8 @@ func TestAdminUIUsersRejectsEndUserToken(t *testing.T) {
 
 func TestAdminUIUsersListsAdminsWithoutSecrets(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "ops@example.com", "hunter2hunter2")
-	session := uiLogin(t, r, "ops@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "ops@example.com")
+	session := uiLogin(t, r, "ops@example.com")
 
 	rec := doUIGet(t, r, uiBasePath+"/users", false, session)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -196,8 +201,8 @@ func TestAdminUIUsersListsAdminsWithoutSecrets(t *testing.T) {
 
 func TestAdminUIUsersFragmentForHtmx(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "ops@example.com", "hunter2hunter2")
-	session := uiLogin(t, r, "ops@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "ops@example.com")
+	session := uiLogin(t, r, "ops@example.com")
 
 	rec := doUIGet(t, r, uiBasePath+"/users", true, session)
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -207,15 +212,15 @@ func TestAdminUIUsersFragmentForHtmx(t *testing.T) {
 
 func TestAdminUIRevokeSessionsEndsThatAdminsTokens(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "revoker@example.com", "hunter2hunter2")
-	seedUITestAdmin(t, s, "target@example.com", "hunter2hunter2")
-	revoker := uiLogin(t, r, "revoker@example.com", "hunter2hunter2")
-	targetSession := uiLogin(t, r, "target@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "revoker@example.com")
+	seedUITestAdmin(t, s, "target@example.com")
+	revoker := uiLogin(t, r, "revoker@example.com")
+	targetSession := uiLogin(t, r, "target@example.com")
 
 	target, err := s.users.GetByEmail(context.Background(), "target@example.com")
 	require.NoError(t, err)
 
-	rec := doUIForm(t, r, http.MethodPost, uiBasePath+"/users/"+target.ID+"/revoke", nil, revoker)
+	rec := doUIForm(t, r, uiBasePath+"/users/"+target.ID+"/revoke", nil, revoker)
 	require.Equal(t, http.StatusSeeOther, rec.Code, "a form revoke lands back on the users list: %s", rec.Body.String())
 
 	stale := doUIGet(t, r, uiBasePath+"/users", false, targetSession)
@@ -228,13 +233,13 @@ func TestAdminUIRevokeSessionsEndsThatAdminsTokens(t *testing.T) {
 
 func TestAdminUIRevokeRequiresAdmin(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "target@example.com", "hunter2hunter2")
-	targetSession := uiLogin(t, r, "target@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "target@example.com")
+	targetSession := uiLogin(t, r, "target@example.com")
 
 	target, err := s.users.GetByEmail(context.Background(), "target@example.com")
 	require.NoError(t, err)
 
-	rec := doUIForm(t, r, http.MethodPost, uiBasePath+"/users/"+target.ID+"/revoke", nil)
+	rec := doUIForm(t, r, uiBasePath+"/users/"+target.ID+"/revoke", nil)
 	require.Equal(t, http.StatusSeeOther, rec.Code, "an anonymous revoke leaves for the login page")
 	assert.Equal(t, uiBasePath+"/login", rec.Header().Get("Location"))
 
@@ -244,16 +249,16 @@ func TestAdminUIRevokeRequiresAdmin(t *testing.T) {
 
 func TestAdminUIRevokeMissingAdminIsNotFound(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "ops@example.com", "hunter2hunter2")
-	session := uiLogin(t, r, "ops@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "ops@example.com")
+	session := uiLogin(t, r, "ops@example.com")
 
-	rec := doUIForm(t, r, http.MethodPost, uiBasePath+"/users/no-such-admin/revoke", nil, session)
+	rec := doUIForm(t, r, uiBasePath+"/users/no-such-admin/revoke", nil, session)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
 func TestAdminUIAuditRequiresAdmin(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "ops@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "ops@example.com")
 	require.NoError(t, s.audit.Append(context.Background(), &AuditEntry{
 		Actor: "admin_1", Action: "user.disable", Target: "user_42", Outcome: AuditOutcomeOK,
 	}))
@@ -266,8 +271,8 @@ func TestAdminUIAuditRequiresAdmin(t *testing.T) {
 
 func TestAdminUIAuditListsAndFilters(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "ops@example.com", "hunter2hunter2")
-	session := uiLogin(t, r, "ops@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "ops@example.com")
+	session := uiLogin(t, r, "ops@example.com")
 	ctx := context.Background()
 	require.NoError(t, s.audit.Append(ctx, &AuditEntry{Actor: "admin_1", Action: "user.disable", Target: "user_42", Outcome: AuditOutcomeOK}))
 	require.NoError(t, s.audit.Append(ctx, &AuditEntry{Actor: "admin_2", Action: "user.enable", Target: "user_43", Outcome: AuditOutcomeError}))
@@ -285,8 +290,8 @@ func TestAdminUIAuditListsAndFilters(t *testing.T) {
 
 func TestAdminUIAuditFragmentForHtmx(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "ops@example.com", "hunter2hunter2")
-	session := uiLogin(t, r, "ops@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "ops@example.com")
+	session := uiLogin(t, r, "ops@example.com")
 	require.NoError(t, s.audit.Append(context.Background(), &AuditEntry{Actor: "admin_1", Action: "user.disable", Outcome: AuditOutcomeOK}))
 
 	rec := doUIGet(t, r, uiBasePath+"/audit", true, session)
@@ -297,10 +302,10 @@ func TestAdminUIAuditFragmentForHtmx(t *testing.T) {
 
 func TestAdminUILogoutClearsCookie(t *testing.T) {
 	s, r := newUITestRouter(t)
-	seedUITestAdmin(t, s, "ops@example.com", "hunter2hunter2")
-	session := uiLogin(t, r, "ops@example.com", "hunter2hunter2")
+	seedUITestAdmin(t, s, "ops@example.com")
+	session := uiLogin(t, r, "ops@example.com")
 
-	rec := doUIForm(t, r, http.MethodPost, uiBasePath+"/logout", nil, session)
+	rec := doUIForm(t, r, uiBasePath+"/logout", nil, session)
 	require.Equal(t, http.StatusSeeOther, rec.Code)
 	assert.Equal(t, uiBasePath+"/login", rec.Header().Get("Location"))
 	cleared := false
