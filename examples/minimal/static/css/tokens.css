@@ -31,7 +31,7 @@
 
 /* Dashboard: the signed-in workspace. Dark surface, same accent family, so
    controls keep their meaning across the sign-in boundary. */
-:root[data-theme=dashboarx] {
+:root[data-theme=dashboard] {
   --bg: #16150f;
   --surface: #201f18;
   --ink: #ece7da;
