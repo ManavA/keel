@@ -157,6 +157,11 @@ type Options struct {
 	Emailer Emailer
 	// SiteURL is the base URL used to build verification and reset links.
 	SiteURL string
+	// BreachChecker optionally rejects passwords present in a breach corpus
+	// (see HIBPBreachChecker) on signup and password reset. Nil — the
+	// default — disables the check entirely, so a service with no network
+	// access never blocks a password set on an unreachable endpoint.
+	BreachChecker BreachChecker
 
 	// RealIP configures client-address recovery for the rate limiter below.
 	// Its zero value ignores forwarding headers, which is correct only when
@@ -196,6 +201,7 @@ type Service struct {
 	rateLimit      middleware.RateLimitOptions
 	attempts       AttemptStore
 	accountLimit   AccountRateLimitOptions
+	breach         BreachChecker
 	log            *slog.Logger
 }
 
@@ -275,6 +281,7 @@ func NewService(opts Options) (*Service, error) {
 		rateLimit:      rateLimitWithDefaults(opts.RateLimit),
 		attempts:       attempts,
 		accountLimit:   accountRateLimitWithDefaults(opts.AccountRateLimit),
+		breach:         opts.BreachChecker,
 		log:            logger,
 	}
 

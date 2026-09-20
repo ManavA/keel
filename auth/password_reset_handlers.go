@@ -87,6 +87,12 @@ func (s *Service) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Checked before ConsumeValid on purpose: the reset token is single-use,
+	// and a policy rejection must not burn it — the holder should be able to
+	// retry the same link with a different password.
+	if s.rejectBreachedPassword(w, r, req.NewPassword) {
+		return
+	}
 
 	userID, err := s.passwordResets.ConsumeValid(r.Context(), HashVerificationToken(req.Token))
 	if err != nil {
