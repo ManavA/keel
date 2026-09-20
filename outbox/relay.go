@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/ManavA/keel/events"
+	"github.com/ManavA/keel/metrics"
 	"github.com/ManavA/keel/retry"
 )
 
@@ -56,6 +57,11 @@ type Options struct {
 	// Relay parks it and stops trying. Zero or negative means no cap: a
 	// poisoned row is retried at the capped backoff interval forever.
 	MaxAttempts int
+
+	// Metrics receives one publish count, lag and attempt count per
+	// relayed row, and one failure count per failed attempt. Nil records
+	// nothing.
+	Metrics *metrics.Metrics
 
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
@@ -115,10 +121,11 @@ func (r *Relay) Run(ctx context.Context) error {
 }
 
 type row struct {
-	id       string
-	topic    string
-	payload  []byte
-	attempts int
+	id        string
+	topic     string
+	payload   []byte
+	attempts  int
+	createdAt time.Time
 }
 
 // Tick runs one poll-publish cycle and reports how many rows it published.
@@ -137,6 +144,7 @@ func (r *Relay) Tick(ctx context.Context) (published int, err error) {
 		}, r.opts.PublishRetry)
 
 		if publishErr != nil {
+			r.opts.Metrics.ObserveOutboxFailed(ctx, rw.topic, rw.attempts+1)
 			if markErr := r.recordFailure(ctx, rw, publishErr); markErr != nil {
 				r.opts.Logger.ErrorContext(ctx, "outbox relay: record publish failure",
 					"id", rw.id, "topic", rw.topic, "publish_error", publishErr, "error", markErr)
@@ -153,6 +161,7 @@ func (r *Relay) Tick(ctx context.Context) (published int, err error) {
 			continue
 		}
 
+		r.opts.Metrics.ObserveOutboxPublished(ctx, rw.topic, time.Since(rw.createdAt), rw.attempts+1)
 		published++
 	}
 
@@ -164,7 +173,7 @@ func (r *Relay) fetch(ctx context.Context) ([]row, error) {
 	// in every batch; once due it is fetched in age order like any other row.
 	// A parked row is never fetched again.
 	rows, err := r.db.Query(ctx,
-		"select id, topic, payload, attempts from "+Table+
+		"select id, topic, payload, attempts, created_at from "+Table+
 			" where published_at is null and parked_at is null"+
 			" and (next_attempt_at is null or next_attempt_at <= now())"+
 			" order by created_at limit $1",
@@ -177,7 +186,7 @@ func (r *Relay) fetch(ctx context.Context) ([]row, error) {
 	var out []row
 	for rows.Next() {
 		var rw row
-		if err := rows.Scan(&rw.id, &rw.topic, &rw.payload, &rw.attempts); err != nil {
+		if err := rows.Scan(&rw.id, &rw.topic, &rw.payload, &rw.attempts, &rw.createdAt); err != nil {
 			return nil, fmt.Errorf("outbox: scan unpublished row: %w", err)
 		}
 		out = append(out, rw)

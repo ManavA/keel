@@ -16,6 +16,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ManavA/keel/metrics"
 )
 
 // Options configures Open. Only URL is required.
@@ -112,6 +114,17 @@ func Open(ctx context.Context, opts Options) (*pgxpool.Pool, error) {
 		slog.Int("max_conns", int(cfg.MaxConns)),
 	)
 	return pool, nil
+}
+
+// Acquire takes a connection from the pool and records how long the
+// caller waited for one. A nil m records nothing. The wait is recorded
+// whether acquisition succeeded or not: a pool that answers slowly and
+// then fails still kept the caller waiting.
+func Acquire(ctx context.Context, pool *pgxpool.Pool, m *metrics.Metrics) (*pgxpool.Conn, error) {
+	start := time.Now()
+	conn, err := pool.Acquire(ctx)
+	m.ObservePoolAcquire(ctx, time.Since(start))
+	return conn, err
 }
 
 // HealthCheck returns a readiness check for this pool, shaped to fit

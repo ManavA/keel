@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"time"
+
+	"github.com/ManavA/keel/metrics"
 )
 
 // Func is one job's body. It reports its own Outcome; a non-nil error means
@@ -22,6 +24,9 @@ type RunnerOptions struct {
 	// Logger receives the run's terminal line. Nil falls back to
 	// slog.Default(); Run never calls slog.SetDefault.
 	Logger *slog.Logger
+	// Metrics receives one count per run under the run's status word.
+	// Nil records nothing.
+	Metrics *metrics.Metrics
 }
 
 // Runner runs one job to completion and turns its Outcome into a log line
@@ -51,8 +56,10 @@ func (r Runner) Run(ctx context.Context, name string, fn Func) int {
 		// distinct from one that measured and found failures, but no less
 		// fatal, so it takes the same terminal status.
 		outcome.Fatal = true
+		r.opts.Metrics.ObserveJob(ctx, name, outcome.Status())
 		return Complete(r.opts.Logger, name+" complete", name+" failed", outcome, "error", err)
 	}
+	r.opts.Metrics.ObserveJob(ctx, name, outcome.Status())
 	return Complete(r.opts.Logger, name+" complete", name+" failed", outcome)
 }
 

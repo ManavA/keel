@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/ManavA/keel/metrics"
 )
 
 // defaultMissTTL is how long Cached remembers an address its Provider could
@@ -26,6 +28,10 @@ type CachedOptions struct {
 	// never written to the Store, so it is not shared across replicas and
 	// does not survive a restart.
 	MissTTL time.Duration
+	// Metrics receives one lookup count per Geocode call, with the source
+	// that answered it and, when the lookup resolved, the precision tier.
+	// Nil records nothing.
+	Metrics *metrics.Metrics
 }
 
 func (o CachedOptions) withDefaults() CachedOptions {
@@ -76,10 +82,12 @@ func (c *Cached) Geocode(ctx context.Context, address, city, state, postalCode s
 	} else if ok {
 		result := coords
 		c.forgetMiss(key)
+		c.opts.Metrics.ObserveGeocode(ctx, metrics.GeocodeStore, result.Precision)
 		return &result, nil
 	}
 
 	if c.isMiss(key) {
+		c.opts.Metrics.ObserveGeocode(ctx, metrics.GeocodeMiss, "")
 		return nil, nil
 	}
 
@@ -89,6 +97,7 @@ func (c *Cached) Geocode(ctx context.Context, address, city, state, postalCode s
 	}
 	if coords == nil {
 		c.recordMiss(key)
+		c.opts.Metrics.ObserveGeocode(ctx, metrics.GeocodeProvider, "")
 		return nil, nil
 	}
 
@@ -96,6 +105,7 @@ func (c *Cached) Geocode(ctx context.Context, address, city, state, postalCode s
 	if err := c.store.Set(ctx, key, *coords); err != nil {
 		c.opts.Logger.Warn("geocode: cache set failed", "error", err)
 	}
+	c.opts.Metrics.ObserveGeocode(ctx, metrics.GeocodeProvider, coords.Precision)
 	return coords, nil
 }
 

@@ -100,6 +100,7 @@ Postgres. Run it with `make run-local`, or start your own from it with
 | `retry` | Exponential backoff with full jitter, and context cancellation |
 | `idempotency` | HTTP middleware that replays a stored response for a repeated `Idempotency-Key` |
 | `outbox` | Writes an event with a domain transaction, then relays it to `events` |
+| `metrics` | Counters and histograms for HTTP, pool, jobs, outbox, events and geocode, with a no-op default and OTel via `metrics/otel` |
 | `app` | The service lifecycle: logger, pool, migrations, router, auth and admin mounts, jobs, shutdown |
 | `cmd/keel` | Scaffolds a project from `examples/minimal` (`keel new <name>`) |
 
@@ -139,6 +140,7 @@ configuration and falls back to an in-process default:
 | `geocode` | `NoopProvider` returns nil when it has no result | Mapbox |
 | `auth` | `local` — email, password, verification, reset, sessions, all in-memory (`auth/pg` for Postgres) | `firebase` (ID tokens), `oidc` (any issuer) |
 | `idempotency` | in-memory (`MemoryStore`) | Postgres (`idempotency/pg`) |
+| `metrics` | no-op recorder, in-process capture (`InMemory`) | OpenTelemetry (`metrics/otel`) |
 
 ## Deployment
 
