@@ -193,6 +193,35 @@ func TestRouterInstallsItsLoggerOnTheRequest(t *testing.T) {
 	assert.Contains(t, buf.String(), "handler reason")
 }
 
+func TestRouterWarnsWhenRateLimitIsBlindBehindAProxy(t *testing.T) {
+	// A default-key limit with RealIP unconfigured buckets every client
+	// behind a proxy together; the startup log is where that misconfiguration
+	// surfaces, because the 429s it produces read as abuse.
+	var buf bytes.Buffer
+	r := httpx.NewRouter(httpx.RouterOptions{
+		Logger:    log.New(log.Options{Output: &buf}),
+		RateLimit: &middleware.RateLimitOptions{Requests: 100, Window: time.Minute},
+	})
+	r.Get("/", func(http.ResponseWriter, *http.Request) {})
+	assert.Contains(t, buf.String(), "shares one bucket")
+
+	var quiet bytes.Buffer
+	r = httpx.NewRouter(httpx.RouterOptions{
+		Logger:    log.New(log.Options{Output: &quiet}),
+		RealIP:    middleware.RealIPOptions{TrustedProxies: []string{"10.0.0.0/8"}},
+		RateLimit: &middleware.RateLimitOptions{Requests: 100, Window: time.Minute},
+	})
+	r.Get("/", func(http.ResponseWriter, *http.Request) {})
+	assert.NotContains(t, quiet.String(), "shares one bucket")
+
+	var norate bytes.Buffer
+	r = httpx.NewRouter(httpx.RouterOptions{
+		Logger: log.New(log.Options{Output: &norate}),
+	})
+	r.Get("/", func(http.ResponseWriter, *http.Request) {})
+	assert.NotContains(t, norate.String(), "shares one bucket")
+}
+
 func TestRouterNotFoundLogsThroughItsLogger(t *testing.T) {
 	// The 404 and 405 the router answers itself go through the same logger.
 	var buf bytes.Buffer

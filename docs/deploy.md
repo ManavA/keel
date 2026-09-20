@@ -90,6 +90,12 @@ platform guarantees nothing else can.
 RFC 7239 `Forwarded:` is not supported. A deployment behind a proxy that emits
 only that header gets no client address, silently.
 
+Without a trusted header the default rate-limit key buckets by the proxy's
+address, so every client shares one bucket: a few active users spend the whole
+budget and everyone else gets 429s that read as abuse rather than
+misconfiguration. `httpx.NewRouter` logs a warning at startup when a limit is
+enabled in that state.
+
 ## Shutdown
 
 `ListenAndServe` stops when its context does, so signal handling stays in `main`

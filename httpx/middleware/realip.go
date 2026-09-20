@@ -39,6 +39,14 @@ type RealIPOptions struct {
 	Header string
 }
 
+// TrustsHeaders reports whether RealIP will honour any forwarding header:
+// TrustAnyPeer, or at least one TrustedProxies entry that parses as an
+// address or CIDR block. An entry that is neither is dropped when the list is
+// parsed, so a proxy list of typos trusts nothing and reports false here.
+func (o RealIPOptions) TrustsHeaders() bool {
+	return o.TrustAnyPeer || len(parseCIDRs(o.TrustedProxies)) > 0
+}
+
 // RealIP rewrites r.RemoteAddr to the client's address, so that rate limiting,
 // logging and abuse rules see the client rather than the proxy.
 //
