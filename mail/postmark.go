@@ -1,7 +1,9 @@
 package mail
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -51,7 +53,7 @@ func NewPostmarkSender(opts PostmarkSenderOptions) *PostmarkSender {
 	client := postmark.NewClient(opts.ServerToken, "")
 	client.HTTPClient = &http.Client{
 		Timeout:   client.HTTPClient.Timeout,
-		Transport: &postmark5xxTransport{base: client.HTTPClient.Transport},
+		Transport: &postmarkStatusTransport{base: client.HTTPClient.Transport},
 	}
 	return &PostmarkSender{
 		client: client,
@@ -59,15 +61,22 @@ func NewPostmarkSender(opts PostmarkSenderOptions) *PostmarkSender {
 	}
 }
 
-// postmark5xxTransport turns an HTTP 5xx response into a transport error, so
-// Send's retry covers it. The client library never looks at the status code:
-// it parses any body, so a 5xx with a well-formed body would otherwise be
-// classified as an API error and sent once.
-type postmark5xxTransport struct {
+// postmarkStatusTransport turns any non-2xx response into a send failure, so
+// Send never reports success for a message the provider did not accept. The
+// client library never looks at the status code: it parses any body, so a
+// proxy error page in another schema — or an empty JSON object — decodes to
+// the zero value, ErrorCode reads 0, and Send would otherwise log success.
+//
+// A non-2xx below 500 whose body decodes to a nonzero ErrorCode is a genuine
+// Postmark API error (for example 422 with 1101 for an unknown template
+// alias); it passes through so Send classifies it exactly once instead of
+// retrying it as a transport failure. A 5xx is always a transport error and
+// is retried, even when its body parses.
+type postmarkStatusTransport struct {
 	base http.RoundTripper
 }
 
-func (t *postmark5xxTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t *postmarkStatusTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	base := t.base
 	if base == nil {
 		base = http.DefaultTransport
@@ -77,7 +86,7 @@ func (t *postmark5xxTransport) RoundTrip(req *http.Request) (*http.Response, err
 	if err != nil {
 		return resp, err
 	}
-	if resp.StatusCode < 500 {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return resp, nil
 	}
 
@@ -85,6 +94,16 @@ func (t *postmark5xxTransport) RoundTrip(req *http.Request) (*http.Response, err
 	_ = resp.Body.Close()
 	if readErr != nil {
 		body = nil
+	}
+	if resp.StatusCode < 500 {
+		var apiErr struct {
+			ErrorCode int64 `json:"ErrorCode"`
+		}
+		if json.Unmarshal(body, &apiErr) == nil && apiErr.ErrorCode != 0 {
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+			return resp, nil
+		}
+		return nil, fmt.Errorf("postmark: unexpected status %d: %s", resp.StatusCode, body)
 	}
 	return nil, fmt.Errorf("postmark: transient server error (status %d): %s", resp.StatusCode, body)
 }
@@ -94,7 +113,10 @@ func (t *postmark5xxTransport) RoundTrip(req *http.Request) (*http.Response, err
 // The `res.ErrorCode != 0` check is required. The client's request path
 // returns a nil Go error even when Postmark's response body carries a
 // nonzero ErrorCode, for example 1101 for an unknown template alias. See
-// the package doc.
+// the package doc. A non-2xx status whose body carries no Postmark
+// ErrorCode — a proxy error page, an outage body in another schema — never
+// reaches this check: postmarkStatusTransport rejects it first, so a zero
+// ErrorCode cannot read as success.
 func (s *PostmarkSender) Send(ctx context.Context, to, templateAlias string, templateModel map[string]any) error {
 	logger := s.opts.Logger
 	if logger == nil {
