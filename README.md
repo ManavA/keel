@@ -102,6 +102,7 @@ Postgres. Run it with `make run-local`, or start your own from it with
 | `outbox` | Writes an event with a domain transaction, then relays it to `events` |
 | `metrics` | Counters and histograms for HTTP, pool, jobs, outbox, events and geocode, with a no-op default and OTel via `metrics/otel` |
 | `webhooks` | Signed HTTP delivery of events to external URLs, over the outbox relay |
+| `notifyprefs` | Per-user notification opt-outs with send-path enforcement (`notifyprefs/pg` for Postgres) |
 | `app` | The service lifecycle: logger, pool, migrations, router, auth and admin mounts, jobs, shutdown |
 | `cmd/keel` | Scaffolds a project from `examples/minimal` (`keel new <name>`) |
 

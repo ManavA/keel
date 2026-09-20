@@ -31,9 +31,12 @@ const (
 type Channel string
 
 const (
+	// ChannelEmail delivers to the user's mailbox.
 	ChannelEmail Channel = "email"
-	ChannelSMS   Channel = "sms"
-	ChannelPush  Channel = "push"
+	// ChannelSMS delivers to the user's phone as a text message.
+	ChannelSMS Channel = "sms"
+	// ChannelPush delivers to the user's devices as a push notification.
+	ChannelPush Channel = "push"
 )
 
 // Preferences is one user's opt-outs, as (category, channel) pairs that
@@ -169,7 +172,10 @@ func (s *MemoryStore) Get(_ context.Context, userID string) (Preferences, error)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.entries[userID], nil
+	// Normalized copies: the stored struct shares its inner maps with
+	// nothing else once copied, so a caller that mutates the returned
+	// value cannot corrupt the store.
+	return s.entries[userID].Normalized(), nil
 }
 
 // Set implements [Store.Set]. Security and transactional opt-outs are
