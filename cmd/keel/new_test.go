@@ -156,7 +156,14 @@ func TestNewGeneratesAMinimalProject(t *testing.T) {
 
 	for _, name := range []string{
 		"main.go", "config.go", "handlers.go", "notes.go", "main_test.go",
+		"ui.go", "ui_notes.go", "ui_auth.go", "ui_test.go", "ui_auth_test.go",
 		"README.md",
+		filepath.Join("templates", "landing.html"),
+		filepath.Join("templates", "notes.html"),
+		filepath.Join("templates", "auth.html"),
+		filepath.Join("templates", "app.html"),
+		filepath.Join("static", "css", "tokens.css"),
+		filepath.Join("static", "vendor", "VERSION"),
 		filepath.Join("migrations", "001_notes.up.sql"),
 		filepath.Join("migrations", "001_notes.down.sql"),
 	} {

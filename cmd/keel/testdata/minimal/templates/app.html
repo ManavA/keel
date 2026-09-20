@@ -1,0 +1,22 @@
+{{define "app"}}<!DOCTYPE html>
+<html lang="en" data-theme="dashboard">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your notes</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+<main class="dashboard">
+<header class="app-header">
+<h1>Your notes</h1>
+<form action="/logout" method="post"><button type="submit">Log out</button></form>
+</header>
+{{template "note_form" .}}
+{{template "note_list" .}}
+</main>
+</body>
+</html>{{end}}

@@ -1,0 +1,20 @@
+{{define "landing"}}<!DOCTYPE html>
+<html lang="en" data-theme="landing">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>keel</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+{{template "landing-main" .}}
+</body>
+</html>{{end}}
+{{define "landing-main"}}<main id="landing-main" class="landing">
+<h1>keel</h1>
+<p>A notes service built out of keel.</p>
+<p><a href="/notes">Open your notes</a></p>
+</main>{{end}}

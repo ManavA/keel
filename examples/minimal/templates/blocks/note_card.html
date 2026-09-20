@@ -1,0 +1,6 @@
+{{define "note_card"}}<article class="note-card" id="note-{{.ID}}">
+<h3>{{.Title}}</h3>
+{{if .Body}}<p>{{.Body}}</p>{{end}}
+<div class="note-meta"><time datetime="{{.CreatedAt.Format "2006-01-02T15:04:05Z07:00"}}">{{.CreatedAt.Format "2006-01-02"}}</time>
+<button type="button" hx-delete="/notes/{{.ID}}" hx-target="closest article" hx-swap="outerHTML" hx-confirm="Delete this note?">Delete</button></div>
+</article>{{end}}

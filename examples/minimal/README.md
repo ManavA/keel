@@ -37,6 +37,28 @@ the API answers 401. In development the verification link is written to the
 service log, so the signup → verify → login flow can be walked through from
 the terminal (see `SITE_URL` below).
 
+## Browser UI
+
+The same service also serves HTML: a landing page at `/`, auth shells
+(`/login`, `/signup`, `/verify-sent`, `/reset`, `/health`), a notes page at
+`/notes` and a dashboard at `/app`, with fragments under `/ui/notes` for
+htmx. Pages are shells composed out of blocks (`templates/blocks/` holds the
+blocks); a fragment is a block rendered on its own, never a second copy. One
+stylesheet holds both themes (`static/css/tokens.css` scopes them with
+`[data-theme=landing]` and `[data-theme=dashboard]`), and htmx is vendored
+under `static/vendor/` with its version pinned in `static/vendor/VERSION`.
+
+The browser signs in through the same auth endpoints as the API: the
+login and signup forms call them in-process and store the returned token in
+an `HttpOnly` `SameSite=Lax` session cookie. A middleware copies that cookie
+into `Authorization` where no bearer token is present, so `RequireAuth` runs
+unchanged and the cookie opens exactly the rows the token would. Pages
+redirect to `/login` when the session is missing; fragments keep the 401. The
+notes blocks are `note_form`, `note_card`, `note_list`, `flash` and
+`empty_state`; the form writes through the same store, index and event path
+as a JSON create, so the two surfaces list and search the same rows, and a
+missing title is 422 with the form re-rendered around a flash.
+
 ## Configuration
 
 Only `DATABASE_URL` is required. Every other default is chosen so the service
@@ -133,5 +155,10 @@ config.go      the environment this service reads, and what it refuses
 auth.go        the auth service: DB-backed local accounts, optional Firebase/OIDC
 notes.go       the notes table, including the keyset page
 handlers.go    the HTTP API
+ui.go          the landing shell and the static assets, parsed once at startup
+ui_notes.go    the notes page and its fragments, over the same store as the API
+ui_auth.go     the auth shells and the session cookie, over the same auth service
+templates/     pages and the blocks they compose; a fragment is a block alone
+static/        stylesheets, the favicon, and vendored htmx with a VERSION pin
 migrations/    embedded, so the binary carries its own schema
 ```

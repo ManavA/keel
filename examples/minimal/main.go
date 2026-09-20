@@ -179,12 +179,36 @@ func run() int {
 	api.publisher = bus
 	api.auth = authSvc
 	api.Routes(a.Router())
-
+	// Templates parse once, before serving: a page or block that does not
+	// parse stops the process here rather than failing its first request.
+	tmpl, err := ParseTemplates()
+	if err != nil {
+		logger.Error("parse UI templates", "error", err)
+		return 1
+	}
+	api.tmpl = tmpl
+	api.NotesUIRoutes(a.Router())
 	// The auth package owns its routes; they live under /auth so the example
 	// stays one service with two concerns rather than two services. chi's
 	// Mount does not strip the prefix, so StripPrefix does — the auth
 	// package's own doc comment calls for exactly this.
-	a.Router().Mount("/auth", http.StripPrefix("/auth", authSvc.Router()))
+	//
+	// The form handlers reuse the same router instance in-process, so their
+	// validation, status codes and rate limit are the JSON endpoints'
+	// themselves rather than a second implementation beside them.
+	authRoutes := authSvc.Router()
+	a.Router().Mount("/auth", http.StripPrefix("/auth", authRoutes))
+	api.authRoutes = authRoutes
+	api.siteURL = cfg.SiteURL
+	api.tokenTTL = cfg.AuthTokenTTL
+	api.checks = map[string]httpx.Check{
+		"database": func(ctx context.Context) error { return pool.Ping(ctx) },
+		"search":   func(ctx context.Context) error { return index.Health(ctx) },
+	}
+	api.AuthUIRoutes(a.Router())
+	// The landing shell and the static assets need no database, so they hang
+	// off their own value rather than the API.
+	NewUI(tmpl).Routes(a.Router())
 
 	// One subscriber, for the side effect that may be missed. The in-memory bus
 	// is at-most-once, which is the right fit for a notification and the wrong
