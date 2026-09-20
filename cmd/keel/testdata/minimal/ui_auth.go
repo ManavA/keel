@@ -117,12 +117,14 @@ func (a *API) requirePageAuth(next http.Handler) http.Handler {
 // mounted under /auth: the same handler, the same rate limiter, no network.
 // The caller's RemoteAddr travels along, so the per-IP limiter still buckets
 // the browser behind the request rather than every form submit together.
-func (a *API) callAuthJSON(r *http.Request, method, path string, body any, token string) (int, []byte) {
+// method is always POST: every auth JSON endpoint mutates, so the helper
+// fixes the verb rather than carrying a parameter that never varies.
+func (a *API) callAuthJSON(r *http.Request, path string, body any, token string) (int, []byte) {
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(body); err != nil {
 		return http.StatusInternalServerError, nil
 	}
-	req := httptest.NewRequest(method, path, &buf)
+	req := httptest.NewRequest(http.MethodPost, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
 	req.RemoteAddr = r.RemoteAddr
 	if token != "" {
@@ -195,7 +197,7 @@ func (a *API) doLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	email := r.PostFormValue("email")
 
-	status, raw := a.callAuthJSON(r, http.MethodPost, "/login", map[string]string{
+	status, raw := a.callAuthJSON(r, "/login", map[string]string{
 		"email":    email,
 		"password": r.PostFormValue("password"),
 	}, "")
@@ -228,7 +230,7 @@ func (a *API) doSignup(w http.ResponseWriter, r *http.Request) {
 	}
 	email := r.PostFormValue("email")
 
-	status, raw := a.callAuthJSON(r, http.MethodPost, "/signup", map[string]string{
+	status, raw := a.callAuthJSON(r, "/signup", map[string]string{
 		"email":    email,
 		"password": r.PostFormValue("password"),
 	}, "")
@@ -256,7 +258,7 @@ func (a *API) verifySent(w http.ResponseWriter, r *http.Request) {
 // Success renders the login shell with a fixed notice; a spent or bogus token
 // renders the same shell with the failure instead.
 func (a *API) doVerifyEmail(w http.ResponseWriter, r *http.Request) {
-	status, _ := a.callAuthJSON(r, http.MethodPost, "/verify-email", map[string]string{
+	status, _ := a.callAuthJSON(r, "/verify-email", map[string]string{
 		"token": r.URL.Query().Get("token"),
 	}, "")
 	if status != http.StatusOK {
@@ -288,7 +290,7 @@ func (a *API) doResetRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	email := r.PostFormValue("email")
-	a.callAuthJSON(r, http.MethodPost, "/forgot-password", map[string]string{"email": email}, "")
+	a.callAuthJSON(r, "/forgot-password", map[string]string{"email": email}, "")
 	renderTemplate(w, r, a.tmpl, "page-reset", authPageData{
 		Title: "Reset your password",
 		Email: email,
@@ -308,7 +310,7 @@ func (a *API) doResetConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := r.PostFormValue("token")
-	status, _ := a.callAuthJSON(r, http.MethodPost, "/reset-password", map[string]string{
+	status, _ := a.callAuthJSON(r, "/reset-password", map[string]string{
 		"token":        token,
 		"new_password": r.PostFormValue("new_password"),
 	}, "")
@@ -331,7 +333,7 @@ func (a *API) doResetConfirm(w http.ResponseWriter, r *http.Request) {
 // failure is logged rather than shown.
 func (a *API) doLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
-		if status, _ := a.callAuthJSON(r, http.MethodPost, "/logout", map[string]string{}, c.Value); status != http.StatusOK {
+		if status, _ := a.callAuthJSON(r, "/logout", map[string]string{}, c.Value); status != http.StatusOK {
 			httpx.Logger(r.Context()).WarnContext(r.Context(), "auth UI logout delegation failed", "status", status)
 		}
 	}
