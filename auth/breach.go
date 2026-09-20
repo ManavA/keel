@@ -44,7 +44,7 @@ type HIBPBreachChecker struct {
 
 // Breached implements BreachChecker.
 func (c *HIBPBreachChecker) Breached(ctx context.Context, password string) (bool, error) {
-	sum := sha1.Sum([]byte(password))
+	sum := sha1.Sum([]byte(password)) //nolint:gosec // SHA-1 mandated by HIBP k-anonymity, not a choice
 	digest := strings.ToUpper(hex.EncodeToString(sum[:]))
 	prefix, suffix := digest[:5], digest[5:]
 
@@ -65,7 +65,7 @@ func (c *HIBPBreachChecker) Breached(ctx context.Context, password string) (bool
 	if err != nil {
 		return false, fmt.Errorf("auth: breach range request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return false, fmt.Errorf("auth: breach range request returned status %d", resp.StatusCode)
 	}
