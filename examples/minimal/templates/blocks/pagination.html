@@ -1,0 +1,1 @@
+{{define "pagination"}}<p class="pagination" role="status">Showing {{len .Notes}} note{{if ne (len .Notes) 1}}s{{end}}.{{if .HasMore}} Older notes are beyond this page.{{end}}</p>{{end}}

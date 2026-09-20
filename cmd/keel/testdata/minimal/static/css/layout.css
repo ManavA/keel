@@ -79,6 +79,17 @@ a {
   padding: var(--space-2) var(--space-3);
 }
 
+/* The per-field error under the title input. Same danger tokens as the
+   flash, smaller voice: the flash summarizes, this one points. */
+.field-error {
+  color: var(--danger);
+  margin: var(--space-1) 0 0;
+}
+
+#note-form [aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
 /* One note in the list. */
 .note-card {
   background: var(--surface);
@@ -113,5 +124,12 @@ a {
   border: 1px dashed var(--line);
   border-radius: var(--radius);
   padding: var(--space-4);
+  text-align: center;
+}
+
+/* The page status under the list. Muted by design: it narrates, it never
+   shouts over the notes. */
+.pagination {
+  color: var(--muted);
   text-align: center;
 }

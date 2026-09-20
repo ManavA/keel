@@ -168,6 +168,7 @@ func TestNewGeneratesAMinimalProject(t *testing.T) {
 		filepath.Join("templates", "blocks", "note_list.html"),
 		filepath.Join("templates", "blocks", "note_card.html"),
 		filepath.Join("templates", "blocks", "note_form.html"),
+		filepath.Join("templates", "blocks", "pagination.html"),
 		filepath.Join("static", "css", "tokens.css"),
 		filepath.Join("static", "css", "layout.css"),
 		filepath.Join("static", "vendor", "htmx.min.js"),

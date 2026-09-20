@@ -45,13 +45,18 @@ var blockDocs = map[string]struct {
 	},
 	"note_form": {
 		purpose: "The create form. It posts through hx-post and prepends the new card to the list.",
-		sample:  "Rendered empty, as the notes page serves it on first load.",
-		height:  440,
+		sample:  `Rendered with a title error, as the notes page serves it after a 422 — flash above, the field marked below.`,
+		height:  500,
 	},
 	"note_list": {
 		purpose: "The list. Cards while there are notes, the empty state otherwise — never a second copy of either.",
 		sample:  "Rendered with two notes, one without a body to show the card's short form.",
 		height:  560,
+	},
+	"pagination": {
+		purpose: "The page status under the list. It names the count and says whether older notes lie beyond it.",
+		sample:  "Rendered with two notes and a next page waiting.",
+		height:  100,
 	},
 }
 
@@ -63,13 +68,15 @@ type sampleNote struct {
 }
 
 type sampleForm struct {
-	Title string
-	Body  string
-	Flash string
+	Title      string
+	Body       string
+	Flash      string
+	TitleError string
 }
 
 type sampleList struct {
-	Notes []sampleNote
+	Notes   []sampleNote
+	HasMore bool
 }
 
 func sampleNotes() []sampleNote {
@@ -98,9 +105,15 @@ func sampleData(block string) (any, error) {
 	case "note_card":
 		return sampleNotes()[0], nil
 	case "note_form":
-		return sampleForm{}, nil
+		return sampleForm{
+			Flash:      "A title is required.",
+			TitleError: "A title is required.",
+			Body:       "Slate tiles, south side",
+		}, nil
 	case "note_list":
 		return sampleList{Notes: sampleNotes()}, nil
+	case "pagination":
+		return sampleList{Notes: sampleNotes(), HasMore: true}, nil
 	default:
 		return nil, fmt.Errorf("no sample data for block %q: add it to sampleData and blockDocs", block)
 	}

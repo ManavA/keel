@@ -10,14 +10,15 @@
 <body>
 <main class="dashboard">
 <form id="note-form" action="/notes" method="post" hx-post="/notes" hx-target="#notes-list" hx-swap="afterbegin">
-
+<p class="flash" role="alert">A title is required.</p>
 <div>
 <label for="note-title">Title</label>
-<input id="note-title" name="title" type="text" required autocomplete="off" value="">
+<input id="note-title" name="title" type="text" required autocomplete="off" value="" aria-invalid="true" aria-describedby="note-title-error">
+<p class="field-error" id="note-title-error" role="alert">A title is required.</p>
 </div>
 <div>
 <label for="note-body">Body</label>
-<textarea id="note-body" name="body" rows="3"></textarea>
+<textarea id="note-body" name="body" rows="3">Slate tiles, south side</textarea>
 </div>
 <button type="submit">Add note</button>
 </form>

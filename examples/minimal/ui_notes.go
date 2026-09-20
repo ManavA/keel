@@ -15,8 +15,8 @@ import (
 )
 
 // notesPageLimit bounds the UI list. Keyset paging stays on the JSON API,
-// which hands back cursors; the page reads the newest rows and says nothing
-// about a next one.
+// which hands back cursors; the page reads the newest rows and the pagination
+// block says whether older ones lie beyond it.
 const notesPageLimit = 50
 
 // notesPageData is what the notes page and its blocks render. One shape for
@@ -27,6 +27,13 @@ type notesPageData struct {
 	// Flash is the one inline message, rendered by the flash block and empty
 	// when there is nothing to say.
 	Flash string
+	// TitleError marks the title field after a validation error, so the form
+	// names the field at fault instead of flashing alone. Empty when the
+	// title stands unaccused.
+	TitleError string
+	// HasMore says the list was truncated at notesPageLimit, rendered by the
+	// pagination block so a full page does not end quietly.
+	HasMore bool
 	// Title and Body carry the caller's input back into the form after a
 	// validation error, so a missing title does not eat the body they typed.
 	Title string
@@ -108,14 +115,14 @@ func (a *API) NotesUIRoutes(r chi.Router) {
 // notesPage renders the notes page, or the list block on its own when htmx
 // asks for the fragment.
 func (a *API) notesPage(w http.ResponseWriter, r *http.Request) {
-	notes, _, err := a.notes.List(r.Context(), auth.UserIDFromContext(r.Context()), notesPageLimit, "")
+	notes, next, err := a.notes.List(r.Context(), auth.UserIDFromContext(r.Context()), notesPageLimit, "")
 	if err != nil {
 		// The cursor is always empty here, so a failure is the database, not
 		// the caller.
 		httpx.InternalError(w, r, err)
 		return
 	}
-	data := notesPageData{Notes: notes}
+	data := notesPageData{Notes: notes, HasMore: next != ""}
 	if isHXRequest(r) {
 		renderTemplate(w, r, a.tmpl, "note_list", data)
 		return
@@ -126,8 +133,8 @@ func (a *API) notesPage(w http.ResponseWriter, r *http.Request) {
 // notesCreate reads a form-encoded note and writes it through the same path
 // as a JSON create. Over htmx the answer is the new card at 201; without it
 // the answer is a redirect back to the list. A missing title is 422 with the
-// form re-rendered around a flash, never a silent redirect that drops the
-// input.
+// form re-rendered around a flash and the title field marked, never a silent
+// redirect that drops the input.
 func (a *API) notesCreate(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	if err := r.ParseForm(); err != nil {
@@ -138,6 +145,7 @@ func (a *API) notesCreate(w http.ResponseWriter, r *http.Request) {
 
 	title, err := validateNoteTitle(form.Title)
 	if err != nil {
+		form.TitleError = "A title is required."
 		a.notesFormError(w, r, form, "A title is required.")
 		return
 	}
@@ -162,12 +170,13 @@ func (a *API) notesCreate(w http.ResponseWriter, r *http.Request) {
 func (a *API) notesFormError(w http.ResponseWriter, r *http.Request, form notesPageData, flash string) {
 	form.Flash = flash
 	if !isHXRequest(r) {
-		notes, _, err := a.notes.List(r.Context(), auth.UserIDFromContext(r.Context()), notesPageLimit, "")
+		notes, next, err := a.notes.List(r.Context(), auth.UserIDFromContext(r.Context()), notesPageLimit, "")
 		if err != nil {
 			httpx.InternalError(w, r, err)
 			return
 		}
 		form.Notes = notes
+		form.HasMore = next != ""
 		renderTemplateStatus(w, r, a.tmpl, "notes", form, http.StatusUnprocessableEntity)
 		return
 	}
