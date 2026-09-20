@@ -9,6 +9,7 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/ManavA/keel/httpx/middleware"
+	"github.com/ManavA/keel/metrics"
 )
 
 // RouterOptions configures NewRouter. The zero value gives you request ids,
@@ -30,6 +31,10 @@ type RouterOptions struct {
 	// entirely — for a service that logs somewhere else.
 	RequestLog     middleware.RequestLogOptions
 	SkipRequestLog bool
+
+	// Metrics receives one count and one duration per request, labeled
+	// with the route pattern and status. Nil records nothing.
+	Metrics *metrics.Metrics
 
 	Recoverer middleware.RecovererOptions
 
@@ -66,6 +71,9 @@ const DefaultTimeout = 30 * time.Second
 //	                    limiter having already bucketed every client behind the
 //	                    proxy together
 //	RequestLog          above Recoverer, so a panic is still logged as a request
+//	Observe             with the request log when Metrics is set, above
+//	                    Recoverer, so a recovered panic is recorded as the
+//	                    500 the client receives
 //	Recoverer           above the timeout and the handler, to catch both
 //	Timeout, compression, CORS, rate limit
 //
@@ -102,6 +110,9 @@ func NewRouter(opts RouterOptions) *chi.Mux {
 			logOpts.Logger = logger
 		}
 		r.Use(middleware.RequestLog(logOpts))
+	}
+	if opts.Metrics != nil {
+		r.Use(middleware.Observe(opts.Metrics))
 	}
 
 	recOpts := opts.Recoverer
