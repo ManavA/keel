@@ -109,7 +109,7 @@ Postgres. Run it with `make run-local`, or start your own from it with
 | `webhooks` | Signed HTTP delivery of events to external URLs, over the outbox relay |
 | `notifyprefs` | Per-user notification opt-outs with send-path enforcement (`notifyprefs/pg` for Postgres) |
 | `app` | The service lifecycle: logger, pool, migrations, router, auth and admin mounts, jobs, shutdown |
-| `cmd/keel` | Scaffolds a project from a template profile (`keel new <name> [-profile minimal\|standard]`; minimal copies `examples/minimal`, standard copies `examples/fullstack`) |
+| `cmd/keel` | Scaffolds a project from a template profile (`keel new <name> [-profile minimal\|standard\|api\|worker\|webhook]`; minimal copies `examples/minimal`, standard copies `examples/fullstack`, api copies `examples/apionly`, worker copies `examples/worker`, webhook copies `examples/webhook`) |
 
 ## Configuration
 

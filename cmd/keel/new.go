@@ -61,6 +61,44 @@ var profiles = []profile{
 		},
 		bootEnvs: []string{"ADMIN_SECRET"},
 	},
+	{
+		name:    "api",
+		example: "apionly",
+		root:    "testdata/apionly",
+		blurb:   "the notes JSON API and auth without the browser UI: signup, session auth, keyset paging and search",
+		packages: []string{
+			"app", "auth", "config", "events", "httpx", "jobs", "log", "mail", "pg", "search",
+		},
+		migrations: []string{
+			"auth: 0001_auth_users through 0006_auth_session_windows",
+			"001_notes",
+			"002_notes_owner",
+		},
+	},
+	{
+		name:    "worker",
+		example: "worker",
+		root:    "testdata/worker",
+		blurb:   "jobs with no HTTP server: a scheduler that writes a heartbeat row on an interval",
+		packages: []string{
+			"config", "jobs", "log", "pg",
+		},
+		migrations: []string{
+			"001_worker_heartbeats",
+		},
+	},
+	{
+		name:    "webhook",
+		example: "webhook",
+		root:    "testdata/webhook",
+		blurb:   "a minimal webhook receiver: verifies the HMAC signature and stores each delivery",
+		packages: []string{
+			"app", "config", "httpx", "log", "pg", "webhooks",
+		},
+		migrations: []string{
+			"001_webhook_deliveries",
+		},
+	},
 }
 
 // defaultProfile is the template keel new copies when no profile is named.
@@ -69,7 +107,7 @@ const defaultProfile = "minimal"
 // templateFS holds every profile's example. Each subtree mirrors
 // examples/<example> file for file; see profile and cmd/new_test.go.
 //
-//go:embed all:testdata/minimal all:testdata/standard
+//go:embed all:testdata/minimal all:testdata/standard all:testdata/apionly all:testdata/worker all:testdata/webhook
 var templateFS embed.FS
 
 // keelModule and keelVersion are the require line a new project starts with.

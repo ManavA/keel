@@ -57,14 +57,29 @@ Usage:
 Profiles:
 
 	minimal
-		a Postgres-backed notes API with local auth, search and a background job.
+		a Postgres-backed notes API with local auth, search, a background job and a server-rendered web UI.
 		packages: app, auth, config, events, httpx, jobs, log, mail, pg, search
 		migrations: auth: 0001_auth_users through 0006_auth_session_windows; 001_notes; 002_notes_owner
 
 	standard
 		the minimal API plus operator auth, an outbox relay and idempotent writes.
 		packages: admin, app, auth, config, events, httpx, idempotency, jobs, log, outbox, pg
-		migrations: auth: 0001_auth_users through 0005_auth_login_attempts; admin: 0001_admin_users, 0002_admin_audit; outbox: 001_outbox_events, 002_outbox_events_parked; idempotency: 001_idempotency_keys; 001_fullstack_notes
+		migrations: auth: 0001_auth_users through 0006_auth_session_windows; admin: 0001_admin_users, 0002_admin_audit; outbox: 001_outbox_events, 002_outbox_events_parked; idempotency: 001_idempotency_keys; 001_fullstack_notes
+
+	api
+		the notes JSON API and auth without the browser UI: signup, session auth, keyset paging and search.
+		packages: app, auth, config, events, httpx, jobs, log, mail, pg, search
+		migrations: auth: 0001_auth_users through 0006_auth_session_windows; 001_notes; 002_notes_owner
+
+	worker
+		jobs with no HTTP server: a scheduler that writes a heartbeat row on an interval.
+		packages: config, jobs, log, pg
+		migrations: 001_worker_heartbeats
+
+	webhook
+		a minimal webhook receiver: verifies the HMAC signature and stores each delivery.
+		packages: app, config, httpx, log, pg, webhooks
+		migrations: 001_webhook_deliveries
 ```
 
 ## Scaffold with keel new
@@ -75,7 +90,7 @@ repository's own tests exercise:
 
 ```
 $ go run ./cmd/keel new /tmp/mynotes
-created /tmp/mynotes/ from keel's minimal profile: a Postgres-backed notes API with local auth, search and a background job.
+created /tmp/mynotes/ from keel's minimal profile: a Postgres-backed notes API with local auth, search, a background job and a server-rendered web UI.
 
 next:
 	cd /tmp/mynotes
