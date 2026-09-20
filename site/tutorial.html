@@ -35,7 +35,7 @@ DATABASE_URL='postgres://keel:keel@127.0.0.1:5432/keel?sslmode=disable' go run .
 <p>The service applies its embedded migrations before it listens, then reports ready:</p>
 <pre><code>{"msg":"migrations complete","applied":2,"already_applied":0}
 curl -s localhost:8080/readyz
-{"status":"ok","checks":{"database":"ok","search":"ok"}}</code></pre>
+{"status":"ok","build":{"revision":"unknown"},"checks":{"database":"ok","search":"ok"}}</code></pre>
 
 <h2>3. Walk the API</h2>
 <p>Sign up for a bearer token, then create, list and search notes. Every notes request needs
