@@ -53,7 +53,9 @@ outbox/          write an event with a transaction, relay it to events
   pg/              the outbox table's migration
 app/             the optional lifecycle: logger, pool, migrations, router,
                  auth and admin mounts, jobs, graceful shutdown
-cmd/keel/        scaffolding: `keel new` copies examples/minimal into a project
+cmd/keel/        scaffolding: `keel new` copies a template profile into a project
+                 (minimal from examples/minimal by default, standard from
+                 examples/fullstack)
 scripts/         developer and CI scripts
 deploy/          deployment templates and checks
 examples/
