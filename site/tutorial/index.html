@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tutorial: build a notes backend with keel</title>
+<link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="site">
+<span class="brand">keel</span><a href="../">Home</a><a href="./">Tutorial</a><a href="../showcase/">Showcase</a>
+</nav>
+
+<h1>Tutorial: build a notes backend with keel</h1>
+<p class="meta">A notes API over Postgres and nothing else — config, logging,
+migrations, auth, search, jobs and graceful shutdown. About 30 minutes.</p>
+
+<h2>0. Prerequisites</h2>
+<p>Go 1.26 or later, and Docker for the local Postgres. Fetch the module:</p>
+<pre><code>go get github.com/ManavA/keel</code></pre>
+
+<h2>1. Scaffold the example</h2>
+<p><code>keel new</code> copies a template profile into a project. The
+<code>minimal</code> profile is a notes API built out of keel, meant to be read
+rather than deployed:</p>
+<pre><code>go run ./cmd/keel new mynotes
+cd mynotes
+make run-local</code></pre>
+<p><code>make run-local</code> starts a Postgres in Docker, points the service
+at it and serves on :8080. Against a database you already have:</p>
+<pre><code>DATABASE_URL='postgres://user:pass@localhost:5432/db?sslmode=disable' go run ./examples/minimal</code></pre>
+<p>Only <code>DATABASE_URL</code> is required. Every other default is chosen so
+the service comes up with none of them set.</p>
+
+<h2>2. Walk through the wiring</h2>
+<p>The service entry point (<code>main.go</code>) follows the same order every
+keel service follows:</p>
+<ol>
+<li><strong>Logger first.</strong> <code>log.New</code> returns a JSON
+<code>slog</code> handler carrying request ids, with credential-shaped keys
+redacted. Development runs at Debug so verification links are walkable from the
+terminal; production stays at Info where they are never written.</li>
+<li><strong>Load config.</strong> <code>config.Load(&amp;cfg)</code> reads a
+struct from the environment, calls <code>Validate</code> if it implements it,
+and trims whitespace from secret and URL fields. Log it back with
+<code>config.Redacted</code>: secrets are replaced, URLs keep their host and
+lose their password.</li>
+<li><strong>Open the app.</strong> <code>app.New(app.Options{...})</code> holds
+the pool, migrations, routes, checks and jobs. Register health checks and
+scheduled jobs on the options, then <code>Open</code>. Migrations ride embedded
+in the binary (<code>//go:embed migrations/*.sql</code>), so there is never a
+question of which schema a build carries.</li>
+<li><strong>Mount auth next to the API.</strong> The auth package owns its
+routes under <code>/auth</code> (signup, login, verify-email, forgot/reset,
+refresh, logout). Notes handlers check the session token and scope every query
+— listing, search and all — to the calling account.</li>
+<li><strong>Index inline, notify by event.</strong> Notes are written to
+Postgres and indexed in the same request, so listing and search agree. The side
+effect that may be missed — a notification — goes out as a
+<code>note.created</code> event on the in-memory bus. A reconcile job rebuilds
+the index on an interval, which is what repairs an index left stale by a failed
+write.</li>
+<li><strong>Run and shut down cleanly.</strong> <code>a.Run(ctx)</code> serves
+until SIGINT or SIGTERM, then finishes the requests already in flight.
+<code>/healthz</code> checks nothing; <code>/readyz</code> checks the pool and
+the index.</li>
+</ol>
+
+<h2>3. Exercise it</h2>
+<pre><code>curl -s localhost:8080/readyz
+
+TOKEN=$(curl -s -X POST localhost:8080/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"password123"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+
+curl -s localhost:8080/api/notes \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Roof repair quote","body":"Slate tiles, south side"}'
+
+curl -s 'localhost:8080/api/notes?limit=2' -H "Authorization: Bearer $TOKEN"
+curl -s 'localhost:8080/api/notes/search?q=tile' -H "Authorization: Bearer $TOKEN"</code></pre>
+<p>Every notes request needs the bearer token; without one the API answers 401.
+Listing pages by keyset, so a note written while paging cannot shift a row
+across a page boundary — hand back <code>next_cursor</code> and nothing
+else.</p>
+
+<h2>4. Grow from here</h2>
+<ul>
+<li>Swap a default for an external backend by configuration, not a rewrite:
+Meilisearch for search, Postmark for mail, Cloud Pub/Sub for events. The
+<a href="../showcase/">showcase</a> lists every default and option.</li>
+<li>Add a second concern (an admin router, a new job) the way the example adds
+auth: another mount on the same app, sharing the pool.</li>
+<li>When a check could pass without exercising what it names, write the case
+that must fail — the test suite treats a self-skipping database test as a
+failure under <code>KEEL_REQUIRE_DB=1</code>.</li>
+</ul>
+
+<footer>
+<p>Source: <a href="https://github.com/ManavA/keel">github.com/ManavA/keel</a>
+(Apache 2.0). Worked example: <code>examples/minimal</code> in the repo.</p>
+</footer>
+</div>
+</body>
+</html>

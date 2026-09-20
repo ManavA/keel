@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Showcase: what keel ships</title>
+<link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="site">
+<span class="brand">keel</span><a href="../">Home</a><a href="../tutorial/">Tutorial</a><a href="./">Showcase</a>
+</nav>
+
+<h1>Showcase: what keel ships</h1>
+<p class="meta">Every package is usable on its own. Importing the module root
+gets you nothing — import the package you need.</p>
+
+<h2>Packages</h2>
+<table>
+<tr><th>Package</th><th>Description</th></tr>
+<tr><td><code>config</code></td><td>Environment loading over envconfig, optional dotenv, validation, secret trimming and redaction</td></tr>
+<tr><td><code>log</code></td><td>JSON <code>slog</code> handler carrying request ids, with credential-shaped keys redacted</td></tr>
+<tr><td><code>httpx</code></td><td>HTTP server with graceful shutdown, chi router, middleware, JSON responses, health endpoints</td></tr>
+<tr><td><code>httpx/middleware</code></td><td>Real client address, request id, request log, panic recovery, CORS, rate limiting</td></tr>
+<tr><td><code>httpx/buildinfo</code></td><td>The revision the running binary was built from</td></tr>
+<tr><td><code>pg</code></td><td>pgx v5 pool, transaction helper, offset and keyset paging</td></tr>
+<tr><td><code>pg/migrate</code></td><td>Migration runner with a ledger, and a replay check</td></tr>
+<tr><td><code>pg/testdb</code></td><td>Docker Postgres harness for tests</td></tr>
+<tr><td><code>search</code></td><td>Document index over Postgres, or Meilisearch via <code>search/meili</code></td></tr>
+<tr><td><code>jobs</code></td><td>Background work with run outcomes, an in-process scheduler, and <code>jobs/cloudrun</code> triggers</td></tr>
+<tr><td><code>events</code></td><td>Publish and subscribe in memory, or over Cloud Pub/Sub via <code>events/pubsub</code></td></tr>
+<tr><td><code>mail</code></td><td>Transactional email over a log sender or Postmark</td></tr>
+<tr><td><code>media</code></td><td>Object storage and image derivatives, local filesystem or Google Cloud Storage</td></tr>
+<tr><td><code>geocode</code></td><td>Address to coordinate lookup with a degrade chain, Mapbox or a no-op default</td></tr>
+<tr><td><code>perf</code></td><td>Response caching, ETag, gzip, and singleflight middleware for HTTP handlers</td></tr>
+<tr><td><code>auth</code></td><td>Authentication across local, Firebase and generic OIDC sources; sessions, verification, password reset (<code>auth/pg</code> for Postgres)</td></tr>
+<tr><td><code>admin</code></td><td>Administrative session auth and a CORS-scoped router (<code>admin/pg</code> for Postgres)</td></tr>
+<tr><td><code>textpolicy</code></td><td>One normalize-then-match guard for generated and forwarded text</td></tr>
+<tr><td><code>retry</code></td><td>Exponential backoff with full jitter, and context cancellation</td></tr>
+<tr><td><code>idempotency</code></td><td>HTTP middleware replaying a stored response for a repeated <code>Idempotency-Key</code></td></tr>
+<tr><td><code>flags</code></td><td>Per-subject feature flags with percentage rollout and allowlist (<code>flags/pg</code> for Postgres)</td></tr>
+<tr><td><code>outbox</code></td><td>Write an event with a domain transaction, then relay it to <code>events</code></td></tr>
+<tr><td><code>metrics</code></td><td>Counters and histograms with a no-op default and OTel via <code>metrics/otel</code></td></tr>
+<tr><td><code>webhooks</code></td><td>Signed HTTP delivery of events to external URLs, over the outbox relay</td></tr>
+<tr><td><code>notifyprefs</code></td><td>Per-user notification opt-outs with send-path enforcement (<code>notifyprefs/pg</code> for Postgres)</td></tr>
+<tr><td><code>app</code></td><td>Service lifecycle: logger, pool, migrations, router, auth and admin mounts, jobs, shutdown</td></tr>
+<tr><td><code>cmd/keel</code></td><td>Scaffolds a project from a template profile (<code>minimal</code> or <code>standard</code>)</td></tr>
+</table>
+
+<h2>In-process defaults, external options</h2>
+<p>A package that talks to an external service also works without it. The
+external provider is selected by configuration, and the heavy dependency stays
+in a subpackage so importing the package does not pull in a client nobody
+asked for.</p>
+<table>
+<tr><th>Package</th><th>Default</th><th>External option</th></tr>
+<tr><td><code>search</code></td><td>Postgres full-text</td><td>Meilisearch (<code>search/meili</code>)</td></tr>
+<tr><td><code>mail</code></td><td>log sender</td><td>Postmark</td></tr>
+<tr><td><code>events</code></td><td>in-memory bus</td><td>Cloud Pub/Sub (<code>events/pubsub</code>)</td></tr>
+<tr><td><code>jobs</code></td><td>in-process scheduler</td><td>Cloud Run triggers (<code>jobs/cloudrun</code>)</td></tr>
+<tr><td><code>media</code></td><td>local filesystem</td><td>Google Cloud Storage</td></tr>
+<tr><td><code>geocode</code></td><td>no-op provider</td><td>Mapbox</td></tr>
+<tr><td><code>auth</code></td><td>local (in-memory; <code>auth/pg</code> for Postgres)</td><td>Firebase ID tokens, any OIDC issuer</td></tr>
+<tr><td><code>metrics</code></td><td>no-op recorder</td><td>OpenTelemetry (<code>metrics/otel</code>)</td></tr>
+</table>
+
+<h2>Example services</h2>
+<p><strong>minimal</strong> (<code>examples/minimal</code>) — a notes API over
+Postgres and nothing else: config read and logged safely, password auth with
+verification and reset mounted next to the API, keyset paging, Postgres search
+with a reconcile job, an event-driven notification, and a shutdown that
+finishes in-flight requests. The <a href="../tutorial/">tutorial</a> is built
+on it.</p>
+<p><strong>fullstack</strong> (<code>examples/fullstack</code>) — the standard
+profile for <code>keel new</code>, extending the same shape with more of the
+packages wired together.</p>
+
+<h2>Architecture in one paragraph</h2>
+<p>Packages are layered, never siblings: a package may depend on the standard
+library, on third-party libraries, and on keel packages below it. Where two
+packages need each other, the connection is an interface the caller supplies —
+<code>httpx.Health</code> takes check functions and <code>pg.HealthCheck</code>
+returns one, so neither imports the other. The mechanical test:
+<code>go get github.com/ManavA/keel/pg</code> into a service with no HTTP
+server must compile. See <code>ARCHITECTURE.md</code> in the repo for the
+layout and import rules.</p>
+
+<footer>
+<p>Source: <a href="https://github.com/ManavA/keel">github.com/ManavA/keel</a>
+(Apache 2.0).</p>
+</footer>
+</div>
+</body>
+</html>
