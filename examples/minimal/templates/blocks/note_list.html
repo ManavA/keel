@@ -1,0 +1,3 @@
+{{define "note_list"}}<div id="notes-list">
+{{if .Notes}}{{range .Notes}}{{template "note_card" .}}{{end}}{{else}}{{template "empty_state" .}}{{end}}
+</div>{{end}}

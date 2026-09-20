@@ -1,0 +1,12 @@
+{{define "note_form"}}<form id="note-form" action="/notes" method="post" hx-post="/notes" hx-target="#notes-list" hx-swap="afterbegin">
+{{template "flash" .}}
+<div>
+<label for="note-title">Title</label>
+<input id="note-title" name="title" type="text" required autocomplete="off" value="{{.Title}}">
+</div>
+<div>
+<label for="note-body">Body</label>
+<textarea id="note-body" name="body" rows="3">{{.Body}}</textarea>
+</div>
+<button type="submit">Add note</button>
+</form>{{end}}

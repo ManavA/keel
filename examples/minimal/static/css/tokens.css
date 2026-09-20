@@ -1,0 +1,45 @@
+/* Theme tokens. One stylesheet, two themes, no per-theme directories: a page
+   picks its theme with <html data-theme="..."> and nothing else moves.
+   Layout and components in layout.css read these tokens and never name a
+   color, so re-theming is editing the values below only. */
+
+:root {
+  --font-body: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-heading: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --radius: 8px;
+  --measure: 44rem;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 1rem;
+  --space-4: 1.5rem;
+  --space-5: 2.5rem;
+}
+
+/* Landing: the public face. Paper background, ink text, one accent. */
+:root[data-theme=landing] {
+  --bg: #faf9f6;
+  --surface: #ffffff;
+  --ink: #1c1a17;
+  --muted: #6b655c;
+  --line: #e3ded4;
+  --accent: #1d5c3f;
+  --accent-ink: #ffffff;
+  --danger: #a83226;
+  --danger-surface: #fbeeec;
+  --focus: #1d5c3f;
+}
+
+/* Dashboard: the signed-in workspace. Dark surface, same accent family, so
+   controls keep their meaning across the sign-in boundary. */
+:root[data-theme=dashboarx] {
+  --bg: #16150f;
+  --surface: #201f18;
+  --ink: #ece7da;
+  --muted: #a8a294;
+  --line: #35332a;
+  --accent: #4fae7d;
+  --accent-ink: #101511;
+  --danger: #e0685c;
+  --danger-surface: #2c1b18;
+  --focus: #4fae7d;
+}

@@ -28,6 +28,7 @@ import (
 	"github.com/ManavA/keel/pg"
 	"github.com/ManavA/keel/pg/testdb"
 	"github.com/ManavA/keel/search"
+	"github.com/go-chi/chi/v5"
 )
 
 // An example nobody runs stops working quietly. These tests exercise it the way
@@ -133,9 +134,28 @@ func newTestServer(t *testing.T) *testService {
 	api.auth = authSvc
 	api.Routes(a.Router())
 
+	// The same UI wiring run() applies: templates parsed once, the notes UI
+	// beside the JSON API, the landing shell and static assets beside those.
+	// The auth router instance is shared with the form handlers the way run()
+	// shares it, so the tests exercise the same rate limiter the binary runs.
+	tmpl, err := ParseTemplates()
+	require.NoError(t, err)
+	api.tmpl = tmpl
+	api.NotesUIRoutes(a.Router())
+	NewUI(tmpl).Routes(a.Router())
+
 	// The auth package owns its routes; they live under /auth the way run()
 	// mounts them.
-	a.Router().Mount("/auth", http.StripPrefix("/auth", authSvc.Router()))
+	authRoutes := authSvc.Router()
+	a.Router().Mount("/auth", http.StripPrefix("/auth", authRoutes))
+	api.authRoutes = authRoutes
+	api.siteURL = cfg.SiteURL
+	api.tokenTTL = cfg.AuthTokenTTL
+	api.checks = map[string]httpx.Check{
+		"database": func(ctx context.Context) error { return pool.Ping(ctx) },
+		"search":   func(ctx context.Context) error { return index.Health(ctx) },
+	}
+	api.AuthUIRoutes(a.Router())
 
 	srv := httptest.NewServer(a.Router())
 
@@ -705,4 +725,58 @@ func TestBuildAuthServiceNeedsItsSettings(t *testing.T) {
 		},
 		slog.Default(), ts.pool, ts.mail)
 	assert.ErrorContains(t, err, "together", "firebase and oidc together must not build")
+}
+
+// newUIServer mounts only the UI routes, so the boot and fragment paths run
+// without a database.
+func newUIServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	tmpl, err := ParseTemplates()
+	require.NoError(t, err)
+	ui := NewUI(tmpl)
+	r := chi.NewRouter()
+	ui.Routes(r)
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestLandingServesBootPage proves the service boots into a page: GET /
+// answers 200 in the landing theme, pulling the token stylesheet and htmx.
+func TestLandingServesBootPage(t *testing.T) {
+	srv := newUIServer(t)
+
+	resp, err := srv.Client().Get(srv.URL + "/") //nolint:gosec // G107: test reads its own server
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+
+	body := string(raw)
+	assert.Contains(t, body, `data-theme="landing"`)
+	assert.Contains(t, body, "/static/css/tokens.css")
+	assert.Contains(t, body, "/static/css/layout.css")
+	assert.Contains(t, body, "/static/vendor/htmx.min.js")
+}
+
+// TestLandingFragmentViaHXRequest proves a block renders standalone over
+// HTTP: an htmx request for the boot page gets the main block only, without
+// the document around it. Fragments are blocks, not second copies.
+func TestLandingFragmentViaHXRequest(t *testing.T) {
+	srv := newUIServer(t)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/", nil)
+	require.NoError(t, err)
+	req.Header.Set("HX-Request", "true")
+	resp, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(raw))
+
+	body := string(raw)
+	assert.NotContains(t, body, "<html")
+	assert.Contains(t, body, "landing-main")
 }

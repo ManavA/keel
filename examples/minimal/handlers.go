@@ -4,9 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"net/http"
-	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -23,12 +24,25 @@ const topicNoteCreated = "note.created"
 
 // API holds what the handlers need. Concrete types where there is one
 // implementation, interfaces where the point is that the implementation is
-// chosen by configuration.
+// chosen by configuration. tmpl renders the browser UI; the JSON handlers
+// never touch it.
 type API struct {
 	notes     *Notes
 	index     search.Index
 	publisher events.Publisher
 	auth      *auth.Service
+	tmpl      *template.Template
+	// authRoutes is the same handler mounted under /auth, kept so the form
+	// handlers can reuse the JSON endpoints in-process (see callAuthJSON).
+	// Sharing the instance matters, not just the routes: the rate limiter is
+	// built when the router is, so a second instance would limit nothing.
+	authRoutes http.Handler
+	// siteURL decides the Secure flag on the session cookie, and tokenTTL its
+	// lifetime; both mirror the session the cookie carries.
+	siteURL  string
+	tokenTTL time.Duration
+	// checks backs the health shell with the same probes readiness reports.
+	checks map[string]httpx.Check
 }
 
 // Routes registers this API under r. Every notes route requires a session:
@@ -62,35 +76,16 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.Title = strings.TrimSpace(req.Title)
-	if req.Title == "" {
-		httpx.BadRequest(w, r, errors.New("title is empty"))
+	title, err := validateNoteTitle(req.Title)
+	if err != nil {
+		httpx.BadRequest(w, r, err)
 		return
 	}
 
-	note, err := a.notes.Create(r.Context(), auth.UserIDFromContext(r.Context()), req.Title, req.Body)
+	note, err := a.createNoteWithSideEffects(r.Context(), auth.UserIDFromContext(r.Context()), title, req.Body)
 	if err != nil {
 		httpx.InternalError(w, r, err)
 		return
-	}
-
-	// Indexed inline, not on the event. The listing and the search results are
-	// expected to agree, and the in-memory bus is at-most-once: a dropped
-	// message would leave a note that exists and cannot be found, with nothing
-	// saying so.
-	if err := a.index.IndexDocuments(r.Context(), []search.Document{noteDocument(note)}); err != nil {
-		httpx.InternalError(w, r, fmt.Errorf("index note %s: %w", note.ID, err))
-		return
-	}
-
-	// Published for the side effects that may be missed: a notification, a
-	// metric. The reconcile job is what repairs the index if this is ever
-	// wrong.
-	if err := a.publisher.Publish(r.Context(), topicNoteCreated, note); err != nil {
-		// Not fatal to the request: the note is written and indexed, and a
-		// failed notification must not undo that.
-		httpx.Logger(r.Context()).WarnContext(r.Context(), "publish note.created",
-			"note_id", note.ID, "error", err)
 	}
 
 	httpx.JSON(w, http.StatusCreated, note)
@@ -117,7 +112,7 @@ func (a *API) get(w http.ResponseWriter, r *http.Request) {
 func (a *API) delete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	err := a.notes.Delete(r.Context(), auth.UserIDFromContext(r.Context()), id)
+	err := a.deleteNoteWithSideEffects(r.Context(), auth.UserIDFromContext(r.Context()), id)
 	switch {
 	case errors.Is(err, ErrNoteNotFound):
 		httpx.NotFound(w, r)
@@ -131,12 +126,6 @@ func (a *API) delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := a.index.RemoveDocuments(r.Context(), []string{id}); err != nil {
-		// The row is gone, so the request succeeded. The index is now stale by
-		// one document, which the reconcile job repairs.
-		httpx.Logger(r.Context()).ErrorContext(r.Context(), "remove note from index",
-			"note_id", id, "error", err)
-	}
 	httpx.NoContent(w)
 }
 

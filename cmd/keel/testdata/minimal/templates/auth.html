@@ -1,0 +1,141 @@
+{{define "page-login"}}<!DOCTYPE html>
+<html lang="en" data-theme="landing">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log in</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+<main class="auth">
+<h1>Log in</h1>
+{{template "flash" .}}
+{{template "form_login" .}}
+<p><a href="/reset">Forgot your password? Reset it.</a></p>
+<p>No account yet? <a href="/signup">Sign up.</a></p>
+</main>
+</body>
+</html>{{end}}
+{{define "form_login"}}<form action="/login" method="post">
+<div>
+<label for="login-email">Email</label>
+<input id="login-email" name="email" type="email" required autocomplete="email" value="{{.Email}}">
+</div>
+<div>
+<label for="login-password">Password</label>
+<input id="login-password" name="password" type="password" required autocomplete="current-password">
+</div>
+<button type="submit">Log in</button>
+</form>{{end}}
+{{define "page-signup"}}<!DOCTYPE html>
+<html lang="en" data-theme="landing">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign up</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+<main class="auth">
+<h1>Sign up</h1>
+{{template "flash" .}}
+{{template "form_signup" .}}
+<p>Have an account? <a href="/login">Log in.</a></p>
+</main>
+</body>
+</html>{{end}}
+{{define "form_signup"}}<form action="/signup" method="post">
+<div>
+<label for="signup-email">Email</label>
+<input id="signup-email" name="email" type="email" required autocomplete="email" value="{{.Email}}">
+</div>
+<div>
+<label for="signup-password">Password</label>
+<input id="signup-password" name="password" type="password" required autocomplete="new-password" minlength="8">
+</div>
+<button type="submit">Sign up</button>
+</form>{{end}}
+{{define "page-verify-sent"}}<!DOCTYPE html>
+<html lang="en" data-theme="landing">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Check your inbox</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+<main class="auth">
+<h1>Check your inbox</h1>
+<p>A verification link is on its way. Follow it to verify your email, then log in.</p>
+<p><a href="/login">Back to login.</a></p>
+</main>
+</body>
+</html>{{end}}
+{{define "page-reset"}}<!DOCTYPE html>
+<html lang="en" data-theme="landing">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reset your password</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+<main class="auth">
+<h1>Reset your password</h1>
+{{template "flash" .}}
+{{if .Sent}}<p>If an account exists for that email, a reset link is on its way.</p>
+{{else if .Token}}{{template "form_reset_confirm" .}}
+{{else}}{{template "form_reset_request" .}}
+{{end}}
+<p><a href="/login">Back to login.</a></p>
+</main>
+</body>
+</html>{{end}}
+{{define "form_reset_request"}}<form action="/reset" method="post">
+<div>
+<label for="reset-email">Email</label>
+<input id="reset-email" name="email" type="email" required autocomplete="email" value="{{.Email}}">
+</div>
+<button type="submit">Send reset link</button>
+</form>{{end}}
+{{define "form_reset_confirm"}}<form action="/reset/confirm" method="post">
+<input type="hidden" name="token" value="{{.Token}}">
+<div>
+<label for="reset-new-password">New password</label>
+<input id="reset-new-password" name="new_password" type="password" required autocomplete="new-password" minlength="8">
+</div>
+<button type="submit">Set new password</button>
+</form>{{end}}
+{{define "page-health"}}<!DOCTYPE html>
+<html lang="en" data-theme="landing">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Service health</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+<main class="health">
+<h1>Service health</h1>
+<ul>
+{{range .Checks}}<li>{{.Name}}: {{if .OK}}ok{{else}}fail{{end}}</li>
+{{end}}
+</ul>
+</main>
+</body>
+</html>{{end}}

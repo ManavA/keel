@@ -34,7 +34,7 @@ var profiles = []profile{
 		name:    "minimal",
 		example: "minimal",
 		root:    "testdata/minimal",
-		blurb:   "a Postgres-backed notes API with local auth, search and a background job",
+		blurb:   "a Postgres-backed notes API with local auth, search, a background job and a server-rendered web UI",
 		packages: []string{
 			"app", "auth", "config", "events", "httpx", "jobs", "log", "mail", "pg", "search",
 		},
