@@ -124,7 +124,7 @@ jobs:
           # A scan of an empty clone reports no leaks and exits 0. The
           # checkout above always provides history; refuse to pass without it.
           test "$(git rev-list --count HEAD)" -gt 0
-          gitleaks detect --source . --config .gitleaks.toml --verbose --exit-code=1
+          gitleaks detect --source . --config .gitleaks.toml --verbose --redact --exit-code=1
 
   deploy-scripts:
     runs-on: ubuntu-latest
