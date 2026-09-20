@@ -103,3 +103,54 @@ func upperCaseEmail(email string) string {
 	}
 	return upper
 }
+
+func TestAdminStoreListAndRevokeSessions(t *testing.T) {
+	pool := newTestPool(t)
+	store := adminpg.NewAdminStore(pool)
+	ctx := context.Background()
+
+	first := &admin.Admin{Email: uniqueEmail(t), Name: "First", Role: "admin", PasswordHash: "hash"}
+	require.NoError(t, store.Create(ctx, first))
+	second := &admin.Admin{Email: uniqueEmail(t), Name: "Second", Role: "viewer", PasswordHash: "hash"}
+	require.NoError(t, store.Create(ctx, second))
+
+	admins, err := store.List(ctx)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, len(admins), 2, "the list holds every admin")
+	emails := make([]string, 0, len(admins))
+	for _, a := range admins {
+		emails = append(emails, a.Email)
+	}
+	assert.Contains(t, emails, first.Email)
+	assert.Contains(t, emails, second.Email)
+	assert.True(t, isSortedStrings(emails), "the list is ordered by email")
+
+	got, err := store.GetByID(ctx, first.ID)
+	require.NoError(t, err)
+	assert.Zero(t, got.SessionEpoch)
+
+	require.NoError(t, store.RevokeSessions(ctx, first.ID))
+	got, err = store.GetByID(ctx, first.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), got.SessionEpoch)
+
+	other, err := store.GetByID(ctx, second.ID)
+	require.NoError(t, err)
+	assert.Zero(t, other.SessionEpoch, "revoking one admin leaves the others alone")
+}
+
+func TestAdminStoreRevokeSessionsMissingAdmin(t *testing.T) {
+	pool := newTestPool(t)
+	store := adminpg.NewAdminStore(pool)
+	err := store.RevokeSessions(context.Background(), "00000000-0000-0000-0000-000000000000")
+	assert.ErrorIs(t, err, admin.ErrAdminNotFound)
+}
+
+func isSortedStrings(in []string) bool {
+	for i := 1; i < len(in); i++ {
+		if in[i-1] > in[i] {
+			return false
+		}
+	}
+	return true
+}

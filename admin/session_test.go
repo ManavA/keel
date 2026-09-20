@@ -13,10 +13,10 @@ import (
 
 func TestSessionIssuerRoundTrip(t *testing.T) {
 	s := newSessionIssuer("shh", time.Hour)
-	token, err := s.IssueToken("admin_1")
+	token, err := s.IssueToken("admin_1", 0)
 	require.NoError(t, err)
 
-	subject, err := s.ValidateToken(token)
+	subject, _, err := s.ValidateToken(token)
 	require.NoError(t, err)
 	assert.Equal(t, "admin_1", subject)
 }
@@ -32,7 +32,7 @@ func TestSessionIssuerTokenCarriesAbsoluteLifetime(t *testing.T) {
 	const secret = "lifetime-test-secret"
 	s := newSessionIssuer(secret, ttl)
 
-	token, err := s.IssueToken("admin_1")
+	token, err := s.IssueToken("admin_1", 0)
 	require.NoError(t, err)
 
 	parsed, err := jwt.Parse(token, func(t *jwt.Token) (any, error) {
@@ -57,27 +57,27 @@ func TestSessionIssuerZeroTTLUsesDefault(t *testing.T) {
 func TestSessionIssuerRejectsExpiredToken(t *testing.T) {
 	s := newSessionIssuer("secret", time.Hour)
 	s.ttl = -time.Minute
-	token, err := s.IssueToken("admin_1")
+	token, err := s.IssueToken("admin_1", 0)
 	require.NoError(t, err)
 	s.ttl = time.Hour
 
-	_, err = s.ValidateToken(token)
+	_, _, err = s.ValidateToken(token)
 	assert.ErrorIs(t, err, ErrInvalidToken)
 }
 
 func TestSessionIssuerRejectsWrongSecret(t *testing.T) {
 	issuer := newSessionIssuer("secret-a", time.Hour)
-	token, err := issuer.IssueToken("admin_1")
+	token, err := issuer.IssueToken("admin_1", 0)
 	require.NoError(t, err)
 
 	other := newSessionIssuer("secret-b", time.Hour)
-	_, err = other.ValidateToken(token)
+	_, _, err = other.ValidateToken(token)
 	assert.ErrorIs(t, err, ErrInvalidToken)
 }
 
 func TestSessionIssuerRejectsGarbage(t *testing.T) {
 	s := newSessionIssuer("secret", time.Hour)
-	_, err := s.ValidateToken("not-a-jwt")
+	_, _, err := s.ValidateToken("not-a-jwt")
 	assert.ErrorIs(t, err, ErrInvalidToken)
 }
 
@@ -101,7 +101,7 @@ func TestSessionIssuerRejectsAuthAudience(t *testing.T) {
 	signed, err := token.SignedString([]byte(sharedSecret))
 	require.NoError(t, err)
 
-	_, err = s.ValidateToken(signed)
+	_, _, err = s.ValidateToken(signed)
 	assert.ErrorIs(t, err, ErrInvalidToken)
 }
 
@@ -118,7 +118,7 @@ func TestSessionIssuerRejectsMissingAudience(t *testing.T) {
 	signed, err := token.SignedString([]byte(secret))
 	require.NoError(t, err)
 
-	_, err = s.ValidateToken(signed)
+	_, _, err = s.ValidateToken(signed)
 	assert.ErrorIs(t, err, ErrInvalidToken)
 }
 
@@ -138,7 +138,7 @@ func TestSessionIssuerRejectsAlgNone(t *testing.T) {
 	token, err := unsigned.SignedString(jwt.UnsafeAllowNoneSignatureType)
 	require.NoError(t, err)
 
-	_, err = s.ValidateToken(token)
+	_, _, err = s.ValidateToken(token)
 	assert.ErrorIs(t, err, ErrInvalidToken)
 }
 
@@ -160,6 +160,38 @@ func TestSessionIssuerRejectsRS256(t *testing.T) {
 	signed, err := token.SignedString(priv)
 	require.NoError(t, err)
 
-	_, err = s.ValidateToken(signed)
+	_, _, err = s.ValidateToken(signed)
+	assert.ErrorIs(t, err, ErrInvalidToken)
+}
+
+func TestSessionIssuerRoundTripCarriesEpoch(t *testing.T) {
+	s := newSessionIssuer("secret", time.Hour)
+	token, err := s.IssueToken("admin_1", 3)
+	require.NoError(t, err)
+
+	subject, epoch, err := s.ValidateToken(token)
+	require.NoError(t, err)
+	assert.Equal(t, "admin_1", subject)
+	assert.Equal(t, int64(3), epoch, "the token carries the epoch it was issued at")
+}
+
+// TestSessionIssuerRejectsTokenWithoutEpoch pins that a token minted before
+// epochs existed — same shape and audience, no epoch claim — does not
+// validate. Without this, pre-revocation tokens would bypass RevokeSessions.
+func TestSessionIssuerRejectsTokenWithoutEpoch(t *testing.T) {
+	const secret = "secret"
+	s := newSessionIssuer(secret, time.Hour)
+
+	now := time.Now()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": "admin_1",
+		"aud": sessionAudience,
+		"iat": now.Unix(),
+		"exp": now.Add(time.Hour).Unix(),
+	})
+	signed, err := token.SignedString([]byte(secret))
+	require.NoError(t, err)
+
+	_, _, err = s.ValidateToken(signed)
 	assert.ErrorIs(t, err, ErrInvalidToken)
 }

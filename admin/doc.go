@@ -13,12 +13,19 @@
 //
 // The session lifetime model is absolute only: a token is valid until its exp
 // (iat plus Options.TokenTTL) and no activity extends it. There is no idle
-// timeout, because these tokens are stateless — validation checks signature
-// and expiry with no storage lookup, so there is no activity record to
-// measure idleness against. End-user sessions under auth's SessionOpaque can
-// enforce both windows (see auth.SessionLimits); an admin deployment that
-// needs idle control must keep TokenTTL short and require re-login. Every
-// refresh issues a full new ttl, so Refresh is not a bounded extension.
+// timeout, because these tokens carry no activity record to measure idleness
+// against — validation checks signature and expiry, plus the epoch below.
+// End-user sessions under auth's SessionOpaque can enforce both windows (see
+// auth.SessionLimits); an admin deployment that needs idle control must keep
+// TokenTTL short and require re-login. Every refresh issues a full new ttl,
+// so Refresh is not a bounded extension.
+//
+// Every token carries the admin's session epoch at issue time, and
+// [Service.RequireAdmin] compares it against the admin's current
+// [Admin.SessionEpoch]. [AdminStore.RevokeSessions] moves the stored epoch
+// forward, ending every session belonging to that admin at once: the users
+// list page exposes it as a per-admin revoke button. Tokens minted before
+// epochs existed carry no epoch claim and do not validate.
 //
 // Options.Secret must be at least 16 bytes, and must be a DIFFERENT secret
 // from whatever auth.Options.Secret this deployment's end-user sessions use.
@@ -45,7 +52,19 @@
 // actor, action, target, timestamp, and outcome — to the store in
 // Options.Audit (in-memory by default, Postgres-backed via admin/pg). Mount
 // it inside [Service.RequireAdmin] on every operator-only route, and review
-// the trail through GET /audit, served by [Service.AuditList].
+// the trail through GET /audit, served by [Service.AuditList], narrowed by
+// the action, actor and outcome query parameters.
+//
+// # Browser UI
+//
+// [Service.MountUI] serves the operator console in the same style as the
+// example apps' templates: Go html/templates plus htmx, no build step. Pages
+// are the login form, the users list with per-admin session revoke, and the
+// audit trail with its filter; the host app serves htmx itself (see the
+// examples' MountStatic for the conventional path). Form logins run through
+// the same rate-limited Login as the JSON API, and every page except the
+// login form requires a valid admin session — anonymous loads leave for the
+// login page, and admin-only data never renders without one.
 //
 // # Protecting fields that must not reach a public response
 //

@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -23,6 +24,12 @@ type Admin struct {
 	Name         string
 	Role         string
 	PasswordHash string
+	// SessionEpoch counts how many times this admin's sessions were revoked.
+	// Every issued token carries the epoch it was born in, and a token whose
+	// epoch is older than this field no longer validates. It never leaves the
+	// server: the users list renders a view without it, and it has no JSON
+	// name.
+	SessionEpoch int64 `json:"-"`
 	LastLoginAt  time.Time
 	CreatedAt    time.Time
 }
@@ -40,6 +47,14 @@ type AdminStore interface {
 	// login. A failure here must not block the login it is recording (see
 	// Service.Login); it is logged instead.
 	UpdateLastLogin(ctx context.Context, id string) error
+	// List returns every admin, ordered by email. The users list page reads
+	// through it; it renders a view without PasswordHash or SessionEpoch.
+	List(ctx context.Context) ([]Admin, error)
+	// RevokeSessions ends every session belonging to id, right now, by
+	// moving its SessionEpoch forward: tokens issued before the bump carry
+	// an older epoch and stop validating. It returns ErrAdminNotFound when
+	// no admin matches.
+	RevokeSessions(ctx context.Context, id string) error
 }
 
 // MemoryAdminStore is an in-memory AdminStore, safe for concurrent use.
@@ -110,6 +125,30 @@ func (s *MemoryAdminStore) UpdateLastLogin(_ context.Context, id string) error {
 		return ErrAdminNotFound
 	}
 	a.LastLoginAt = time.Now()
+	return nil
+}
+
+// List implements AdminStore, ordered by email so the users list is stable.
+func (s *MemoryAdminStore) List(_ context.Context) ([]Admin, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Admin, 0, len(s.byID))
+	for _, a := range s.byID {
+		out = append(out, *a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Email < out[j].Email })
+	return out, nil
+}
+
+// RevokeSessions implements AdminStore.
+func (s *MemoryAdminStore) RevokeSessions(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.byID[id]
+	if !ok {
+		return ErrAdminNotFound
+	}
+	a.SessionEpoch++
 	return nil
 }
 

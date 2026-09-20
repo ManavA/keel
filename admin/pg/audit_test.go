@@ -36,7 +36,7 @@ func TestAuditStoreAppendAndList(t *testing.T) {
 	second := &admin.AuditEntry{Actor: "admin_1", Action: "user.enable", Target: "user_43", Outcome: admin.AuditOutcomeError}
 	require.NoError(t, store.Append(ctx, second))
 
-	entries, err := store.List(ctx, 50, 0)
+	entries, err := store.List(ctx, admin.AuditFilter{}, 50, 0)
 	require.NoError(t, err)
 	require.Len(t, entries, 2, "the trail keeps every appended row")
 	assert.Equal(t, "user.disable", entries[0].Action)
@@ -58,18 +58,18 @@ func TestAuditStoreListPagination(t *testing.T) {
 		}))
 	}
 
-	first, err := store.List(ctx, 2, 0)
+	first, err := store.List(ctx, admin.AuditFilter{}, 2, 0)
 	require.NoError(t, err)
 	require.Len(t, first, 2)
 	assert.Equal(t, "a.one", first[0].Action)
 	assert.Equal(t, "a.two", first[1].Action)
 
-	second, err := store.List(ctx, 2, 2)
+	second, err := store.List(ctx, admin.AuditFilter{}, 2, 2)
 	require.NoError(t, err)
 	require.Len(t, second, 1)
 	assert.Equal(t, "a.three", second[0].Action)
 
-	empty, err := store.List(ctx, 2, 3)
+	empty, err := store.List(ctx, admin.AuditFilter{}, 2, 3)
 	require.NoError(t, err)
 	assert.Empty(t, empty)
 }
@@ -89,7 +89,7 @@ func TestAuditStoreAppendInTransactionJoinsTheDomainChange(t *testing.T) {
 	}))
 	require.NoError(t, rolledBack.Rollback(ctx))
 
-	entries, err := store.List(ctx, 50, 0)
+	entries, err := store.List(ctx, admin.AuditFilter{}, 50, 0)
 	require.NoError(t, err)
 	assert.Empty(t, entries, "a rolled-back transaction must leave no audit row")
 
@@ -100,8 +100,33 @@ func TestAuditStoreAppendInTransactionJoinsTheDomainChange(t *testing.T) {
 	}))
 	require.NoError(t, committed.Commit(ctx))
 
-	entries, err = store.List(ctx, 50, 0)
+	entries, err = store.List(ctx, admin.AuditFilter{}, 50, 0)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Equal(t, "user_42", entries[0].Target)
+}
+
+func TestAuditStoreListFilters(t *testing.T) {
+	_, store := newAuditStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, store.Append(ctx, &admin.AuditEntry{Actor: "admin_1", Action: "user.disable", Outcome: admin.AuditOutcomeOK}))
+	require.NoError(t, store.Append(ctx, &admin.AuditEntry{Actor: "admin_2", Action: "user.enable", Outcome: admin.AuditOutcomeError}))
+
+	byAction, err := store.List(ctx, admin.AuditFilter{Action: "user.enable"}, 50, 0)
+	require.NoError(t, err)
+	require.Len(t, byAction, 1)
+	assert.Equal(t, "admin_2", byAction[0].Actor)
+
+	byActor, err := store.List(ctx, admin.AuditFilter{Actor: "admin_1"}, 50, 0)
+	require.NoError(t, err)
+	require.Len(t, byActor, 1)
+
+	byOutcome, err := store.List(ctx, admin.AuditFilter{Outcome: admin.AuditOutcomeError}, 50, 0)
+	require.NoError(t, err)
+	require.Len(t, byOutcome, 1)
+
+	empty, err := store.List(ctx, admin.AuditFilter{Action: "nothing.did"}, 50, 0)
+	require.NoError(t, err)
+	assert.Empty(t, empty)
 }

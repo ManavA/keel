@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html/template"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/ManavA/keel/httpx"
@@ -94,6 +96,13 @@ type Service struct {
 	realIP         middleware.RealIPOptions
 	loginRateLimit middleware.RateLimitOptions
 	log            *slog.Logger
+	// tmpl renders the browser UI (see ui.go); the JSON handlers never
+	// touch it.
+	tmpl *template.Template
+	// login runs Login behind the same client-address recovery and rate
+	// limit as POST /login, so form logins through the browser UI and JSON
+	// logins share one limiter and one set of rules.
+	login http.Handler
 }
 
 // NewService validates Options and builds a Service.
@@ -115,15 +124,26 @@ func NewService(opts Options) (*Service, error) {
 	if audit == nil {
 		audit = NewMemoryAuditStore()
 	}
-	return &Service{
+	tmpl, err := parseUITemplates()
+	if err != nil {
+		return nil, err
+	}
+	rateLimit := loginRateLimitWithDefaults(opts.LoginRateLimit)
+	s := &Service{
 		users:          opts.Users,
 		audit:          audit,
 		session:        newSessionIssuer(opts.Secret, opts.TokenTTL),
 		corsOrigin:     opts.CORSOrigin,
 		realIP:         opts.RealIP,
-		loginRateLimit: loginRateLimitWithDefaults(opts.LoginRateLimit),
+		loginRateLimit: rateLimit,
 		log:            logger,
-	}, nil
+		tmpl:           tmpl,
+	}
+	var login http.Handler = http.HandlerFunc(s.Login)
+	login = middleware.RateLimit(s.loginRateLimit)(login)
+	login = middleware.RealIP(s.realIP)(login)
+	s.login = login
+	return s, nil
 }
 
 // logger prefers the request-scoped logger httpx.NewRouter installs on ctx,

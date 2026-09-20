@@ -10,7 +10,8 @@ import (
 //
 //	POST /login     (rate-limited)
 //	POST /refresh   (requires RequireAdmin)
-//	GET  /audit     (requires RequireAdmin; the audit trail, oldest first)
+//	GET  /audit     (requires RequireAdmin; the audit trail, oldest first,
+//	                 narrowed by the action, actor and outcome query parameters)
 //
 // and this Service's CORS policy applied to every route, including ones a
 // caller adds afterward. A caller mounts its own operator-only routes on the
@@ -32,11 +33,10 @@ func (s *Service) Router() chi.Router {
 		}))
 	}
 
-	r.Group(func(r chi.Router) {
-		r.Use(middleware.RealIP(s.realIP))
-		r.Use(middleware.RateLimit(s.loginRateLimit))
-		r.Post("/login", s.Login)
-	})
+	// POST /login carries its own client-address recovery and rate limit,
+	// shared with the browser UI's form login (see Service.login): the group
+	// below would apply them a second time.
+	r.Post("/login", s.login.ServeHTTP)
 
 	r.Group(func(r chi.Router) {
 		r.Use(s.RequireAdmin)
