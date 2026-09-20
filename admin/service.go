@@ -42,7 +42,9 @@ func loginRateLimitWithDefaults(opts middleware.RateLimitOptions) middleware.Rat
 // deployment uses — see auth.Options's doc comment on why a shared secret is
 // a configuration mistake this package's audience check defends against, but
 // two independent secrets is what actually keeps a compromise of one
-// credential from reaching the other's sessions.
+// credential from reaching the other's sessions. The app package's
+// CheckSecretSeparation enforces this at startup for deployments that mount
+// both services.
 type Options struct {
 	// Users is required.
 	Users AdminStore

@@ -113,7 +113,9 @@ const (
 // of the same shape; the audience claim each embeds (see session.go) stops a
 // token issued by one from validating against the other even when a secret
 // is reused by mistake, but two independent secrets is what actually keeps a
-// compromise of one credential from reaching the other's sessions.
+// compromise of one credential from reaching the other's sessions. The app
+// package's CheckSecretSeparation enforces this at startup for deployments
+// that mount both services.
 type Options struct {
 	// Sources lists which identity sources this Service accepts. Defaults to
 	// []Source{SourceLocal}.
