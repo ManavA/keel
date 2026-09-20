@@ -132,6 +132,33 @@ func TestPostgresIndex_Search_ZeroTotalSkipsTheSelectQuery(t *testing.T) {
 	assert.Empty(t, conn.queryCalls, "a zero total must skip the paged SELECT entirely")
 }
 
+// TestPostgresIndex_Search_OffsetPastEndKeepsRealTotal is the regression test
+// for the deep-page total: an Offset past every matching row must return zero
+// hits with the real total, not a zero total. Search uses a separate COUNT(*)
+// query rather than a COUNT(*) OVER() window on the paged query exactly so
+// the total survives an empty page; this test pins that through the full
+// Search call with a faked connection.
+func TestPostgresIndex_Search_OffsetPastEndKeepsRealTotal(t *testing.T) {
+	conn := &fakeConn{
+		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			return fakeRow{scanFn: func(dest ...any) error {
+				*(dest[0].(*int64)) = 3
+				return nil
+			}}
+		},
+		queryFn: func(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+			return &fakeRows{}, nil
+		},
+	}
+	idx := newPostgresIndexWithConn(conn, PostgresConfig{Table: testTable})
+
+	res, err := idx.Search(context.Background(), Query{Offset: 3, Limit: 10})
+	require.NoError(t, err)
+	assert.Empty(t, res.Hits)
+	assert.EqualValues(t, 3, res.Total, "an offset past every row must still report the real total")
+	assert.NotEmpty(t, conn.queryCalls, "a nonzero total must still run the paged SELECT even when the page comes back empty")
+}
+
 // TestPostgresIndex_Search_WrapsInvalidTextRepresentation is the regression
 // test for a numeric filter over a mixed-type JSONB field surfacing the
 // driver's raw error, which echoes the offending value back to the caller.
