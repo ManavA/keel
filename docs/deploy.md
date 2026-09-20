@@ -242,7 +242,61 @@ docker compose -f deploy/compose.yaml up
 
 Add `--profile search` to also start Meilisearch, for a service that uses
 keel's `search` package. A service that only uses Postgres does not need
-this profile.
+this profile. With the production overlay, still export `MEILI_MASTER_KEY`:
+compose interpolates the search service while rendering even when its
+profile is inactive, so a missing key fails config for a Postgres-only
+stack too.
+
+### Promoting the local compose file toward production
+
+`deploy/compose.yaml` is a local-development shape: fixed credentials, no
+resource limits, every port published, no health state beyond the image's own
+liveness probe. `deploy/compose.production.yaml` is an overlay that replaces
+those defaults without touching the local file. Render the merged stack
+without starting anything:
+
+```
+docker compose -f deploy/compose.yaml -f deploy/compose.production.yaml config
+```
+
+To start it, export the variables the overlay names first — each one fails
+closed at config time with a message saying which. In a real deployment the
+deploy step writes them from the secret manager (with `printf`, not `echo` —
+see "Configuration" above), never from a committed file. A project-root
+`.env` also feeds compose interpolation and is already gitignored, which
+makes it a convenient local stand-in for the secret manager.
+
+Every production delta, next to the local default it replaces:
+
+| Area | Local default (`compose.yaml`) | Production delta (`compose.production.yaml`) |
+|---|---|---|
+| Container user | The image's `USER appuser`, implicit | Pinned as `user: appuser`, so a rebuilt image that drops the directive fails loudly instead of running as root |
+| Database role | The app connects as the bootstrap superuser (`keel`) | A least-privilege role (`NOSUPERUSER`, no `CREATEDB`), created once — see below |
+| Passwords | `keel`/`keel` and `development-only-key`, committed in the file | Required variables (`POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `MEILI_MASTER_KEY`); a missing one means the stack does not render, let alone start |
+| Resource limits | None | `deploy.resources` limits and reservations on every service |
+| Postgres persistence | A named volume and nothing else | The same named volume, plus scheduled `pg_dump` (or volume snapshots with WAL archiving for point-in-time recovery) and a restore that has actually been rehearsed |
+| Meilisearch persistence | A named volume, a dev master key, default dev mode | The same named volume, `MEILI_ENV=production`, master key from a secret; the index is derived data, so keep the reindex path working and a lost volume costs time, not data |
+| Readiness | The image probes `/healthz` (liveness only) | A compose healthcheck on `/readyz`, so traffic stops while a dependency is down; restarts stay on process exit (`restart: unless-stopped`), never on readiness — see "Health checks" above |
+| Published ports | Postgres and Meilisearch publish to the host | Publish only the app port, ideally none of them behind a reverse proxy; the overlay leaves the local mappings in place, so unpublish the database and search ports in your own file |
+
+The least-privilege role, once:
+
+```sql
+CREATE ROLE svc_api WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '...';
+GRANT CONNECT ON DATABASE keel TO svc_api;
+```
+
+then, after migrations have run, the data-access grants the service needs on
+the tables migrations created, plus `ALTER DEFAULT PRIVILEGES` so tables
+future migrations create inherit them. Which grants those are depends on the
+service; the point is they are data-access grants, not ownership.
+
+One constraint decides where the grants stop. `app.Open` applies `Migrations`
+at startup, so a service that migrates at `Open` needs the DDL privileges its
+own migration files require on its runtime role. To keep the runtime role
+DDL-free instead, ship with `Migrations` empty and run `migrate.Run` against
+the same sources as a separate step — the two share the ledger, so each file
+still applies exactly once (see "Migrations" above).
 
 ### Running on Cloud Run
 

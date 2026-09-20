@@ -1,0 +1,96 @@
+# Production overlay for deploy/compose.yaml: the same services with the
+# local-development defaults replaced by what a production host needs.
+#
+# This file changes nothing on its own. It is layered over the local file:
+#
+#   export POSTGRES_USER=... POSTGRES_PASSWORD=... POSTGRES_DB=...
+#   export APP_DB_USER=... APP_DB_PASSWORD=...
+#   export MEILI_MASTER_KEY=...   # always: compose interpolates the search
+#   service even when its profile is inactive, so a missing key fails
+#   config whether or not the service uses the search profile
+#   docker compose -f deploy/compose.yaml -f deploy/compose.production.yaml up -d
+#
+# Every value it needs comes from the environment, which in production is
+# written by the deploy step from the secret manager (with printf, not echo —
+# see "Configuration" in docs/deploy.md), never committed. A missing variable
+# fails closed at config time with the message naming it, before anything
+# starts. What each delta is and why is in docs/deploy.md under "Promoting
+# the local compose file toward production".
+
+services:
+  app:
+    # The image already runs as this user (see deploy/Dockerfile). Pinning it
+    # here keeps a rebuilt image that drops the directive from silently
+    # running as root.
+    user: "appuser"
+    # Readiness, not liveness: /readyz answers 503 while a dependency is down,
+    # which must stop traffic, never restart the process (see docs/deploy.md,
+    # "Health checks"). Anything fronting this stack polls /readyz itself;
+    # this health state is what it reads.
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:$${PORT:-8080}/readyz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+    environment:
+      # The app role is least-privilege (NOSUPERUSER, no CREATEDB), created
+      # once per the runbook in docs/deploy.md. URL-encode the password if
+      # the secret manager emits reserved characters (&, @, /, ? and the
+      # like). sslmode stays disabled only while Postgres stays inside this
+      # compose network; if the database moves out to a managed instance,
+      # terminate TLS there and drop the postgres service below.
+      DATABASE_URL: "postgres://${APP_DB_USER:?APP_DB_USER must be set}:${APP_DB_PASSWORD:?APP_DB_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set}?sslmode=disable"
+
+  postgres:
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER must be set}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+      POSTGRES_DB: "${POSTGRES_DB:?POSTGRES_DB must be set}"
+    # The local file's healthcheck names its fixed user; once the user is a
+    # variable the probe must follow it, or Postgres never reports healthy
+    # under any other name and the app never starts.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    # No user: override here. The image starts as root to fix up the data
+    # directory's ownership and drops to the postgres user itself; forcing a
+    # UID breaks that handoff. The privilege boundary that matters is the
+    # database role the app connects with (see app/DATABASE_URL above).
+
+  # Only started with --profile search, same as in the local file.
+  meilisearch:
+    environment:
+      MEILI_MASTER_KEY: "${MEILI_MASTER_KEY:?MEILI_MASTER_KEY must be set even for a Postgres-only stack: compose interpolates this service when rendering, whether or not the search profile is enabled}"
+      # Production mode: turns off the development conveniences the local
+      # default leaves on.
+      MEILI_ENV: production
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
