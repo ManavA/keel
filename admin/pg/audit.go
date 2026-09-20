@@ -3,6 +3,8 @@ package pg
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -48,22 +50,40 @@ func (s *AuditStore) Append(ctx context.Context, e *admin.AuditEntry) error {
 	return nil
 }
 
-// List implements admin.AuditStore, oldest first. A non-positive limit
-// means the default page of 50.
-func (s *AuditStore) List(ctx context.Context, limit, offset int) ([]admin.AuditEntry, error) {
+// List implements admin.AuditStore, oldest first and narrowed by filter. A
+// non-positive limit means the default page of 50.
+func (s *AuditStore) List(ctx context.Context, filter admin.AuditFilter, limit, offset int) ([]admin.AuditEntry, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := s.db.Query(ctx, `
+	query := `
 		SELECT id, actor, action, target, outcome, created_at
-		FROM admin_audit
+		FROM admin_audit`
+	var conds []string
+	var args []any
+	if filter.Actor != "" {
+		args = append(args, filter.Actor)
+		conds = append(conds, `actor = $`+strconv.Itoa(len(args)))
+	}
+	if filter.Action != "" {
+		args = append(args, filter.Action)
+		conds = append(conds, `action = $`+strconv.Itoa(len(args)))
+	}
+	if filter.Outcome != "" {
+		args = append(args, filter.Outcome)
+		conds = append(conds, `outcome = $`+strconv.Itoa(len(args)))
+	}
+	if len(conds) > 0 {
+		query += "\nWHERE " + strings.Join(conds, " AND ")
+	}
+	args = append(args, limit, offset)
+	query += `
 		ORDER BY id ASC
-		LIMIT $1 OFFSET $2`,
-		limit, offset,
-	)
+		LIMIT $` + strconv.Itoa(len(args)-1) + ` OFFSET $` + strconv.Itoa(len(args))
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("adminpg: list audit entries: %w", err)
 	}

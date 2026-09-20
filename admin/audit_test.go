@@ -111,3 +111,33 @@ func readAuditEntries(t *testing.T, router http.Handler, token string) []AuditEn
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	return resp.Entries
 }
+
+func TestMemoryAuditStoreListFilters(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryAuditStore()
+	require.NoError(t, store.Append(ctx, &AuditEntry{Actor: "admin_1", Action: "user.disable", Outcome: AuditOutcomeOK}))
+	require.NoError(t, store.Append(ctx, &AuditEntry{Actor: "admin_2", Action: "user.enable", Outcome: AuditOutcomeError}))
+	require.NoError(t, store.Append(ctx, &AuditEntry{Actor: "admin_1", Action: "user.enable", Outcome: AuditOutcomeOK}))
+
+	byAction, err := store.List(ctx, AuditFilter{Action: "user.enable"}, 50, 0)
+	require.NoError(t, err)
+	assert.Len(t, byAction, 2, "the action filter keeps only matching rows")
+
+	byActor, err := store.List(ctx, AuditFilter{Actor: "admin_2"}, 50, 0)
+	require.NoError(t, err)
+	require.Len(t, byActor, 1)
+	assert.Equal(t, "user.enable", byActor[0].Action)
+
+	byOutcome, err := store.List(ctx, AuditFilter{Outcome: AuditOutcomeError}, 50, 0)
+	require.NoError(t, err)
+	require.Len(t, byOutcome, 1)
+
+	combined, err := store.List(ctx, AuditFilter{Actor: "admin_1", Action: "user.enable"}, 50, 0)
+	require.NoError(t, err)
+	require.Len(t, combined, 1)
+	assert.Equal(t, AuditOutcomeOK, combined[0].Outcome)
+
+	empty, err := store.List(ctx, AuditFilter{Action: "nothing.did"}, 50, 0)
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+}

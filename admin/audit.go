@@ -26,6 +26,14 @@ type AuditEntry struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// AuditFilter narrows an audit listing: every non-empty field must match
+// exactly. Empty means unfiltered.
+type AuditFilter struct {
+	Action  string
+	Actor   string
+	Outcome string
+}
+
 // AuditStore is the storage interface for the audit trail. It is
 // append-only by construction: there is deliberately no update or delete,
 // so the trail is a record of what happened, not a mutable table.
@@ -34,8 +42,9 @@ type AuditEntry struct {
 type AuditStore interface {
 	// Append records one entry, setting its ID and CreatedAt.
 	Append(ctx context.Context, e *AuditEntry) error
-	// List returns entries oldest first, paged by limit and offset.
-	List(ctx context.Context, limit, offset int) ([]AuditEntry, error)
+	// List returns entries oldest first, narrowed by filter and paged by
+	// limit and offset.
+	List(ctx context.Context, filter AuditFilter, limit, offset int) ([]AuditEntry, error)
 }
 
 // MemoryAuditStore is an in-memory AuditStore, safe for concurrent use.
@@ -62,16 +71,29 @@ func (s *MemoryAuditStore) Append(_ context.Context, e *AuditEntry) error {
 }
 
 // List implements AuditStore.
-func (s *MemoryAuditStore) List(_ context.Context, limit, offset int) ([]AuditEntry, error) {
+func (s *MemoryAuditStore) List(_ context.Context, filter AuditFilter, limit, offset int) ([]AuditEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var matched []AuditEntry
+	for _, e := range s.entries {
+		if filter.Action != "" && e.Action != filter.Action {
+			continue
+		}
+		if filter.Actor != "" && e.Actor != filter.Actor {
+			continue
+		}
+		if filter.Outcome != "" && e.Outcome != filter.Outcome {
+			continue
+		}
+		matched = append(matched, e)
+	}
 	if offset < 0 {
 		offset = 0
 	}
-	if offset >= len(s.entries) {
+	if offset >= len(matched) {
 		return nil, nil
 	}
-	out := s.entries[offset:]
+	out := matched[offset:]
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
@@ -164,9 +186,15 @@ type AuditListResponse struct {
 	Entries []AuditEntry `json:"entries"`
 }
 
-// AuditList serves GET /audit: the audit trail oldest first, paged by the
-// limit (default 50, capped at 200) and offset query parameters.
+// AuditList serves GET /audit: the audit trail oldest first, narrowed by
+// the action, actor and outcome query parameters and paged by the limit
+// (default 50, capped at 200) and offset query parameters.
 func (s *Service) AuditList(w http.ResponseWriter, r *http.Request) {
+	filter := AuditFilter{
+		Action:  r.URL.Query().Get("action"),
+		Actor:   r.URL.Query().Get("actor"),
+		Outcome: r.URL.Query().Get("outcome"),
+	}
 	limit := 50
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
@@ -189,7 +217,7 @@ func (s *Service) AuditList(w http.ResponseWriter, r *http.Request) {
 		offset = n
 	}
 
-	entries, err := s.audit.List(r.Context(), limit, offset)
+	entries, err := s.audit.List(r.Context(), filter, limit, offset)
 	if err != nil {
 		s.logger(r.Context()).Error("admin: audit list failed", "error", err)
 		writeGenericError(w, http.StatusInternalServerError)

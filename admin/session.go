@@ -9,9 +9,10 @@ import (
 )
 
 // DefaultTokenTTL is how long an issued admin session token is valid. Short
-// by default: an admin token is privileged, and this package has no
-// server-side revocation, so the console re-authenticates often rather than
-// carrying a long-lived credential.
+// by default: an admin token is privileged, and expiry is its main lifetime
+// control — revocation ends sessions explicitly (see RevokeSessions), but the
+// console still re-authenticates often rather than carrying a long-lived
+// credential.
 const DefaultTokenTTL = 12 * time.Hour
 
 // sessionAudience is the required "aud" claim on every token this package
@@ -30,6 +31,12 @@ const sessionAudience = "keel:admin"
 // response for each is the same 401 regardless.
 var ErrInvalidToken = errors.New("admin: invalid token")
 
+// sessionEpochClaim carries the admin's SessionEpoch at the moment the token
+// was issued. RevokeSessions moves the stored epoch forward, so a token
+// carrying an older epoch stops validating even though its signature and
+// expiry are still good.
+const sessionEpochClaim = "epoch"
+
 // sessionIssuer issues and validates this package's JWT sessions. It is a
 // separate implementation from auth's (see that package's session.go): admin
 // and auth sit at the same layer and neither imports the other, so each
@@ -41,6 +48,11 @@ var ErrInvalidToken = errors.New("admin: invalid token")
 // storage lookup — so there is no record of last activity to measure idleness
 // against. A deployment that needs idle control must keep ttl short and have
 // the console re-authenticate; see Options.TokenTTL.
+//
+// Revocation is the one check that does reach the store, and it happens
+// outside this type: ValidateToken hands back the token's epoch, and the
+// caller (RequireAdmin) compares it against the admin's current SessionEpoch.
+// See AdminStore.RevokeSessions.
 type sessionIssuer struct {
 	secret string
 	ttl    time.Duration
@@ -53,13 +65,14 @@ func newSessionIssuer(secret string, ttl time.Duration) *sessionIssuer {
 	return &sessionIssuer{secret: secret, ttl: ttl}
 }
 
-func (s *sessionIssuer) IssueToken(subject string) (string, error) {
+func (s *sessionIssuer) IssueToken(subject string, epoch int64) (string, error) {
 	now := time.Now()
 	claims := jwt.MapClaims{
-		"sub": subject,
-		"aud": sessionAudience,
-		"iat": now.Unix(),
-		"exp": now.Add(s.ttl).Unix(),
+		"sub":             subject,
+		"aud":             sessionAudience,
+		sessionEpochClaim: epoch,
+		"iat":             now.Unix(),
+		"exp":             now.Add(s.ttl).Unix(),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := token.SignedString([]byte(s.secret))
@@ -69,21 +82,41 @@ func (s *sessionIssuer) IssueToken(subject string) (string, error) {
 	return signed, nil
 }
 
-func (s *sessionIssuer) ValidateToken(tokenString string) (string, error) {
+func (s *sessionIssuer) ValidateToken(tokenString string) (subject string, epoch int64, err error) {
 	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (any, error) {
 		return []byte(s.secret), nil
 	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithAudience(sessionAudience))
 	if err != nil || !token.Valid {
-		return "", ErrInvalidToken
+		return "", 0, ErrInvalidToken
 	}
 
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		return "", ErrInvalidToken
+		return "", 0, ErrInvalidToken
 	}
-	subject, ok := claims["sub"].(string)
+	subject, ok = claims["sub"].(string)
 	if !ok || subject == "" {
-		return "", ErrInvalidToken
+		return "", 0, ErrInvalidToken
 	}
-	return subject, nil
+	epoch, ok = epochFromClaims(claims)
+	if !ok {
+		return "", 0, ErrInvalidToken
+	}
+	return subject, epoch, nil
+}
+
+// epochFromClaims reads the session epoch back out of validated claims. JSON
+// numbers decode as float64; anything else — a string, a bool, a missing
+// claim on a token minted before epochs existed — is not a token this package
+// issued and does not validate.
+func epochFromClaims(claims jwt.MapClaims) (int64, bool) {
+	raw, ok := claims[sessionEpochClaim]
+	if !ok {
+		return 0, false
+	}
+	f, ok := raw.(float64)
+	if !ok || f != float64(int64(f)) || f < 0 {
+		return 0, false
+	}
+	return int64(f), true
 }

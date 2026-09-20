@@ -75,3 +75,37 @@ func TestMemoryAdminStoreMutatingReturnedAdminDoesNotAffectStore(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "isolated@example.com", fresh.Email)
 }
+
+func TestMemoryAdminStoreListOrdersByEmail(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryAdminStore()
+	for _, email := range []string{"c@example.com", "a@example.com", "b@example.com"} {
+		require.NoError(t, store.Create(ctx, &Admin{Email: email, PasswordHash: "hash"}))
+	}
+
+	admins, err := store.List(ctx)
+	require.NoError(t, err)
+	require.Len(t, admins, 3)
+	assert.Equal(t, "a@example.com", admins[0].Email)
+	assert.Equal(t, "b@example.com", admins[1].Email)
+	assert.Equal(t, "c@example.com", admins[2].Email)
+}
+
+func TestMemoryAdminStoreRevokeSessionsBumpsEpoch(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryAdminStore()
+	a := &Admin{Email: "ops@example.com", PasswordHash: "hash"}
+	require.NoError(t, store.Create(ctx, a))
+	assert.Zero(t, a.SessionEpoch)
+
+	require.NoError(t, store.RevokeSessions(ctx, a.ID))
+
+	got, err := store.GetByID(ctx, a.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), got.SessionEpoch)
+}
+
+func TestMemoryAdminStoreRevokeSessionsMissingAdmin(t *testing.T) {
+	err := NewMemoryAdminStore().RevokeSessions(context.Background(), "missing")
+	assert.ErrorIs(t, err, ErrAdminNotFound)
+}

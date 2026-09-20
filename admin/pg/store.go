@@ -25,12 +25,12 @@ func NewAdminStore(pool *pgxpool.Pool) *AdminStore {
 	return &AdminStore{pool: pool}
 }
 
-const adminColumns = `id, email, name, role, password_hash, last_login_at, created_at`
+const adminColumns = `id, email, name, role, password_hash, session_epoch, last_login_at, created_at`
 
 func scanAdmin(row pgx.Row) (*admin.Admin, error) {
 	var a admin.Admin
 	var lastLoginAt *time.Time
-	if err := row.Scan(&a.ID, &a.Email, &a.Name, &a.Role, &a.PasswordHash, &lastLoginAt, &a.CreatedAt); err != nil {
+	if err := row.Scan(&a.ID, &a.Email, &a.Name, &a.Role, &a.PasswordHash, &a.SessionEpoch, &lastLoginAt, &a.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, admin.ErrAdminNotFound
 		}
@@ -83,6 +83,39 @@ func (s *AdminStore) UpdateLastLogin(ctx context.Context, id string) error {
 	tag, err := s.pool.Exec(ctx, `UPDATE admin_users SET last_login_at = now() WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("adminpg: update last login: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return admin.ErrAdminNotFound
+	}
+	return nil
+}
+
+// List implements admin.AdminStore, ordered by email.
+func (s *AdminStore) List(ctx context.Context) ([]admin.Admin, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+adminColumns+` FROM admin_users ORDER BY email ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("adminpg: list admins: %w", err)
+	}
+	defer rows.Close()
+	var out []admin.Admin
+	for rows.Next() {
+		a, err := scanAdmin(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("adminpg: list admins: %w", err)
+	}
+	return out, nil
+}
+
+// RevokeSessions implements admin.AdminStore.
+func (s *AdminStore) RevokeSessions(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE admin_users SET session_epoch = session_epoch + 1 WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("adminpg: revoke sessions: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return admin.ErrAdminNotFound

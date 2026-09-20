@@ -1,0 +1,112 @@
+{{define "page-login"}}<!DOCTYPE html>
+<html lang="en" data-theme="landing">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin log in</title>
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+<main class="auth">
+<h1>Admin log in</h1>
+{{template "flash" .Flash}}
+<form action="{{.Base}}/login" method="post">
+<div>
+<label for="login-email">Email</label>
+<input id="login-email" name="email" type="email" required autocomplete="username" value="{{.Email}}">
+</div>
+<div>
+<label for="login-password">Password</label>
+<input id="login-password" name="password" type="password" required autocomplete="current-password">
+</div>
+<button type="submit">Log in</button>
+</form>
+</main>
+</body>
+</html>{{end}}
+{{define "flash"}}{{if .}}<p class="flash" role="alert">{{.}}</p>{{end}}{{end}}
+{{define "notice"}}<p id="ui-notice">{{.}}</p>{{end}}
+{{define "page-users"}}<!DOCTYPE html>
+<html lang="en" data-theme="dashboard">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin users</title>
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+<main class="dashboard">
+<header class="app-header">
+<h1>Admin users</h1>
+<nav><a href="{{.Base}}/audit">Audit trail</a></nav>
+<form action="{{.Base}}/logout" method="post"><button type="submit">Log out</button></form>
+</header>
+<p id="ui-notice" aria-live="polite"></p>
+<table>
+<thead><tr><th>Email</th><th>Name</th><th>Role</th><th>Last login</th><th>Sessions</th></tr></thead>
+<tbody id="admin-users">
+{{template "admin_user_rows" .}}
+</tbody>
+</table>
+</main>
+</body>
+</html>{{end}}
+{{define "admin_user_rows"}}{{range .Users}}<tr>
+<td>{{.Email}}</td>
+<td>{{.Name}}</td>
+<td>{{.Role}}</td>
+<td>{{.LastLogin}}</td>
+<td><form action="{{$.Base}}/users/{{.ID}}/revoke" method="post" hx-post="{{$.Base}}/users/{{.ID}}/revoke" hx-target="#ui-notice" hx-swap="innerHTML"><button type="submit">Revoke sessions</button></form></td>
+</tr>{{end}}{{end}}
+{{define "page-audit"}}<!DOCTYPE html>
+<html lang="en" data-theme="dashboard">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audit trail</title>
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+<main class="dashboard">
+<header class="app-header">
+<h1>Audit trail</h1>
+<nav><a href="{{.Base}}/users">Admin users</a></nav>
+<form action="{{.Base}}/logout" method="post"><button type="submit">Log out</button></form>
+</header>
+<form action="{{.Base}}/audit" method="get" hx-get="{{.Base}}/audit" hx-target="#audit-rows" hx-swap="innerHTML" hx-push-url="true">
+<div>
+<label for="audit-action">Action</label>
+<input id="audit-action" name="action" type="text" value="{{.Action}}">
+</div>
+<div>
+<label for="audit-actor">Actor</label>
+<input id="audit-actor" name="actor" type="text" value="{{.Actor}}">
+</div>
+<div>
+<label for="audit-outcome">Outcome</label>
+<input id="audit-outcome" name="outcome" type="text" value="{{.Outcome}}">
+</div>
+<button type="submit">Filter</button>
+</form>
+<table>
+<thead><tr><th>Actor</th><th>Action</th><th>Target</th><th>Outcome</th><th>At</th></tr></thead>
+<tbody id="audit-rows">
+{{template "audit_rows" .}}
+</tbody>
+</table>
+</main>
+</body>
+</html>{{end}}
+{{define "audit_rows"}}{{range .Entries}}<tr>
+<td>{{.Actor}}</td>
+<td>{{.Action}}</td>
+<td>{{.Target}}</td>
+<td>{{.Outcome}}</td>
+<td>{{.CreatedAt.Format "2006-01-02 15:04"}}</td>
+</tr>{{end}}{{end}}

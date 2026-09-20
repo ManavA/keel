@@ -86,7 +86,7 @@ func TestRefreshIssuesNewToken(t *testing.T) {
 	s := newTestService(t)
 	a := &Admin{Email: "refresh@example.com", PasswordHash: "x"}
 	require.NoError(t, s.users.Create(context.Background(), a))
-	token, err := s.session.IssueToken(a.ID)
+	token, err := s.session.IssueToken(a.ID, 0)
 	require.NoError(t, err)
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/refresh", nil)

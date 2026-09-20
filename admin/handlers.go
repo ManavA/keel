@@ -80,7 +80,7 @@ func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 		s.logger(r.Context()).Warn("admin: last_login not recorded", "admin_id", admin.ID, "error", err)
 	}
 
-	token, err := s.session.IssueToken(admin.ID)
+	token, err := s.session.IssueToken(admin.ID, admin.SessionEpoch)
 	if err != nil {
 		writeGenericError(w, http.StatusInternalServerError)
 		return
@@ -100,7 +100,7 @@ func (s *Service) Refresh(w http.ResponseWriter, r *http.Request) {
 		writeGenericError(w, http.StatusUnauthorized)
 		return
 	}
-	token, err := s.session.IssueToken(admin.ID)
+	token, err := s.session.IssueToken(admin.ID, admin.SessionEpoch)
 	if err != nil {
 		writeGenericError(w, http.StatusInternalServerError)
 		return
