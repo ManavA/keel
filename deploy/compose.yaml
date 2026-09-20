@@ -17,6 +17,11 @@
 # CMD_PATH defaults to this repository's example so the file is runnable here
 # rather than only illustrative. A service using keel overrides it with its own
 # main package, usually ./cmd/api.
+#
+# Production is a separate overlay, deploy/compose.production.yaml, layered
+# over this file. The deltas are documented in docs/deploy.md under
+# "Promoting the local compose file toward production"; this file stays
+# runnable on its own with docker compose -f deploy/compose.yaml up.
 
 services:
   app:
