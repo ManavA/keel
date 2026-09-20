@@ -166,6 +166,14 @@ type Options struct {
 	RealIP middleware.RealIPOptions
 	// RateLimit bounds requests per client IP to the routes Router builds.
 	RateLimit middleware.RateLimitOptions
+	// Attempts backs the per-account login throttle and the login-attempt
+	// audit trail. Defaults to an in-memory store.
+	Attempts AttemptStore
+	// AccountRateLimit bounds failed logins per account email on POST /login,
+	// catching the spray the per-IP limiter cannot: few attempts per IP
+	// across many IPs against one account. Zero values take the
+	// DefaultAccountRateLimit defaults.
+	AccountRateLimit AccountRateLimitOptions
 	// Logger receives this package's diagnostic output. Defaults to
 	// slog.Default(); never overridden globally by this package.
 	Logger *slog.Logger
@@ -186,6 +194,8 @@ type Service struct {
 	siteURL        string
 	realIP         middleware.RealIPOptions
 	rateLimit      middleware.RateLimitOptions
+	attempts       AttemptStore
+	accountLimit   AccountRateLimitOptions
 	log            *slog.Logger
 }
 
@@ -248,6 +258,11 @@ func NewService(opts Options) (*Service, error) {
 		return nil, errors.New("auth: unknown SessionMode")
 	}
 
+	attempts := opts.Attempts
+	if attempts == nil {
+		attempts = NewMemoryAttemptStore()
+	}
+
 	svc := &Service{
 		sources:        sourceSet,
 		users:          users,
@@ -258,6 +273,8 @@ func NewService(opts Options) (*Service, error) {
 		siteURL:        strings.TrimRight(opts.SiteURL, "/"),
 		realIP:         opts.RealIP,
 		rateLimit:      rateLimitWithDefaults(opts.RateLimit),
+		attempts:       attempts,
+		accountLimit:   accountRateLimitWithDefaults(opts.AccountRateLimit),
 		log:            logger,
 	}
 

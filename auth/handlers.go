@@ -147,6 +147,14 @@ func (s *Service) Signup(w http.ResponseWriter, r *http.Request) {
 
 // Login handles POST /login. Mounted only when Options.Sources includes
 // SourceLocal.
+//
+// Beyond the per-IP limiter in front of it, Login throttles failed attempts
+// per account email (see Options.AccountRateLimit): a spray that spreads a
+// few attempts per IP across many IPs still shares one per-account bucket.
+// Every outcome is recorded to Options.Attempts — success and failure, never
+// password material — so the attempt history is auditable. The throttle
+// answers an unknown email exactly like a known one, keeping the fixed-string
+// contract that stops login from enumerating registered addresses.
 func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 	var req LoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -154,12 +162,22 @@ func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := s.users.GetByEmail(r.Context(), normalizeEmail(req.Email))
+	email := normalizeEmail(req.Email)
+	if email != "" && s.accountLoginBlocked(r.Context(), email) {
+		// Recorded as a failure like any other: the audit trail should show
+		// the attempts that arrived during a lockout, not go quiet for it.
+		s.recordLoginAttempt(r.Context(), r, LoginAttempt{Email: email, IP: clientIPFromRequest(r)})
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
+
+	user, err := s.users.GetByEmail(r.Context(), email)
 	switch {
 	case errors.Is(err, ErrUserNotFound):
 		// Burn a comparison anyway so timing does not reveal that the email
 		// was the reason this failed rather than the password.
 		burnTimingEqualizer(req.Password)
+		s.recordLoginAttempt(r.Context(), r, LoginAttempt{Email: email, IP: clientIPFromRequest(r)})
 		writeGenericError(w, http.StatusUnauthorized)
 		return
 	case err != nil:
@@ -175,10 +193,12 @@ func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 		// An account that only ever signed in via an identity token: burn a
 		// comparison anyway so timing does not reveal that either.
 		burnTimingEqualizer(req.Password)
+		s.recordLoginAttempt(r.Context(), r, LoginAttempt{Email: email, IP: clientIPFromRequest(r)})
 		writeGenericError(w, http.StatusUnauthorized)
 		return
 	}
 	if !ComparePassword(user.PasswordHash, req.Password) {
+		s.recordLoginAttempt(r.Context(), r, LoginAttempt{Email: email, IP: clientIPFromRequest(r)})
 		writeGenericError(w, http.StatusUnauthorized)
 		return
 	}
@@ -188,6 +208,7 @@ func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 		writeGenericError(w, http.StatusInternalServerError)
 		return
 	}
+	s.recordLoginAttempt(r.Context(), r, LoginAttempt{Email: email, Success: true, IP: clientIPFromRequest(r)})
 	writeJSON(w, http.StatusOK, sessionResponse(token, user))
 }
 

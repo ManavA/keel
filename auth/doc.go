@@ -27,12 +27,12 @@
 //
 // # Storage
 //
-// [UserStore], [VerificationStore], [PasswordResetStore] and [SessionStore]
-// are the interfaces this package persists through. Each has an in-memory
-// implementation, sufficient for tests and for a service with no database.
-// The auth/pg package (a separate package, so this one never imports
-// database/sql) provides a Postgres-backed implementation of all four,
-// along with the migrations it needs.
+// [UserStore], [VerificationStore], [PasswordResetStore], [SessionStore]
+// and [AttemptStore] are the interfaces this package persists through. Each
+// has an in-memory implementation, sufficient for tests and for a service
+// with no database. The auth/pg package (a separate package, so this one
+// never imports database/sql) provides a Postgres-backed implementation of
+// all five, along with the migrations it needs.
 //
 // # Sessions and revocation
 //
@@ -63,7 +63,14 @@
 // Router rate-limits its own routes per client IP (15 requests/minute by
 // default, configurable through Options.RateLimit) using keel's
 // httpx/middleware package; Options.RealIP configures which forwarding
-// headers, if any, that limiter trusts.
+// headers, if any, that limiter trusts. POST /login additionally throttles
+// failed attempts per account email (10 failures per 15 minutes by default,
+// see Options.AccountRateLimit), which is what stops a spray that spreads a
+// few attempts per IP across many IPs: the IPs each stay under their own
+// limit while the targeted account shares one bucket. Every login outcome is
+// recorded to Options.Attempts — success and failure, never password
+// material — with a Postgres implementation in auth/pg alongside the other
+// stores.
 //
 // # Session tokens are not interchangeable with admin's
 //
