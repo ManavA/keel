@@ -29,6 +29,34 @@
 //   - reverted pagination or faceting settings: results or facet values
 //     are truncated
 //
+// [Searcher.DriftCheck] runs this comparison on a schedule and fails loudly
+// on drift; [Searcher.RequireSettings] refuses startup on drift. Both report
+// "not checked" rather than clean when the live settings could not be read.
+//
+// # Runbook: re-applying settings after drift
+//
+// Drift means the live index no longer matches [Config]: someone edited the
+// settings out of band, or a deploy carrying a Config change never applied
+// them. The repair is to apply Config and prove it landed:
+//
+//  1. From a batch caller such as a reindex job, run
+//     [Searcher.SetupIndexAndVerify]. It applies Config, waits for the
+//     settings tasks to settle, and reads the settings back; it returns an
+//     error while they differ.
+//  2. If the process that calls [Searcher.SetupIndex] at startup is already
+//     deployed with the current Config, restarting it re-applies Config.
+//     SetupIndex alone does not wait, so confirm with DriftCheck or
+//     [Searcher.CheckSettings] afterwards rather than assuming the restart
+//     fixed it.
+//  3. If neither applies the settings — SetupIndexAndVerify keeps failing —
+//     the writes themselves are being rejected (permissions, an unreachable
+//     index), not merely slow. The error names the failing task; fix that
+//     before re-running.
+//
+// Do not "fix" drift by editing the live index by hand to match. The next
+// SetupIndex call replaces the whole settings list, so a hand edit that
+// Config does not declare is drift again the moment anything re-applies.
+//
 // # Filter value quoting
 //
 // A filter value containing a space or a hyphen must be quoted before it is
