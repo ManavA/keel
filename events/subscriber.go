@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/ManavA/keel/metrics"
 )
 
 // Handler processes one message's raw payload. A non-nil error means the
@@ -55,6 +57,10 @@ type InMemoryBusOptions struct {
 	// without this. Defaults to one second when zero. DroppedCount is
 	// exact regardless of this interval; only the log line is throttled.
 	DropLogInterval time.Duration
+	// Metrics receives one publish count per accepted publish and one
+	// drop count per dropped delivery, both with the topic. Nil records
+	// nothing.
+	Metrics *metrics.Metrics
 }
 
 // defaultDropLogInterval is used when InMemoryBusOptions.DropLogInterval is
@@ -129,7 +135,7 @@ func (b *InMemoryBus) DroppedCount() int64 {
 // buffer is full is dropped for that subscriber — see the type doc — and
 // Publish then returns a [*BufferFullError] instead of nil, so the caller can
 // tell accepted from dropped without scraping logs or counters.
-func (b *InMemoryBus) Publish(_ context.Context, topic string, event any) error {
+func (b *InMemoryBus) Publish(ctx context.Context, topic string, event any) error {
 	data, err := Marshal(event)
 	if err != nil {
 		return fmt.Errorf("marshal event for topic %s: %w", topic, err)
@@ -154,8 +160,10 @@ func (b *InMemoryBus) Publish(_ context.Context, topic string, event any) error 
 
 	if dropped > 0 {
 		b.recordDrop(topic, dropped)
+		b.opts.Metrics.ObserveEventsDropped(ctx, topic, dropped)
 		return &BufferFullError{Topic: topic, Dropped: dropped}
 	}
+	b.opts.Metrics.ObserveEventPublished(ctx, topic)
 	return nil
 }
 
