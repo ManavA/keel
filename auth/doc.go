@@ -81,6 +81,15 @@
 // material — with a Postgres implementation in auth/pg alongside the other
 // stores.
 //
+// # Breached-password screening
+//
+// Options.BreachChecker optionally rejects passwords present in a breach
+// corpus on signup and password reset (see HIBPBreachChecker, which speaks
+// the k-anonymity range protocol: only the first 5 hex characters of the
+// password's SHA-1 leave the process). Nil — the default — disables the
+// check, so an offline service never blocks a password set on an unreachable
+// endpoint; a checker failure likewise fails open with a warning.
+//
 // # Session tokens are not interchangeable with admin's
 //
 // Under SessionJWT, this package's tokens carry an "aud" claim

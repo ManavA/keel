@@ -109,6 +109,9 @@ func (s *Service) Signup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if s.rejectBreachedPassword(w, r, req.Password) {
+		return
+	}
 
 	hash, err := HashPassword(req.Password)
 	if err != nil {
