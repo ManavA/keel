@@ -241,3 +241,86 @@ func TestStore_ConcurrentClaimOnlyOneWins(t *testing.T) {
 	}
 	assert.Equal(t, 1, winCount, "exactly one of %d concurrent claims for the same key must win", n)
 }
+
+// TestStore_CleanupDeletesOnlyExpiredRows seeds expired and live rows, runs
+// cleanup twice concurrently, and asserts only the expired rows are gone.
+// The delete is a plain predicate DELETE with no follow-up writes, so two
+// runs racing each other are safe, and every expired row is counted exactly
+// once across both runs.
+func TestStore_CleanupDeletesOnlyExpiredRows(t *testing.T) {
+	store := openStore(t)
+	ctx := context.Background()
+	prefix := uniqueKey(t) + "-cleanup"
+
+	db := testdb.Shared(t)
+	pool, err := keelpg.Open(ctx, keelpg.Options{URL: db.URL, MaxConns: 8})
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	count := func(where string, args ...any) int {
+		t.Helper()
+		var n int
+		require.NoError(t, pool.QueryRow(ctx,
+			`select count(*) from idempotency_keys where starts_with(key, $1)`+where,
+			append([]any{prefix}, args...)...).Scan(&n))
+		return n
+	}
+
+	expiredDone := []string{prefix + "-expired-done-0", prefix + "-expired-done-1"}
+	for _, key := range expiredDone {
+		claimID, _, err := store.Claim(ctx, key, "hash-a", time.Hour)
+		require.NoError(t, err)
+		require.NoError(t, store.Complete(ctx, key, claimID, idempotency.Record{
+			RequestHash: "hash-a", Body: []byte("stale"), ExpiresAt: time.Now().Add(-time.Second),
+		}))
+	}
+	expiredClaim := prefix + "-expired-claim"
+	_, _, err = store.Claim(ctx, expiredClaim, "hash-a", 50*time.Millisecond)
+	require.NoError(t, err)
+	time.Sleep(500 * time.Millisecond)
+
+	liveDone := prefix + "-live-done"
+	claimID, _, err := store.Claim(ctx, liveDone, "hash-a", time.Hour)
+	require.NoError(t, err)
+	require.NoError(t, store.Complete(ctx, liveDone, claimID, idempotency.Record{
+		RequestHash: "hash-a", Body: []byte("kept"), ExpiresAt: time.Now().Add(time.Hour),
+	}))
+	liveClaim := prefix + "-live-claim"
+	_, _, err = store.Claim(ctx, liveClaim, "hash-a", time.Hour)
+	require.NoError(t, err)
+
+	require.Equal(t, 3, count(` and expires_at < now()`), "three seeded rows must read as expired before cleanup")
+
+	const runs = 2
+	var wg sync.WaitGroup
+	deleted := make([]int64, runs)
+	errs := make([]error, runs)
+	for i := range runs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			deleted[i], errs[i] = store.Cleanup(ctx)
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+	assert.Equal(t, int64(3), deleted[0]+deleted[1],
+		"the two concurrent runs must account for each expired row exactly once")
+
+	assert.Equal(t, 0, count(` and expires_at < now()`), "no seeded row may still read as expired")
+	assert.Equal(t, 2, count(``), "only the two live rows may remain")
+
+	_, rec, err := store.Claim(ctx, liveDone, "hash-a", time.Hour)
+	require.NoError(t, err)
+	require.NotNil(t, rec, "cleanup must not touch a live completed record")
+	assert.Equal(t, "kept", string(rec.Body))
+
+	_, _, err = store.Claim(ctx, liveClaim, "hash-b", time.Hour)
+	assert.ErrorIs(t, err, idempotency.ErrInProgress, "cleanup must not free a live in-flight claim")
+
+	fresh, rec, err := store.Claim(ctx, expiredDone[0], "hash-b", time.Hour)
+	require.NoError(t, err)
+	assert.NotEmpty(t, fresh, "a cleaned-up key must be claimable again")
+	assert.Nil(t, rec)
+}

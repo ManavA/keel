@@ -156,3 +156,22 @@ func (s *Store) Release(ctx context.Context, key, claimID string) error {
 	}
 	return nil
 }
+
+const cleanupSQL = `delete from ` + Table + ` where expires_at < now()`
+
+// Cleanup deletes every row whose claim lease or replay window has passed,
+// and reports how many it removed. Run it on a schedule — an hourly
+// jobs.Scheduler entry, for example — because nothing else deletes expired
+// rows: a key that is never retried keeps its row until this runs.
+//
+// The predicate matches Claim's reclaim check, so Cleanup removes exactly
+// the rows Claim would no longer honor. It is a single predicate DELETE
+// with no follow-up writes, so concurrent runs are safe: each expired row
+// is deleted once, and a run racing another one just finds less to do.
+func (s *Store) Cleanup(ctx context.Context) (int64, error) {
+	tag, err := s.db.Exec(ctx, cleanupSQL)
+	if err != nil {
+		return 0, fmt.Errorf("idempotency/pg: cleanup: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
