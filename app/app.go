@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -193,6 +194,48 @@ type App struct {
 	schedule *jobs.Scheduler
 	haveJobs bool
 	opened   bool
+
+	mu           sync.Mutex
+	lastShutdown ShutdownReport
+}
+
+// ShutdownStage names where Run's staged shutdown stopped: the server stage
+// stops accepting traffic and waits for in-flight requests, then the jobs
+// stage signals the scheduler to stop and waits for the running jobs.
+type ShutdownStage string
+
+const (
+	// ShutdownClean means every stage finished inside the timeout.
+	ShutdownClean ShutdownStage = "clean"
+	// ShutdownServer means the server stage returned an error, usually its
+	// shutdown timeout with requests still in flight.
+	ShutdownServer ShutdownStage = "server"
+	// ShutdownJobs means the jobs stage timed out with a job still running.
+	// The pool is closed after Run returns, so that job loses the pool.
+	ShutdownJobs ShutdownStage = "jobs"
+)
+
+// ShutdownReport says how the most recent Run shutdown finished. Stage is
+// clean, or the stage that timed out. Err carries the server stage's error
+// when it failed; a jobs timeout leaves Err as the server stage left it,
+// usually nil, because the stuck job reports nothing to wrap.
+type ShutdownReport struct {
+	Stage ShutdownStage
+	Err   error
+}
+
+// LastShutdown reports how the most recent Run shutdown finished. Before any
+// Run it is the zero report, with an empty stage.
+func (a *App) LastShutdown() ShutdownReport {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastShutdown
+}
+
+func (a *App) setLastShutdown(r ShutdownReport) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastShutdown = r
 }
 
 // New stores opts and fills in the logger. It performs no I/O; Open does.
@@ -335,8 +378,13 @@ func (a *App) Open(ctx context.Context) error {
 }
 
 // Run opens the app if needed, then serves HTTP and runs the jobs until ctx
-// is cancelled, shutting down gracefully. It returns nil on a clean
-// shutdown. Signal handling stays in main, where it can be seen:
+// is cancelled, shutting down in stages: the server stops accepting traffic
+// and waits for in-flight requests, then the scheduler is signalled to stop
+// and the running jobs are waited for up to ShutdownTimeout. It returns nil
+// on a clean shutdown, and the stage that timed out is logged and kept on
+// LastShutdown. Run does not close the pool: call Close after Run returns,
+// once the jobs it waited for no longer need it. Signal handling stays in
+// main, where it can be seen:
 //
 //	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 //	defer stop()
@@ -346,7 +394,14 @@ func (a *App) Run(ctx context.Context) error {
 		return err
 	}
 	if !a.haveJobs {
-		return a.server.ListenAndServe(ctx)
+		err := a.server.ListenAndServe(ctx)
+		if err != nil {
+			a.logger.Warn("shutdown timed out waiting for the server", "stage", ShutdownServer, "error", err)
+			a.setLastShutdown(ShutdownReport{Stage: ShutdownServer, Err: err})
+			return err
+		}
+		a.setLastShutdown(ShutdownReport{Stage: ShutdownClean})
+		return nil
 	}
 	schedDone := make(chan struct{})
 	go func() {
@@ -354,6 +409,9 @@ func (a *App) Run(ctx context.Context) error {
 		a.schedule.Run(ctx)
 	}()
 	err := a.server.ListenAndServe(ctx)
+	if err != nil {
+		a.logger.Warn("shutdown timed out waiting for the server", "stage", ShutdownServer, "error", err)
+	}
 	// The scheduler stops when ctx is cancelled, but a job already running
 	// keeps going until it finishes. Wait for it, so Close does not release
 	// the pool from under a running job — bounded by ShutdownTimeout, so a
@@ -367,10 +425,17 @@ func (a *App) Run(ctx context.Context) error {
 	defer timer.Stop()
 	select {
 	case <-schedDone:
+		if err != nil {
+			a.setLastShutdown(ShutdownReport{Stage: ShutdownServer, Err: err})
+			return err
+		}
+		a.setLastShutdown(ShutdownReport{Stage: ShutdownClean})
+		return nil
 	case <-timer.C:
-		a.logger.Warn("shutdown timed out waiting for jobs, continuing without them")
+		a.logger.Warn("shutdown timed out waiting for jobs, continuing without them", "stage", ShutdownJobs)
+		a.setLastShutdown(ShutdownReport{Stage: ShutdownJobs, Err: err})
+		return err
 	}
-	return err
 }
 
 // Close releases the pool. Safe to call before Open and more than once.
