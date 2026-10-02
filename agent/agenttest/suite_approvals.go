@@ -450,14 +450,83 @@ func parkCases() []storeCase {
 				k.unchanged(before)
 			}
 		}},
-		{"one approval without its answer is enough to wait for", func(k *kit) {
+		{"with one approval answered and another pending, reports false: the answered call is not left waiting", func(k *kit) {
+			answers := []struct {
+				name   string
+				answer func(k *kit, approval agent.Approval)
+			}{
+				{"approved", func(k *kit, a agent.Approval) { k.decide(a.ID, true) }},
+				{"declined", func(k *kit, a agent.Approval) { k.decide(a.ID, false) }},
+				{"lapsed", func(k *kit, a agent.Approval) {
+					n, err := k.store.ExpireApprovals(k.ctx, *a.ExpiresAt)
+					require.NoError(k.t, err)
+					require.Equal(k.t, 1, n)
+				}},
+			}
+			for _, tt := range answers {
+				run, lease := k.held(agentAlpha)
+				k.reply(lease, Call("call-1", toolSend, sendInput), Call("call-2", toolSend, sendInput))
+				expires := k.now().Add(time.Hour)
+				answered := k.ask(lease, 2, &expires)
+				k.ask(lease, 3, nil)
+				tt.answer(k, answered)
+				before := k.snapshot(run.ID)
+
+				parked, _ := park(k, lease, agent.ReasonApproval)
+
+				assert.False(k.t, parked, tt.name)
+				k.unchanged(before)
+				// The execution still holds the run, and acts on the answer.
+				k.update(lease, 2, agent.StepWaiting, agent.StepStarted)
+			}
+		}},
+		{"an answer whose step has been acted on does not stop a park on another", func(k *kit) {
 			run, lease := k.held(agentAlpha)
 			k.reply(lease, Call("call-1", toolSend, sendInput), Call("call-2", toolSend, sendInput))
 			answered := k.ask(lease, 2, nil)
 			k.ask(lease, 3, nil)
 			k.decide(answered.ID, true)
+			k.update(lease, 2, agent.StepWaiting, agent.StepStarted)
+			k.update(lease, 2, agent.StepStarted, agent.StepCompleted)
 
 			parked, _ := park(k, lease, agent.ReasonApproval)
+
+			assert.True(k.t, parked)
+			assert.Equal(k.t, agent.StatusWaiting, k.run(run.ID).Status)
+		}},
+		{"an answer to an earlier attempt of a step does not stop a park on its current one", func(k *kit) {
+			run, lease := k.proposed(agentAlpha)
+			k.decide(k.ask(lease, 2, nil).ID, true)
+			k.update(lease, 2, agent.StepWaiting, agent.StepStarted)
+			again := k.askRequest(2)
+			again.From, again.Cause, again.Decision = agent.StepStarted, agent.CauseInterrupted, ""
+			second, err := k.store.RequestApproval(k.ctx, lease, again)
+			require.NoError(k.t, err)
+			require.Equal(k.t, agent.ApprovalPending, second.Status)
+
+			parked, _ := park(k, lease, agent.ReasonApproval)
+
+			assert.True(k.t, parked)
+			assert.Equal(k.t, agent.StatusWaiting, k.run(run.ID).Status)
+		}},
+		{"with one waiting step's child ended and another's running, reports false: the ended child is not left uncollected", func(k *kit) {
+			for _, status := range finalStatuses {
+				run, lease, children := k.delegated()
+				k.finish(k.claim(workerB, children[0].ID), status)
+				before := k.snapshot(run.ID)
+
+				parked, _ := park(k, lease, agent.ReasonChildren)
+
+				assert.False(k.t, parked, status)
+				k.unchanged(before)
+			}
+		}},
+		{"an ended child whose step has collected it does not stop a park on another", func(k *kit) {
+			run, lease, children := k.delegated()
+			k.finish(k.claim(workerB, children[0].ID), agent.StatusCompleted)
+			k.update(lease, 2, agent.StepWaiting, agent.StepCompleted)
+
+			parked, _ := park(k, lease, agent.ReasonChildren)
 
 			assert.True(k.t, parked)
 			assert.Equal(k.t, agent.StatusWaiting, k.run(run.ID).Status)

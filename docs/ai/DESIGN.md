@@ -2877,9 +2877,13 @@ type Store interface {
 	// Yield releases the lease and leaves the run runnable.
 	Yield(ctx context.Context, lease Lease, req YieldRequest) error
 	// Park sets the run waiting and releases the lease, but only while it
-	// has something to wait for: a pending approval, or a child run that
-	// has not ended. Otherwise, or when cancellation has been requested,
-	// it changes nothing and reports false.
+	// has something to wait for, a pending approval or a child run that has
+	// not ended, and nothing to do: no waiting step whose approval for its
+	// current attempt has its answer, and none whose child has ended.
+	// Otherwise, or when cancellation has been requested, it changes
+	// nothing and reports false. So an answer or a child's end that lands
+	// after the caller read the journal is never left for whatever else the
+	// run waits for.
 	Park(ctx context.Context, lease Lease, req ParkRequest) (parked bool, err error)
 	// Finish ends the run, releases the lease, cancels its pending
 	// approvals, and makes a waiting parent runnable.
@@ -4230,6 +4234,19 @@ finds a waiting run and sets it runnable. A run is never left waiting with
 nothing to wait for. Child runs ending and cancellation use the same lock
 for the same reason.
 
+A run can wait on more than one thing, and then "nothing pending" is not
+the whole test. With two calls of one reply both put to a person, an
+execution reads the journal, a person approves the first, and the execution
+parks: the second question is still pending, the answer found a run that
+was not waiting and woke nothing, and the approved call would not run until
+the second question was answered or lapsed. So `Park` also reports false
+while any waiting step already has what it waited for: the approval for its
+current attempt is no longer pending, or its child has ended. The execution
+goes round, reads the answer and acts on it, and parks afterwards on what is
+left. Only the approval for a step's current attempt counts, as in `next`
+(6.5): the answer to an earlier attempt, and an answer whose step has since
+moved on, stop nothing.
+
 With `ApprovalTTL` set, an approval carries `ExpiresAt`. `Tick` calls
 `ExpireApprovals` first, which lapses overdue approvals and sets their runs
 runnable; a lapsed approval declines the call.
@@ -4239,7 +4256,7 @@ the row is locked first and what is decided on is read afterwards:
 
 | Method | Statements, in order |
 |---|---|
-| `Park` | The fence, which locks the run. Then `select exists (a pending approval of the run) or exists (a child run that has not ended)`. Then the update that sets the run waiting and releases the lease. The look and the write are separate statements on purpose: one statement that carried the look as a condition would evaluate it in a snapshot taken before it waited for the row |
+| `Park` | The fence, which locks the run. Then `select (exists (a pending approval of the run) or exists (a child run that has not ended)) and not exists (a waiting step whose approval for its current attempt is not pending) and not exists (a waiting step whose child run has ended)`. Then the update that sets the run waiting and releases the lease. The look and the write are separate statements on purpose: one statement that carried the look as a condition would evaluate it in a snapshot taken before it waited for the row |
 | `DecideApproval` | Lock the run the approval belongs to (`select r.id from agent_runs r join agent_approvals a on a.run_id = r.id where a.id = $1 for update of r`). Read the approval again. If it is not pending, return it with `ErrAlreadyDecided`, having changed nothing. Otherwise raise the run's `Rev` and wake it, and write the answer with that `Rev`. Of eight answers at once, seven read an approval that has its answer |
 | `ExpireApprovals` | Lock every run that has a pending approval past its time, `order by depth desc, id`, waiting for each and passing over none. Then lapse what is due among those runs' approvals, read again now that the rows are held, each stamped with its run's `Rev` plus one. Then raise each of those runs' `Rev` once and wake it. With nothing due nothing is locked or written |
 | `Finish` | The fence, on the run that is ending. The update that ends it. The update that cancels its pending approvals. Then, for a child, `select 1 from agent_runs where id = <parent> for update`, and `update … where id = <parent> and status = 'waiting'` |

@@ -173,6 +173,27 @@ func (k *kit) createChild(parent agent.Run) agent.Run {
 	return k.insert(child)
 }
 
+// delegated stores a run of agentName held by workerA whose reply made two
+// calls, steps 2 and 3, each now waiting on a child run of its own that has
+// not ended.
+func (k *kit) delegated() (agent.Run, agent.Lease, []agent.Run) {
+	k.t.Helper()
+	run, lease := k.held(agentAlpha)
+	k.reply(lease, Call("call-1", toolSend, sendInput), Call("call-2", toolSend, sendInput))
+	var children []agent.Run
+	for _, seq := range []int{2, 3} {
+		k.update(lease, seq, agent.StepProposed, agent.StepStarted)
+		child := k.newRun(agentBeta)
+		child.ParentID, child.ParentSeq, child.Depth = run.ID, seq, run.Depth+1
+		child = k.insert(child)
+		require.NoError(k.t, k.store.UpdateStep(k.ctx, lease, agent.StepUpdate{
+			Seq: seq, From: agent.StepStarted, To: agent.StepWaiting, ChildRunID: child.ID, Now: k.tick(),
+		}))
+		children = append(children, child)
+	}
+	return k.run(run.ID), lease, children
+}
+
 func (k *kit) run(id string) agent.Run {
 	k.t.Helper()
 	run, err := k.store.GetRun(k.ctx, id)

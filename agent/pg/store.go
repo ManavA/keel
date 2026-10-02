@@ -581,11 +581,24 @@ func (s *Store) Yield(ctx context.Context, lease agent.Lease, req agent.YieldReq
 }
 
 const (
-	// waitsSQL says whether a run has something to wait for: an approval
-	// nobody has answered, or a child run that has not ended.
+	// waitsSQL says whether a run has something to wait for and nothing to
+	// do. Something to wait for is an approval nobody has answered, or a
+	// child run that has not ended. Something to do is a waiting step that
+	// has what it waited for: the approval for its current attempt has its
+	// answer, or its child has ended.
 	waitsSQL = `
-select exists (select 1 from ` + ApprovalsTable + ` where run_id = $1 and status = 'pending')
-    or exists (select 1 from ` + RunsTable + ` where parent_id = $1 and status not in ` + ended + `)`
+select (exists (select 1 from ` + ApprovalsTable + ` where run_id = $1 and status = 'pending')
+     or exists (select 1 from ` + RunsTable + ` where parent_id = $1 and status not in ` + ended + `))
+   and not exists (
+        select 1 from ` + StepsTable + ` s
+        join ` + ApprovalsTable + ` a on a.run_id = s.run_id and a.seq = s.seq and a.attempt = s.attempts
+        where s.run_id = $1 and s.kind = 'tool' and s.status = 'waiting'
+          and s.child_run_id is null and a.status <> 'pending')
+   and not exists (
+        select 1 from ` + StepsTable + ` s
+        join ` + RunsTable + ` c on c.id = s.child_run_id
+        where s.run_id = $1 and s.kind = 'tool' and s.status = 'waiting'
+          and c.status in ` + ended + `)`
 
 	parkSQL = `
 update ` + RunsTable + `
@@ -607,12 +620,17 @@ func (s *Store) Park(ctx context.Context, lease agent.Lease, req agent.ParkReque
 	return parked, nil
 }
 
-// park sets the run waiting if it has something to wait for. The caller
-// holds the run's row, and that is what makes the look and the write one
-// step: an answer, a lapse, a child's end and a request to cancel each take
-// the same row before they change what this reads, so each lands wholly
-// before the look, and is seen, or wholly after the write, and finds a
-// waiting run to wake.
+// park sets the run waiting if it has something to wait for and no waiting
+// step that already has what it waited for. The caller holds the run's row,
+// and that is what makes the look and the write one step: an answer, a
+// lapse, a child's end and a request to cancel each take the same row before
+// they change what this reads, so each lands wholly before the look, and is
+// seen, or wholly after the write, and finds a waiting run to wake.
+//
+// Seen, it stops the park even when something else is still pending: the
+// execution read its journal before the answer landed, and parked on the
+// other question it would leave an approved call unrun until that question
+// was answered too.
 func park(ctx context.Context, tx pgx.Tx, runID string, run heldRun, req agent.ParkRequest) (bool, error) {
 	if run.cancelRequested {
 		return false, nil

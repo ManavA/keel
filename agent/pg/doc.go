@@ -29,7 +29,10 @@
 // before they change what Park reads, so each lands wholly before the look
 // or wholly after the write, and a run is never left waiting for something
 // that has already happened. This is why a child's Finish locks its parent's
-// row even when the parent is not waiting.
+// row even when the parent is not waiting. The look is for more than
+// something pending: a run with two questions out, one of them answered since
+// its execution read the journal, is not parked on the other, since nothing
+// would then run the approved call until the other was answered too.
 //
 // A claim that names its run waits for the row and then decides, so it is
 // not refused because the run's last holder was in the middle of a write. A
