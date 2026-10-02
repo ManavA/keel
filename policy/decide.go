@@ -17,8 +17,9 @@ import (
 // replaces the one held only when it is strictly stricter, so of two equally
 // strict rules the earlier is reported. Called on a Policy that did not come
 // through Validate, a rule with an effect that is none of the three counts as
-// Block, and a target pattern that does not compile, or a condition Validate
-// would refuse, matches nothing.
+// Block, and a target pattern that does not compile, or a condition with an
+// operator or a value its operator cannot use, matches nothing. The other forms
+// Validate refuses, such as an empty list of values, are decided as written.
 func (p Policy) Decide(a Action) Decision {
 	d := Decision{Index: -1}
 	for i, r := range p.Rules {
@@ -72,8 +73,9 @@ func (m Match) holds(a Action) bool {
 }
 
 // holds reports whether c holds for a. A condition on an attribute the action
-// does not carry never holds, except that exists is false; a condition that
-// Validate would refuse never holds.
+// does not carry never holds, except that exists is false. A condition whose
+// operator is not listed, or whose value the operator cannot compare with,
+// never holds, ne no less than eq.
 func (c Cond) holds(a Action) bool {
 	v, present := a.Attrs[c.Attr]
 	if c.Op == OpExists {
@@ -84,10 +86,11 @@ func (c Cond) holds(a Action) bool {
 		return false
 	}
 	switch c.Op {
-	case OpEq:
-		return equal(v, c.Value)
-	case OpNe:
-		return !equal(v, c.Value)
+	case OpEq, OpNe:
+		if ok, _ := scalar(c.Value); !ok {
+			return false
+		}
+		return equal(v, c.Value) == (c.Op == OpEq)
 	case OpIn:
 		return in(v, c.Value)
 	case OpGt, OpGte, OpLt, OpLte:

@@ -78,6 +78,19 @@ func TestNewDecider(t *testing.T) {
 		assert.Contains(t, err.Error(), "policy: new decider")
 	})
 
+	t.Run("refuses a condition that can never hold", func(t *testing.T) {
+		for name, p := range map[string]Policy{
+			"no attribute": {Rules: []Rule{{Name: "r", Effect: Block, When: Match{Attrs: []Cond{{Op: OpEq, Value: 1}}}}}},
+			"eq no value":  {Rules: []Rule{{Name: "r", Effect: Block, When: Match{Attrs: []Cond{{Attr: "x", Op: OpEq}}}}}},
+			"empty kind":   {Rules: []Rule{{Name: "r", Effect: Block, When: Match{Kinds: []string{""}}}}},
+		} {
+			d, err := NewDecider(p, Options{})
+			require.Error(t, err, name)
+			assert.Nil(t, d, name)
+			assert.Contains(t, err.Error(), `rule 0 ("r")`, name)
+		}
+	})
+
 	t.Run("refuses a default that is not an effect", func(t *testing.T) {
 		d, err := NewDecider(Policy{Default: "deny"}, Options{})
 		require.Error(t, err)

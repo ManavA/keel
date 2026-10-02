@@ -1450,8 +1450,25 @@ is the record, so it must identify one rule), an effect that is not one of
 the three, a `Default` that is neither empty nor one of the three, a target
 pattern that does not compile, an operator that is not listed, an `OpIn`
 whose value is not a list, an `OpExists` whose value is not a boolean, and a
-numeric operator whose value is not a number. `Parse` decodes with unknown
-fields disallowed and then validates.
+numeric operator whose value is not a number.
+
+It also refuses each form that can never hold, or holds for every action by
+accident, because on a block rule either one fails open without a word, and
+it names the rule and the condition as it does the other faults: a `Cond`
+with an empty `Attr`; an `OpEq` or `OpNe` whose value is not a number, a
+string or a boolean, so no value at all, and no list or object either, since
+such a value is equal to nothing and would leave `OpEq` never holding and
+`OpNe` always holding; a number that is not finite (NaN, or an infinity,
+which nothing is above and every number is below) as the value of any
+operator or as an element of an `OpIn` list; an `OpIn` whose list is empty or
+has an element that is not a number, a string or a boolean; and a kind in
+`Match.Kinds` that is the empty string, which names no action. The empty
+`Kinds`, `Target` and `Attrs` are not refused: the field comments above say
+each means every kind, every target and no condition. Two conditions that
+contradict one another are not detected.
+
+`Parse` decodes with unknown fields disallowed and then validates, so a
+serialised policy with any of these cannot be loaded.
 
 *package pg: policy/pg/store.go, migrations.go*
 
@@ -1548,8 +1565,10 @@ recorded is never acted on as an allow. The decision log is append-only:
 
 An invalid policy cannot reach `Decide` through a `Decider`, since
 `NewDecider` validates. Called on a `Policy` value directly, `Decide` treats
-a rule with an unknown effect as block and a pattern that does not compile
-as not matching.
+a rule with an unknown effect as block, and a pattern that does not compile,
+or a condition whose operator is not listed or whose value its operator
+cannot use, as not matching. The other forms `Validate` refuses are decided
+as written.
 
 ### 5.7 In-process default
 
@@ -4078,3 +4097,20 @@ chose them.
     bound. Rejected: checking the assembled event, which allocates first
     and checks after. The error is not exported, since no caller has a
     decision to make about it.
+
+40. **`Validate` refuses a rule that matches nothing, or everything, by
+    mistake.** A condition with no attribute; an `eq` or `ne` with no value,
+    or with a list or object; a number that is not finite; an `in` with an
+    empty list or an element that is not a number, a string or a boolean; and
+    an empty kind. Rejected: leaving them to `Decide`, where each reads as
+    "this rule does not apply". A person who wrote a block rule and left out
+    the attribute, or whose `value` was dropped when a policy was
+    reserialised, has a rule that looks like protection and protects
+    nothing, and nothing says so; the fault is also the sort a reviewer reads
+    straight past. Refusing at load time costs a startup error that names the
+    rule and the condition. Not refused: an empty `Kinds`, `Target` or
+    `Attrs`, which the design defines as "every", so a rule with no `when`
+    applies to every action; two conditions that contradict one another,
+    which is analysis this package does not do; and a target of `*`, which
+    `path.Match` does not let cross a slash, so it does not match a target
+    that holds one.

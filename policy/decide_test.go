@@ -122,6 +122,13 @@ func TestMatch_Conditions(t *testing.T) {
 		{name: "ne: equal numbers", m: cond("n", policy.OpNe, 5), attrs: attrs("n", 5.0), want: false},
 		{name: "ne: different numbers", m: cond("n", policy.OpNe, 5), attrs: attrs("n", 6), want: true},
 		{name: "ne: a present attribute of another type is not equal", m: cond("n", policy.OpNe, 5), attrs: attrs("n", "five"), want: true},
+		// Decide on a policy Validate refuses: a value eq and ne cannot compare
+		// with makes the condition fail, ne no less than eq, not hold by accident.
+		{name: "ne: a nil value never holds", m: cond("n", policy.OpNe, nil), attrs: attrs("n", 5), want: false},
+		{name: "ne: a list value never holds", m: cond("n", policy.OpNe, []any{"a"}), attrs: attrs("n", "b"), want: false},
+		{name: "ne: a map value never holds", m: cond("n", policy.OpNe, map[string]any{}), attrs: attrs("n", "b"), want: false},
+		{name: "ne: a NaN value never holds", m: cond("n", policy.OpNe, math.NaN()), attrs: attrs("n", 5), want: false},
+		{name: "eq: a nil value never holds", m: cond("n", policy.OpEq, nil), attrs: attrs("n", 5), want: false},
 
 		// gt, gte, lt, lte
 		{name: "gt: above", m: cond("n", policy.OpGt, 5), attrs: attrs("n", 6), want: true},

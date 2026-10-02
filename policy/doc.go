@@ -50,6 +50,16 @@
 // cannot be written. The zero Decision's empty effect is not Allow, and a
 // caller must treat an effect that is not one of the three as Block.
 //
+// # A rule that matches nothing by mistake
+//
+// [Policy.Validate] refuses a rule whose condition could never hold, or would
+// hold for every action, because on a block rule that fails open without a
+// word: a condition with no attribute, an eq or ne with no value, an in with
+// an empty list or an element that is not a number, a string or a boolean, a
+// number that is not finite, and an empty kind. An empty Kinds, Target or
+// Attrs is not a mistake: each means every action, as the field says. Two
+// conditions that contradict one another are not detected.
+//
 // # In-process by default
 //
 // [MemoryRecorder] is the [Recorder] a Decider uses when it is given none, and

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"reflect"
 )
 
 // UnmarshalText reads an effect. It also reads "approve" as Ask, which is
@@ -76,15 +77,27 @@ func (p Policy) check() error {
 	return nil
 }
 
-// check reports what is wrong with m: a target pattern that does not compile,
-// or a condition no action could hold under.
+// check reports what is wrong with m: a kind that names nothing, a target
+// pattern that does not compile, or a condition that can never hold or holds
+// whatever the action is. The design says an empty Kinds, an empty Target and
+// an empty Attrs each mean "any", so those are accepted; anything else that
+// would leave a part of a rule silently unmatched is refused, since on a block
+// rule that fails open.
 func (m Match) check() error {
+	for i, k := range m.Kinds {
+		if k == "" {
+			return fmt.Errorf("kind %d is empty, which names no action", i)
+		}
+	}
 	// Matching against the empty string still reads the whole pattern, so a
 	// malformed one is reported whatever the target.
 	if _, err := path.Match(m.Target, ""); err != nil {
 		return fmt.Errorf("target pattern %q does not compile: %w", m.Target, err)
 	}
 	for i, c := range m.Attrs {
+		if c.Attr == "" {
+			return fmt.Errorf("condition %d has no attribute", i)
+		}
 		if err := c.check(); err != nil {
 			return fmt.Errorf("condition %d on %q: %w", i, c.Attr, err)
 		}
@@ -93,18 +106,47 @@ func (m Match) check() error {
 }
 
 // check reports whether c has an operator that is listed and a value that
-// operator can use.
+// operator can use. A value must be one the operator can hold under for some
+// action and fail under for another: eq and ne compare against a number, a
+// string or a boolean, since anything else is equal to nothing and eq would
+// never hold while ne always did; the ordering operators need a finite number,
+// since nothing is above positive infinity and every number is below it; and in
+// needs a list with something in it, of such values.
 func (c Cond) check() error {
 	switch c.Op {
 	case OpEq, OpNe:
-		return nil
+		ok, infinite := scalar(c.Value)
+		if !ok {
+			return fmt.Errorf("%s needs a number, a string or a boolean, not %T", c.Op, c.Value)
+		}
+		if infinite {
+			return fmt.Errorf("%s needs a finite number, not %v", c.Op, c.Value)
+		}
 	case OpGt, OpGte, OpLt, OpLte:
-		if _, ok := numberOf(c.Value); !ok {
+		n, ok := numberOf(c.Value)
+		if !ok {
 			return fmt.Errorf("%s needs a number, not %T", c.Op, c.Value)
+		}
+		if n.IsInf() {
+			return fmt.Errorf("%s needs a finite number, not %v", c.Op, c.Value)
 		}
 	case OpIn:
 		if !isList(c.Value) {
 			return fmt.Errorf("%s needs a list, not %T", c.Op, c.Value)
+		}
+		list := reflect.ValueOf(c.Value)
+		if list.Len() == 0 {
+			return fmt.Errorf("%s needs a list with something in it", c.Op)
+		}
+		for i := range list.Len() {
+			v := list.Index(i).Interface()
+			ok, infinite := scalar(v)
+			if !ok {
+				return fmt.Errorf("%s list element %d is not a number, a string or a boolean, but %T", c.Op, i, v)
+			}
+			if infinite {
+				return fmt.Errorf("%s list element %d is not a finite number, but %v", c.Op, i, v)
+			}
 		}
 	case OpExists:
 		if _, ok := boolOf(c.Value); !ok {
@@ -114,4 +156,17 @@ func (c Cond) check() error {
 		return fmt.Errorf("unknown operator %q", c.Op)
 	}
 	return nil
+}
+
+// scalar classifies v as eq, ne and in see it: ok when it is a number, a string
+// or a boolean, and infinite when it is a number that is not finite.
+func scalar(v any) (ok, infinite bool) {
+	if n, isNumber := numberOf(v); isNumber {
+		return true, n.IsInf()
+	}
+	if _, isString := stringOf(v); isString {
+		return true, false
+	}
+	_, isBool := boolOf(v)
+	return isBool, false
 }

@@ -2,6 +2,7 @@ package policy_test
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 
@@ -110,6 +111,12 @@ func TestParse_RoundTrips(t *testing.T) {
 		{name: "every field and operator", p: everyPart()},
 		{name: "the empty policy", p: policy.Policy{}},
 		{name: "a policy of no rules with a default", p: policy.Policy{Default: policy.Allow, Rules: []policy.Rule{}}},
+		{name: "values that are false, zero and empty", p: policy.Policy{Rules: []policy.Rule{
+			{Name: "false", Effect: policy.Block, When: policy.Match{Attrs: []policy.Cond{{Attr: "f", Op: policy.OpEq, Value: false}}}},
+			{Name: "zero", Effect: policy.Block, When: policy.Match{Attrs: []policy.Cond{{Attr: "n", Op: policy.OpNe, Value: 0.0}}}},
+			{Name: "empty", Effect: policy.Block, When: policy.Match{Attrs: []policy.Cond{{Attr: "s", Op: policy.OpEq, Value: ""}}}},
+			{Name: "empty kinds", Effect: policy.Allow, When: policy.Match{Kinds: nil}},
+		}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -185,6 +192,74 @@ func TestParse_Refuses(t *testing.T) {
 		_, err := policy.Parse([]byte(`{"rules": [{"name": "a", "effect": "allow", "when": {"target": "["}}]}`))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "target")
+	})
+}
+
+// A serialised policy with a condition that can never hold, or a kind that
+// names nothing, cannot be loaded.
+func TestParse_RefusesWhatCanNeverHold(t *testing.T) {
+	rule := func(when string) string {
+		return `{"rules": [{"name": "r", "effect": "block", "when": ` + when + `}]}`
+	}
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{name: "an empty attribute", data: rule(`{"attrs": [{"attr": "", "op": "eq", "value": 1}]}`), want: "condition 0 has no attribute"},
+		{name: "no attribute at all", data: rule(`{"attrs": [{"op": "eq", "value": 1}]}`), want: "condition 0 has no attribute"},
+		{name: "eq with no value", data: rule(`{"attrs": [{"attr": "x", "op": "eq"}]}`), want: "eq needs a number, a string or a boolean"},
+		{name: "eq with a null value", data: rule(`{"attrs": [{"attr": "x", "op": "eq", "value": null}]}`), want: "eq needs a number, a string or a boolean"},
+		{name: "ne with no value", data: rule(`{"attrs": [{"attr": "x", "op": "ne"}]}`), want: "ne needs a number, a string or a boolean"},
+		{name: "ne with a null value", data: rule(`{"attrs": [{"attr": "x", "op": "ne", "value": null}]}`), want: "ne needs a number, a string or a boolean"},
+		{name: "eq with an object", data: rule(`{"attrs": [{"attr": "x", "op": "eq", "value": {"a": 1}}]}`), want: "eq needs a number, a string or a boolean"},
+		{name: "ne with a list", data: rule(`{"attrs": [{"attr": "x", "op": "ne", "value": ["a"]}]}`), want: "ne needs a number, a string or a boolean"},
+		{name: "in with an empty list", data: rule(`{"attrs": [{"attr": "x", "op": "in", "value": []}]}`), want: "in needs a list with something in it"},
+		{name: "in with a null element", data: rule(`{"attrs": [{"attr": "x", "op": "in", "value": [1, null]}]}`), want: "in list element 1"},
+		{name: "in with a nested list", data: rule(`{"attrs": [{"attr": "x", "op": "in", "value": [["a"]]}]}`), want: "in list element 0"},
+		{name: "kinds with an empty entry", data: rule(`{"kinds": [""]}`), want: "kind 0 is empty"},
+		{name: "kinds with an empty entry after another", data: rule(`{"kinds": ["read", ""]}`), want: "kind 1 is empty"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := policy.Parse([]byte(tt.data))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "policy: parse")
+			assert.Contains(t, err.Error(), `rule 0 ("r")`)
+			assert.Contains(t, err.Error(), tt.want)
+			assert.Equal(t, policy.Policy{}, got)
+		})
+	}
+
+	// What the design defines as "any", and values that are empty but are values,
+	// still load, and decide as written.
+	t.Run("what the design says is any still loads", func(t *testing.T) {
+		for _, data := range []string{
+			`{"rules": [{"name": "r", "effect": "block"}]}`,
+			rule(`{}`),
+			rule(`{"kinds": []}`),
+			rule(`{"target": ""}`),
+			rule(`{"attrs": []}`),
+		} {
+			got, err := policy.Parse([]byte(data))
+			require.NoError(t, err, data)
+			assert.Equal(t, policy.Block, got.Decide(policy.Action{Kind: "anything"}).Effect, data)
+		}
+	})
+
+	t.Run("a value that is false, zero or empty is a value", func(t *testing.T) {
+		got, err := policy.Parse([]byte(`{"rules": [
+			{"name": "false", "effect": "block", "when": {"attrs": [{"attr": "f", "op": "eq", "value": false}]}},
+			{"name": "zero", "effect": "block", "when": {"attrs": [{"attr": "n", "op": "eq", "value": 0}]}},
+			{"name": "empty", "effect": "block", "when": {"attrs": [{"attr": "s", "op": "eq", "value": ""}]}}
+		]}`))
+		require.NoError(t, err)
+		for rule, attrs := range map[string]map[string]any{
+			"false": {"f": false}, "zero": {"n": 0}, "empty": {"s": ""},
+		} {
+			assert.Equal(t, rule, got.Decide(policy.Action{Kind: "k", Attrs: attrs}).Rule)
+		}
+		assert.Equal(t, policy.RuleDefault, got.Decide(policy.Action{Kind: "k", Attrs: attrs("f", true, "n", 1, "s", "x")}).Rule)
 	})
 }
 
@@ -308,6 +383,13 @@ func TestValidate(t *testing.T) {
 		return policy.Rule{Name: "c", Effect: policy.Allow, When: cond("x", op, v)}
 	}
 	rule := func(name string, e policy.Effect) policy.Rule { return policy.Rule{Name: name, Effect: e} }
+	// noAttr is a block rule whose one condition names no attribute.
+	noAttr := func(op policy.Op, v any) policy.Rule {
+		return policy.Rule{Name: "c", Effect: policy.Block, When: policy.Match{Attrs: []policy.Cond{{Op: op, Value: v}}}}
+	}
+	withKinds := func(kinds ...string) policy.Rule {
+		return policy.Rule{Name: "c", Effect: policy.Block, When: policy.Match{Kinds: kinds}}
+	}
 
 	refused := []struct {
 		name string
@@ -346,6 +428,42 @@ func TestValidate(t *testing.T) {
 			}}}}},
 			want: `condition 1 on "y"`,
 		},
+
+		// A condition that can never hold, or holds whatever the action is,
+		// fails open on a block rule without a word, so it is refused.
+		{name: "a condition with no attribute, eq", p: policy.Policy{Rules: []policy.Rule{noAttr(policy.OpEq, "a")}}, want: `rule 0 ("c"): condition 0 has no attribute`},
+		{name: "a condition with no attribute, ne", p: policy.Policy{Rules: []policy.Rule{noAttr(policy.OpNe, "a")}}, want: "condition 0 has no attribute"},
+		{name: "a condition with no attribute, gt", p: policy.Policy{Rules: []policy.Rule{noAttr(policy.OpGt, 1)}}, want: "condition 0 has no attribute"},
+		{name: "a condition with no attribute, in", p: policy.Policy{Rules: []policy.Rule{noAttr(policy.OpIn, []any{"a"})}}, want: "condition 0 has no attribute"},
+		{name: "a condition with no attribute, exists", p: policy.Policy{Rules: []policy.Rule{noAttr(policy.OpExists, false)}}, want: "condition 0 has no attribute"},
+		{
+			name: "the second condition with no attribute",
+			p: policy.Policy{Rules: []policy.Rule{{Name: "a", Effect: policy.Block, When: policy.Match{Attrs: []policy.Cond{
+				{Attr: "x", Op: policy.OpEq, Value: 1}, {Op: policy.OpEq, Value: 1},
+			}}}}},
+			want: `rule 0 ("a"): condition 1 has no attribute`,
+		},
+		{name: "eq with no value", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpEq, nil)}}, want: `condition 0 on "x": eq needs a number, a string or a boolean, not <nil>`},
+		{name: "ne with no value", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpNe, nil)}}, want: `ne needs a number, a string or a boolean, not <nil>`},
+		{name: "eq with a list", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpEq, []any{"a"})}}, want: "eq needs a number, a string or a boolean"},
+		{name: "ne with a map", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpNe, map[string]any{"a": 1})}}, want: "ne needs a number, a string or a boolean"},
+		{name: "eq with NaN", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpEq, math.NaN())}}, want: "eq needs a number, a string or a boolean"},
+		{name: "eq with a json.Number that is not a number", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpEq, json.Number("abc"))}}, want: "eq needs a number, a string or a boolean"},
+		{name: "eq with infinity", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpEq, math.Inf(1))}}, want: "eq needs a finite number"},
+		{name: "gt with infinity, which nothing is above", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpGt, math.Inf(1))}}, want: "gt needs a finite number"},
+		{name: "lt with infinity, which every number is below", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpLt, math.Inf(1))}}, want: "lt needs a finite number"},
+		{name: "gte with negative infinity, which every number meets", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpGte, math.Inf(-1))}}, want: "gte needs a finite number"},
+		{name: "lte with NaN", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpLte, math.NaN())}}, want: "lte needs a number"},
+		{name: "in with an empty list", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpIn, []any{})}}, want: "in needs a list with something in it"},
+		{name: "in with an empty string list", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpIn, []string{})}}, want: "in needs a list with something in it"},
+		{name: "in with an empty array", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpIn, [0]int{})}}, want: "in needs a list with something in it"},
+		{name: "in with a null element", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpIn, []any{"a", nil})}}, want: "in list element 1 is not a number, a string or a boolean, but <nil>"},
+		{name: "in with a nested list", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpIn, []any{[]any{"a", "b"}})}}, want: "in list element 0 is not a number, a string or a boolean"},
+		{name: "in with an object element", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpIn, []any{map[string]any{}})}}, want: "in list element 0 is not a number, a string or a boolean"},
+		{name: "in with a NaN element", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpIn, []float64{1, math.NaN()})}}, want: "in list element 1 is not a number, a string or a boolean"},
+		{name: "in with an infinite element", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpIn, []float64{math.Inf(-1)})}}, want: "in list element 0 is not a finite number"},
+		{name: "kinds with an empty entry", p: policy.Policy{Rules: []policy.Rule{withKinds("")}}, want: `rule 0 ("c"): kind 0 is empty`},
+		{name: "kinds with an empty entry after others", p: policy.Policy{Rules: []policy.Rule{withKinds("read", "write", "")}}, want: "kind 2 is empty"},
 	}
 	for _, tt := range refused {
 		t.Run("refuses "+tt.name, func(t *testing.T) {
@@ -390,7 +508,23 @@ func TestValidate(t *testing.T) {
 			{Name: "e", Effect: policy.Allow, When: cond("x", policy.OpLt, 1.5)},
 			{Name: "f", Effect: policy.Allow, When: cond("x", policy.OpLte, json.Number("2"))},
 		}}},
-		{name: "equality with any value", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpEq, "a"), {Name: "d", Effect: policy.Allow, When: cond("x", policy.OpNe, true)}}}},
+		{name: "equality with a number, a string or a boolean", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpEq, "a"), {Name: "d", Effect: policy.Allow, When: cond("x", policy.OpNe, true)}}}},
+		{name: "equality with values that are empty but are values", p: policy.Policy{Rules: []policy.Rule{
+			{Name: "false", Effect: policy.Block, When: cond("x", policy.OpEq, false)},
+			{Name: "zero", Effect: policy.Block, When: cond("x", policy.OpNe, 0)},
+			{Name: "empty string", Effect: policy.Block, When: cond("x", policy.OpEq, "")},
+			{Name: "zero float", Effect: policy.Block, When: cond("x", policy.OpEq, 0.0)},
+		}}},
+		{name: "equality with a named number and a named string", p: policy.Policy{Rules: []policy.Rule{
+			{Name: "number", Effect: policy.Block, When: cond("x", policy.OpEq, cents(5))},
+			{Name: "string", Effect: policy.Block, When: cond("x", policy.OpEq, policy.Block)},
+		}}},
+		{name: "in with every kind of scalar", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpIn, []any{"a", 1.0, true, json.Number("2"), cents(3), 4, int8(5)})}}},
+		{name: "a large number that is finite", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpGt, 1e300)}}},
+		{name: "kinds empty, which the design says is every kind", p: policy.Policy{Rules: []policy.Rule{withKinds(), {Name: "d", Effect: policy.Block, When: policy.Match{Kinds: []string{}}}}}},
+		{name: "a match with nothing set, which the design says is every action", p: policy.Policy{Rules: []policy.Rule{{Name: "a", Effect: policy.Block}}}},
+		{name: "an empty target, which the design says is every target", p: policy.Policy{Rules: []policy.Rule{{Name: "a", Effect: policy.Block, When: policy.Match{Target: ""}}}}},
+		{name: "exists on an attribute", p: policy.Policy{Rules: []policy.Rule{withCond(policy.OpExists, false)}}},
 		{name: "a pattern with every metacharacter", p: policy.Policy{Rules: []policy.Rule{{Name: "a", Effect: policy.Allow, When: policy.Match{Target: `a*b?[c-d][^e]\*`}}}}},
 	}
 	for _, tt := range accepted {
