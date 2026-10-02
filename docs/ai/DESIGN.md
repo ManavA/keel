@@ -1934,7 +1934,10 @@ type Run struct {
 	Reason string `json:"reason,omitempty"`
 	Input  string `json:"input"`
 	Output string `json:"output,omitempty"`
-	Error  string `json:"error,omitempty"`
+	// Error is the last failure. A failed execution records it, and it stays
+	// through later executions that go well, until the run ends and records
+	// its own, which is none for a run that ended well.
+	Error string `json:"error,omitempty"`
 
 	// ParentID and ParentSeq name the tool step of the run that started
 	// this one. Depth is 0 for a run nobody delegated.
@@ -1943,9 +1946,11 @@ type Run struct {
 	Depth     int    `json:"depth,omitempty"`
 
 	// Key is the caller's idempotency key for starting the run.
-	Key        string            `json:"key,omitempty"`
-	Definition Snapshot          `json:"definition"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
+	Key        string   `json:"key,omitempty"`
+	Definition Snapshot `json:"definition"`
+	// Metadata is the caller's own. A run started with none reads back with
+	// an empty map.
+	Metadata map[string]string `json:"metadata,omitempty"`
 
 	Usage        Usage `json:"usage"`
 	ModelCalls   int   `json:"model_calls"`
@@ -2089,18 +2094,24 @@ type Approval struct {
 	Cause   ApprovalCause `json:"cause"`
 	Tool    string        `json:"tool"`
 	// Input is the call's arguments: exactly what runs if approved.
-	Input  json.RawMessage `json:"input"`
-	Action Action          `json:"action"`
-	Rule   string          `json:"rule"`
+	Input json.RawMessage `json:"input"`
+	// Action is what the Guard was asked about. Its Attrs read back as JSON
+	// gives them, a number as a float64, and as an empty map when there
+	// were none.
+	Action Action `json:"action"`
+	Rule   string `json:"rule"`
 
 	Status    ApprovalStatus `json:"status"`
 	DecidedBy string         `json:"decided_by,omitempty"`
 	Reason    string         `json:"reason,omitempty"`
 	Rev       int64          `json:"rev"`
 
-	RequestedAt time.Time  `json:"requested_at"`
-	DecidedAt   *time.Time `json:"decided_at,omitempty"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	RequestedAt time.Time `json:"requested_at"`
+	// DecidedAt is when the approval stopped being pending, whether a person
+	// answered it, it lapsed, or its run ended. It is nil exactly while the
+	// approval is pending.
+	DecidedAt *time.Time `json:"decided_at,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // Changes is what happened to a run after a revision.
@@ -2140,13 +2151,19 @@ type ApprovalFilter struct {
 
 // ClaimRequest asks for a run to execute.
 type ClaimRequest struct {
+	// Owner names who will hold the run. It must not be empty.
 	Owner string
 	// Agents limits the claim to runs of these agents.
 	Agents []string
-	// RunID, when set, claims that run or fails with ErrNotClaimable.
+	// RunID, when set, claims that run or fails: with ErrNotFound when there
+	// is no such run, and with ErrNotClaimable when it cannot be taken. A
+	// claim by RunID waits for a write to the run that is in progress and
+	// then decides. A claim without one passes over a run being written to.
 	RunID string
 	Now   time.Time
-	TTL   time.Duration
+	// TTL is how long the lease lasts without a heartbeat. It must be more
+	// than zero.
+	TTL time.Duration
 }
 
 // YieldRequest gives a run back without finishing it.
@@ -2381,7 +2398,9 @@ type Options struct {
 	Events Publisher
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
-	// NewID makes ids for runs and approvals. Default a random UUID.
+	// NewID makes ids for runs and approvals. Default a random UUID. A store
+	// keeps a run or an approval only under a UUID, written as uuid.NewString
+	// writes one, so a NewID of one's own must return those.
 	NewID func() string
 
 	// WorkerID names this process in leases. Default host name, process id
@@ -2578,7 +2597,7 @@ func Call(id, name, input string) agent.Call
 // Model is a scripted agent.Model that records what it was asked.
 type Model struct{ /* unexported fields */ }
 
-// NewModel builds a Model over script.
+// NewModel builds a Model over script. A nil script is one with no replies.
 func NewModel(script Script) *Model
 
 // Generate implements agent.Model.
@@ -2603,7 +2622,13 @@ var ErrKilled = errors.New("agenttest: store killed")
 var ErrFault = errors.New("agenttest: store fault")
 
 // FaultStore wraps a Store so a test can stop a process at a chosen store
-// call, the way a crash would.
+// call, the way a crash would. Until a fault is asked for it is the store it
+// wraps. It is safe for concurrent use.
+//
+// A call that fails returns no part of the store's answer, whether or not it
+// reached the store. That holds for a call the store itself refused: a fault
+// after the store hides the store's own error too, as a connection lost
+// before the reply would.
 type FaultStore struct{ /* unexported fields */ }
 
 // NewFaultStore wraps inner.
@@ -2614,11 +2639,15 @@ func NewFaultStore(inner agent.Store) *FaultStore
 func (f *FaultStore) Kill()
 
 // KillBefore kills the store as its nth call arrives, so that call and
-// every later one fail and none of them reaches the store. n counts from 1.
+// every later one fail and none of them reaches the store. n counts from 1,
+// over every call since the store was built; an n already passed kills the
+// store at its next call.
 func (f *FaultStore) KillBefore(n int)
 
 // KillAfter lets the nth call reach the store, then fails it and every
-// later one: the write landed and the caller never learned of it.
+// later one: the write landed and the caller never learned of it. If the
+// store refused the nth call, the caller does not learn that either. n
+// counts as it does for KillBefore.
 func (f *FaultStore) KillAfter(n int)
 
 // FailBefore makes the next times calls of op fail with ErrFault without
@@ -2629,12 +2658,16 @@ func (f *FaultStore) KillAfter(n int)
 func (f *FaultStore) FailBefore(op string, times int)
 
 // FailAfter lets the next times calls of op reach the store and then fails
-// each with ErrFault: the write landed, the caller was told it did not, and
-// the store goes on working. op is as for FailBefore, and a fault asked for
-// with FailBefore is spent first.
+// each with ErrFault, whatever the store answered: a write that landed is
+// reported as failed, and so is a call the store refused. The store goes on
+// working. op is as for FailBefore, and a fault asked for with FailBefore is
+// spent first.
 func (f *FaultStore) FailAfter(op string, times int)
 
-// Calls reports how many calls have arrived.
+// Calls reports how many calls have arrived, those that failed included.
+// Every Store method counts, reads and heartbeats as much as writes, so a
+// count taken from one run is the count of another only when both make the
+// same calls: keep a real heartbeat timer out of a run that is counted.
 func (f *FaultStore) Calls() int
 
 // RunStoreSuite runs the Store contract against the store newStore builds.
@@ -2678,25 +2711,27 @@ from the request; a store never reads a clock.
 
 | Method | Effect |
 |---|---|
-| Every method that changes anything | Adds one to the run's `Rev`, stamps each step and approval it touched with the new `Rev`, and sets `UpdatedAt` to the request's time. One call adds one, however many steps and approvals it touches: they all carry the one new `Rev`. `Heartbeat` is the exception: it changes only the lease's expiry and leaves `Rev` and `UpdatedAt` alone. A call that changes nothing leaves them alone too: a call that is refused, a `Park` that reports false, a `RequestApproval` that returns an approval already recorded, an `ExpireApprovals` with nothing due |
+| Every method that changes anything | Adds one to the run's `Rev`, stamps each step and approval it touched with the new `Rev`, and sets `UpdatedAt` to the request's time. One call adds one, however many steps and approvals it touches: they all carry the one new `Rev`. `Heartbeat` is the exception: it changes only the lease's expiry and leaves `Rev` and `UpdatedAt` alone. A call that changes nothing leaves them alone too: a call that is refused, a `Park` that reports false, a `RequestApproval` that returns an approval already recorded, a `RequestCancel` of a run already marked, an `ExpireApprovals` with nothing due |
 | Every method taking a `Lease` | Locks the run, and returns `ErrLeaseLost` without changing anything unless the run's owner and epoch equal the lease's. A lease with an empty `Owner` is never the run's, even when the run records no owner, so nothing writes to a run nobody holds. The hold is the epoch and not the time: under a lease that has lapsed and that no other claim has taken, a write goes through and `Heartbeat` extends the expiry. A run that does not exist is `ErrNotFound`, whatever the lease |
 | Every method that makes a waiting run runnable | These are `DecideApproval`, `ExpireApprovals`, `RequestCancel`, and `Finish` for the run's parent. Each sets `Status` runnable and clears `Reason`, since the run no longer waits. A run that is not waiting keeps its status and its lease |
-| `CreateRun` | The run is stored as given, with `Rev` 1 whatever `Rev` it was given. `Status` must be `StatusRunnable`: any other is an error and stores nothing. A create that finds its agent and key returns the run that has them, as it now stands, and stores nothing. Otherwise an id already in use is an error, and the run that has it is left alone |
-| `Claim` | 6.6. `Owner` must not be empty: a claim without one is an error. A claim leaves `NextAttemptAt` as it is, for the next `Yield` to set or clear. With `RunID`, the same conditions apply to that run alone, its agent being named in `Agents` among them, and `ErrNotClaimable` is returned when they do not hold. A `RunID` that names no run is `ErrNotFound` |
-| `Yield` | Owner cleared, expiry cleared, `NextAttemptAt` set as given, which clears it when none is given. With `Failed`: `Failures` plus one, `Error` recorded. Without it, `Failures` and `Error` stay as they were |
+| Every method that is given something to keep | Refuses, with an error that is none of the package's sentinels and with nothing changed, what a database could not keep or would keep as something else. An id to be stored must be a UUID in the form `uuid.NewString` writes: a run's `ID` and `ParentID`, an approval's `ID`, a step's `ChildRunID`. A `ParentID` must name a run that exists. The other refusals are in the rows below |
+| `CreateRun` | The run is stored as given, with `Rev` 1 whatever `Rev` it was given. `Status` must be `StatusRunnable`: any other is an error and stores nothing. `ID`, and `ParentID` when set, must be UUIDs, and the parent must exist. A create that finds its agent and key returns the run that has them, as it now stands, and stores nothing. Otherwise an id already in use is an error, and the run that has it is left alone. `Metadata` reads back as given, and as an empty map, not nil, when the run was given none |
+| `Claim` | 6.6. `Owner` must not be empty and `TTL` must be more than zero: otherwise an error. A claim leaves `NextAttemptAt` as it is, for the next `Yield` to set or clear. With `RunID`, the same conditions apply to that run alone, its agent being named in `Agents` among them, and `ErrNotClaimable` is returned when they do not hold. A claim by `RunID` locks the run and waits for a write in progress before it decides; only a claim without `RunID` passes over a run that is locked. A `RunID` that names no run is `ErrNotFound` |
+| `Heartbeat` | Sets the lease's expiry to `now` plus `ttl` and reports the cancel mark. `ttl` must be more than zero: otherwise an error, and the lease is as it was |
+| `Yield` | Owner cleared, expiry cleared, `NextAttemptAt` set as given, which clears it when none is given. With `Failed`: `Failures` plus one, `Error` recorded. Without it, `Failures` and `Error` stay as they were. `Error` is therefore the last failure: it stays through later executions that go well, until `Finish` |
 | `Park` | 6.10. Sets `Status` waiting and `Reason`, clears the lease |
-| `Finish` | `Status` must be completed, failed or cancelled: any other is an error and changes nothing. Sets `Status`, `Reason`, `Output`, `Error`, `FinishedAt`; clears the lease; sets every pending approval of the run `cancelled`; and when the run has a parent that is waiting, sets it runnable and adds one to its `Rev`. A cancelled approval gets that status and the run's new `Rev` and nothing else: nobody decided it, so it has no `DecidedAt`, `DecidedBy` or `Reason` |
+| `Finish` | `Status` must be completed, failed or cancelled: any other is an error and changes nothing. Sets `Status`, `Reason`, `Output`, `Error`, `FinishedAt`; clears the lease; sets every pending approval of the run `cancelled`; and when the run has a parent that is waiting, sets it runnable and adds one to its `Rev`. `Error` is set as given, so a run that ended well has none, whatever an earlier failure left. A cancelled approval gets that status, `DecidedAt` the request's time and the run's new `Rev`, and no `DecidedBy` or `Reason`, since nobody decided it |
 | `BeginModel` | `seq` must be one past the last step, or name a model step that is `started`; otherwise `ErrConflict`. Inserts the step as `started` with `Attempts` 1, or adds one to `Attempts` and resets `StartedAt` |
 | `CompleteModel` | The step must be a `started` model step; otherwise `ErrConflict`, which is also the answer when `seq` names no step. Sets it `completed` with the message, stop, model name, usage and `FinishedAt`. On the run: adds the usage, adds one to `ModelCalls`, adds finish less start to `ActiveMillis`, sets `Failures` to 0. Appends one tool step per `Message.Calls` entry at `Seq+1`, `Seq+2`, …: `proposed`, `Turn` the model step's `seq`, `Name` and `Call` from the call, `Key` from `StepKey` |
-| `UpdateStep` | The step must be a tool step in `From`; otherwise `ErrConflict`, which is also the answer when `seq` names no step. Sets `Status` to `To` and records what the request carries: `Decision` and `Rule` only when `Decision` is not empty, `Result` and `IsError` only when `Result` is not nil, and `ChildRunID` only when it is not empty. A `Result` that points at an empty string is a result and is recorded. `To` of `started` adds one to `Attempts` and sets `StartedAt`. A final `To` sets `FinishedAt`, sets the run's `Failures` to 0, and when `From` is `started` adds finish less start to `ActiveMillis`. `Usage` is added to the step and the run. The store checks nothing else about the move; which moves are legal is the engine's business |
-| `RequestApproval` | The step must be a tool step: a model step, or a `seq` that names no step, is `ErrConflict`. If an approval exists for the run, `Seq` and the step's current `Attempts`, it is returned and nothing changes. That lookup comes before the check of `From`, and looks at neither the approval's status nor the rest of the request, so a question asked again after its answer comes back answered. Otherwise the step must be in `From`, or `ErrConflict`; it becomes `waiting` with the decision and rule, and an approval is inserted as pending with `Attempt` the step's `Attempts`, `Tool` its name and `Input` its call's arguments |
+| `UpdateStep` | `To` must be one of the six step statuses, and `ChildRunID`, when set, a UUID: otherwise an error, and nothing changes. The step must be a tool step in `From`; otherwise `ErrConflict`, which is also the answer when `seq` names no step. Sets `Status` to `To` and records what the request carries: `Decision` and `Rule` only when `Decision` is not empty, `Result` and `IsError` only when `Result` is not nil, and `ChildRunID` only when it is not empty. A `Result` that points at an empty string is a result and is recorded. `To` of `started` adds one to `Attempts` and sets `StartedAt`. A final `To` sets `FinishedAt`, sets the run's `Failures` to 0, and when `From` is `started` adds finish less start to `ActiveMillis`. `Usage` is added to the step and the run. The store checks nothing else about the move; which moves are legal is the engine's business |
+| `RequestApproval` | `ID` must be a UUID, or an error. The step must be a tool step: a model step, or a `seq` that names no step, is `ErrConflict`. If an approval exists for the run, `Seq` and the step's current `Attempts`, it is returned and nothing changes. That lookup comes before the check of `From`, and looks at neither the approval's status nor the rest of the request, so a question asked again after its answer comes back answered. Otherwise the step must be in `From`, or `ErrConflict`; it becomes `waiting`, and an approval is inserted as pending with `Attempt` the step's `Attempts`, `Tool` its name and `Input` its call's arguments. The step's `Decision` and `Rule` are set only when the request's `Decision` is not empty, as in `UpdateStep`: the question about an interrupted call does not replace the guard's answer on the step. The approval's `Rule` is the request's either way. `Action.Attrs` reads back as a JSON round trip gives it: a number as a `float64`, an object as a `map[string]any`, a list as a `[]any`, and an empty map, not nil, when there were none. Attributes JSON cannot hold are an error |
 | `DecideApproval` | Locks the run. A pending approval becomes approved or declined with who, why and when; a waiting run becomes runnable. Anything but pending, an expired or a cancelled approval included, is returned as it stands with `ErrAlreadyDecided` |
-| `ExpireApprovals` | The same as a decline, for every pending approval whose `ExpiresAt` is not after `now`, with status `expired`: `DecidedAt` is `now`, and `DecidedBy` and `Reason` stay empty, since nobody decided. Approvals of one run that lapse in one call change the run once and carry the one new `Rev` |
-| `RequestCancel` | Locks the run. Sets the mark, who and why; a waiting run becomes runnable. `ErrFinished` for a run that has ended |
-| `Changes` | The run as it stands, always. With it, the steps in `Seq` order and the approvals in the order `ListApprovals` gives, whatever order they changed in |
-| `ListRuns` | Newest first by `CreatedAt`, then `ID` descending. A `Limit` of zero or less is 50, and one over 200 is 200 |
-| `ListApprovals` | Oldest first by `RequestedAt`, then `ID`. `Limit` as for `ListRuns` |
-| Any method given an id that does not exist | `ErrNotFound`. An id that is not a UUID does not exist either: it is `ErrNotFound` like any other, and never the database's complaint about its form. A `seq` is not an id: a step that does not exist is `ErrConflict`, as the rows above say |
+| `ExpireApprovals` | The same as a decline, for every pending approval whose `ExpiresAt` is not after `now`, with status `expired`: `DecidedAt` is `now`, and `DecidedBy` and `Reason` stay empty, since nobody decided. Approvals of one run that lapse in one call change the run once and carry the one new `Rev`. With `DecideApproval` and `Finish` this keeps one rule: an approval's `DecidedAt` is nil exactly while it is pending |
+| `RequestCancel` | Locks the run. Sets the mark, who and why; a waiting run becomes runnable. A run already marked is left exactly as it is: the first request's who and why stand and `Rev` does not move. `ErrFinished` for a run that has ended |
+| `Changes` | The run as it stands, always. With it, the steps in `Seq` order and the approvals in the order `ListApprovals` gives, whatever order they changed in. A reader that passes each answer's `Run.Rev` as the next call's `since` misses no change, whatever is being written meanwhile. A step or approval may be newer than the run it is returned with; the next call then returns it again |
+| `ListRuns` | Newest first by `CreatedAt`, then `ID` descending. A `Limit` of zero or less is 50, and one over 200 is 200. A `ParentID` that names no run, or is not a UUID, lists nothing |
+| `ListApprovals` | Oldest first by `RequestedAt`, then `ID`. `Limit` as for `ListRuns`. A `RunID` that names no run, or is not a UUID, lists nothing |
+| Any method given an id that does not exist | `ErrNotFound`. An id that is not a UUID does not exist either: it is `ErrNotFound` like any other, and never the database's complaint about its form. A filter is not a lookup, and lists nothing. A `seq` is not an id: a step that does not exist is `ErrConflict`, as the rows above say |
 
 `agenttest.RunStoreSuite` has a case for each of these, and both stores
 pass it.
@@ -3108,9 +3143,14 @@ returning r.*
 ```
 
 `skip locked` means two processes claiming at once take different runs and
-neither waits. A lease is free when it was released (`lease_owner` empty)
-or has lapsed. Taking over a lapsed one adds a failure, so a run that kills
-every process that touches it is finished as `ReasonAbandoned` by the
+neither waits. A claim that names its run (`ClaimRequest.RunID`, which
+`Execute` uses) is the same statement with the run's id among the conditions
+and without `skip locked`: it locks the row, and so waits for a write in
+progress, and then decides. Passing over the row there would answer
+`ErrNotClaimable` for a lapsed run whose last holder happened to be in the
+middle of a write. A lease is free when it was released (`lease_owner`
+empty) or has lapsed. Taking over a lapsed one adds a failure, so a run that
+kills every process that touches it is finished as `ReasonAbandoned` by the
 execution that claims it once `MaxFailures` is reached, before that
 execution does any of the run's work.
 
@@ -3132,13 +3172,14 @@ select lease_owner, lease_epoch from agent_runs where id = $1 for update
 If they differ, the transaction ends with `ErrLeaseLost` and changes
 nothing. It ends the same way when the lease names no owner, whatever the
 row holds: a run nobody holds records an empty owner, and a lease with none
-must not match it. A claim is an update of the same row, so it waits for a
-write in progress and the next holder always reads a journal that includes
-it. A process that was paused past its lease, or partitioned from the
-database and back, therefore cannot add to a journal another process now
-owns. What it can still do is finish the tool call it was in the middle of.
-That is the one way a tool can run twice at the same moment, and 6.7 covers
-it.
+must not match it. A claim takes the same row lock, so it never lands in the
+middle of a write: a claim by id waits for the write, and a claim without
+one passes over the run until the write is done. Either way the next holder
+always reads a journal that includes it. A process that was paused past its
+lease, or partitioned from the database and back, therefore cannot add to a
+journal another process now owns. What it can still do is finish the tool
+call it was in the middle of. That is the one way a tool can run twice at
+the same moment, and 6.7 covers it.
 
 **Clock.** Lease times are written and compared on the engine's `Clock`,
 not the database's. Processes sharing runs must keep their clocks within a
@@ -4116,28 +4157,52 @@ places where the table in 6.2 did not say what a store does. The project
 lead confirmed its choices, and the table now states each of them.
 
 40. **The `Store` contract is the table in 6.2 as the suite holds a store to
-    it, and `FaultStore` can also fail one named method.** Fifteen
-    behaviours were chosen where the table was silent and are now written
-    into it; `agent/pg` passes the same suite, so they bind both stores.
-    The ones that had an alternative: a lease with no owner never holds a
-    run, and a claim needs an owner (rejected: comparing owner and epoch
-    and nothing else, under which a lease with no owner matches a run
-    nobody holds and may write to it); an id that is not a UUID is
-    `ErrNotFound`, and so is `Claim` for a `RunID` that names no run
-    (rejected: the driver's error for a malformed id, which the HTTP
-    surface would serve as a 500, and `ErrNotClaimable` for a run that is
-    not there); a waiting run made runnable loses its `Reason` (rejected:
-    leaving it, so that a runnable run says it waits on an approval); one
-    call adds one to a run's `Rev` however many approvals it touches
-    (rejected: one per approval, which makes the number of revisions
-    depend on how a store batches its writes); an approval that lapsed
-    records when and no one, and one cancelled by its run ending records
-    neither (rejected: a decision time on an approval nobody decided); a
-    step that does not exist is `ErrConflict` (rejected: `ErrNotFound`,
-    which is for ids, and a `seq` is a position); `Changes` returns steps
-    in journal order (rejected: by `Rev`, which the stream wants and sorts
-    for itself, while the timeline wants the journal). On the test kit:
-    `FailBefore` and `FailAfter` fail a named method a given number of
-    times and leave the store working (rejected: kills alone, which
-    cannot make a store failure the process outlives, the case that ends
-    an execution as failed and has it tried again).
+    it, and `FaultStore` can also fail one named method.** Behaviours were
+    chosen where the table was silent and are now written into it;
+    `agent/pg` passes the same suite, so they bind both stores. The ones
+    that had an alternative: a lease with no owner never holds a run, and
+    a claim needs an owner (rejected: comparing owner and epoch and
+    nothing else, under which a lease with no owner matches a run nobody
+    holds and may write to it); an id that is not a UUID is `ErrNotFound`,
+    and so is `Claim` for a `RunID` that names no run (rejected: the
+    driver's error for a malformed id, which the HTTP surface would serve
+    as a 500, and `ErrNotClaimable` for a run that is not there); a
+    waiting run made runnable loses its `Reason` (rejected: leaving it, so
+    that a runnable run says it waits on an approval); one call adds one
+    to a run's `Rev` however many approvals it touches (rejected: one per
+    approval, which makes the number of revisions depend on how a store
+    batches its writes); a step that does not exist is `ErrConflict`
+    (rejected: `ErrNotFound`, which is for ids, and a `seq` is a
+    position); `Changes` returns steps in journal order (rejected: by
+    `Rev`, which the stream wants and sorts for itself, while the timeline
+    wants the journal). On the test kit: `FailBefore` and `FailAfter` fail
+    a named method a given number of times and leave the store working
+    (rejected: kills alone, which cannot make a store failure the process
+    outlives, the case that ends an execution as failed and has it tried
+    again).
+
+    The review of the memory store settled the rest, each so that a test
+    passing on one store passes on the other. A claim by `RunID` waits for
+    a write in progress and only a claim without one passes over a locked
+    run (rejected: `skip locked` for both, as 6.6 first read, which
+    refuses a lapsed run because its last holder is still writing). An
+    approval's `DecidedAt` is nil exactly while it is pending, so one
+    cancelled by its run ending records when, like one that lapsed, and
+    neither records a decider (rejected: no time on a cancelled approval,
+    which leaves two states to tell apart by status alone).
+    `RequestApproval` leaves the step's `Decision` and `Rule` when the
+    request carries no decision (rejected: overwriting them, which wipes
+    the guard's answer from an interrupted step). `RequestCancel` of a run
+    already marked changes nothing (rejected: recording the later request,
+    which rewrites who cancelled a run and moves `Rev` for no change of
+    state). A store refuses what a database could not keep, or would keep
+    as something else: an id that is not a UUID in canonical form, a
+    parent that does not exist, a step status that is not one, a lease of
+    no length (rejected: leaving each to the database's constraints, which
+    `MemoryStore` does not have, so that a test passed on it and failed on
+    Postgres). `Metadata` and `Action.Attrs` read back as JSON gives them,
+    numbers as `float64` and none as an empty map (rejected: `MemoryStore`
+    keeping the Go values it was given, which no database can).
+    `Run.Error` is the last failure and stays until `Finish` (rejected:
+    clearing it when a later step completes, which loses why a run that
+    recovered had been retried).
