@@ -15,10 +15,37 @@ package policy_test
 // counts it shows, 6 allowed, 8 waiting and 0 blocked, are asserted with the
 // data cases below. Where the reference asserts only a decision, the rule name
 // here is the one its decide returns for that case.
+//
+// Agreement with the reference is also a standing check, not only the cases
+// above. TestReference_GoldenGrid holds Go to the reference's own answers for a
+// grid of 21,870 policies and actions, stored in testdata/reference_grid.json.
+// testdata/reference_grid.mts generated that file from logic.ts, and says how
+// (the command, the order of the grid, the code each answer is written in).
+// Regenerate it only when logic.ts changes, and say so in the commit.
+//
+// Go differs from the reference in two places, on purpose, and
+// TestReference_WhereGoDiffersOnPurpose pins both.
+//
+//   - A payment with no amount. The reference reads it as 0 (amount ?? 0); Go
+//     treats the attribute as absent, which holds under no operator. The two
+//     agree for every limit from 0 up, which is the range the demonstration
+//     allows, and differ below it: with a limit of -5 the reference asks and
+//     Go allows.
+//   - An amount that is not a number. The reference compares as JavaScript
+//     does: "1250" and [1250] ask, and "50", "abc", null and NaN are allowed.
+//     Go cannot tell, and an ask or block rule counts what it cannot tell
+//     against the action (DESIGN.md 5.2), so Go asks in every one of those
+//     cases: where the reference's coercion also asks, and where it allows. A
+//     limit is never passed by the type an amount arrives in.
 
 import (
+	"encoding/json"
+	"fmt"
 	"maps"
+	"math"
+	"os"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -409,6 +436,120 @@ func TestReference_Thousands(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.want, func(t *testing.T) {
 			assert.Equal(t, tt.want, thousands(tt.n))
+		})
+	}
+}
+
+// referenceGrid is testdata/reference_grid.json: one character for each case of
+// the grid, in the order reference_grid.mts enumerates it.
+type referenceGrid struct {
+	Cases   int    `json:"cases"`
+	Answers string `json:"answers"`
+}
+
+func TestReference_GoldenGrid(t *testing.T) {
+	raw, err := os.ReadFile("testdata/reference_grid.json")
+	require.NoError(t, err)
+	var grid referenceGrid
+	require.NoError(t, json.Unmarshal(raw, &grid))
+	require.Len(t, grid.Answers, grid.Cases)
+
+	// The reference's three effects, which are ours with approve written ask.
+	effects := []policy.Effect{policy.Allow, policy.Ask, policy.Block}
+	amounts := []any{nil, 0.0, 100.0, 101.0, 3000.0}
+	flags := []any{nil, true, false}
+	defaults := map[string]policy.Effect{
+		"read": policy.Allow, "write": policy.Allow, "send": policy.Allow, "pay": policy.Allow,
+		"delete": policy.Ask, "run": policy.Ask,
+	}
+	ruleName := func(code int, kind string, limit int) string {
+		switch code {
+		case 0:
+			return "Default for " + kind + " actions"
+		case 1:
+			return "Payment above the $" + thousands(limit) + " limit"
+		case 2:
+			return "Reaches outside the company"
+		default:
+			return "Touches sensitive data"
+		}
+	}
+
+	n, differ := 0, 0
+	for _, kind := range refKinds {
+		for _, kindEffect := range effects {
+			for _, limit := range []int{0, 100, 2500} {
+				for _, external := range effects {
+					for _, sensitive := range effects {
+						rp := refPolicy{kinds: maps.Clone(defaults), payLimit: limit, external: external, sensitive: sensitive}
+						rp.kinds[kind] = kindEffect
+						p := rp.build()
+						for _, amount := range amounts {
+							for _, flagExternal := range flags {
+								for _, flagSensitive := range flags {
+									attrs := map[string]any{}
+									for name, v := range map[string]any{"amount": amount, "external": flagExternal, "sensitive": flagSensitive} {
+										if v != nil {
+											attrs[name] = v
+										}
+									}
+									answer := strings.IndexByte("0123456789ab", grid.Answers[n])
+									require.GreaterOrEqual(t, answer, 0, "case %d", n)
+									wantEffect, wantRule := effects[answer%3], ruleName(answer/3, kind, limit)
+									n++
+
+									got := p.Decide(policy.Action{Kind: kind, Target: "a", Attrs: attrs})
+									if got.Effect != wantEffect || got.Rule != wantRule || len(got.Uncertain) > 0 {
+										differ++
+										if differ <= 10 {
+											t.Errorf("case %d: kind %s (%s), limit %d, external %s, sensitive %s, attrs %v: Go says %s %q %v, the reference says %s %q",
+												n-1, kind, kindEffect, limit, external, sensitive, attrs, got.Effect, got.Rule, got.Uncertain, wantEffect, wantRule)
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	require.Equal(t, grid.Cases, n, "the grid here has as many cases as the file")
+	assert.Zero(t, differ, "cases where Go and the reference differ, of %d", n)
+}
+
+func TestReference_WhereGoDiffersOnPurpose(t *testing.T) {
+	withLimit := func(n int) policy.Policy {
+		p := refDefaultPolicy
+		p.payLimit = n
+		return p.build()
+	}
+	asks := func(limit int) string { return "Payment above the $" + thousands(limit) + " limit" }
+	tests := []struct {
+		name          string
+		policy        policy.Policy
+		attrs         map[string]any
+		reference     string // what logic.ts answers, for the reader
+		want          policy.Effect
+		wantRule      string
+		wantUncertain []string
+	}{
+		{name: "no amount, limit -5", policy: withLimit(-5), attrs: nil, reference: "approve: " + asks(-5), want: policy.Allow, wantRule: "Default for pay actions"},
+		{name: "no amount, limit 0 agrees", policy: withLimit(0), attrs: nil, reference: "allow: Default for pay actions", want: policy.Allow, wantRule: "Default for pay actions"},
+		{name: "no amount, limit 200 agrees", policy: withLimit(200), attrs: nil, reference: "allow: Default for pay actions", want: policy.Allow, wantRule: "Default for pay actions"},
+		{name: "amount 1250 as a string", policy: withLimit(200), attrs: map[string]any{"amount": "1250"}, reference: "approve: " + asks(200), want: policy.Ask, wantRule: asks(200), wantUncertain: []string{"amount"}},
+		{name: "amount 50 as a string", policy: withLimit(200), attrs: map[string]any{"amount": "50"}, reference: "allow: Default for pay actions", want: policy.Ask, wantRule: asks(200), wantUncertain: []string{"amount"}},
+		{name: "amount abc", policy: withLimit(200), attrs: map[string]any{"amount": "abc"}, reference: "allow: Default for pay actions", want: policy.Ask, wantRule: asks(200), wantUncertain: []string{"amount"}},
+		{name: "amount null", policy: withLimit(200), attrs: map[string]any{"amount": nil}, reference: "allow: Default for pay actions", want: policy.Ask, wantRule: asks(200), wantUncertain: []string{"amount"}},
+		{name: "amount a list of 1250", policy: withLimit(200), attrs: map[string]any{"amount": []any{1250.0}}, reference: "approve: " + asks(200), want: policy.Ask, wantRule: asks(200), wantUncertain: []string{"amount"}},
+		{name: "amount NaN", policy: withLimit(200), attrs: map[string]any{"amount": math.NaN()}, reference: "allow: Default for pay actions", want: policy.Ask, wantRule: asks(200), wantUncertain: []string{"amount"}},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s (reference: %s)", tt.name, tt.reference), func(t *testing.T) {
+			got := tt.policy.Decide(policy.Action{Kind: "pay", Target: "a", Attrs: tt.attrs})
+			assert.Equal(t, tt.want, got.Effect)
+			assert.Equal(t, tt.wantRule, got.Rule)
+			assert.Equal(t, tt.wantUncertain, got.Uncertain)
 		})
 	}
 }
