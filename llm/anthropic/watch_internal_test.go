@@ -95,6 +95,17 @@ func TestIdleWatch_Expiry(t *testing.T) {
 		assert.True(t, w.end())
 	})
 
+	t.Run("a byte starts the wait's own length again, not the watch's", func(t *testing.T) {
+		var expired atomic.Int64
+		w := watchIdle(time.Hour, func() { expired.Add(1) })
+		defer w.close()
+
+		w.begin(limit)
+		w.touch()
+		require.Eventually(t, func() bool { return expired.Load() == 1 }, 5*time.Second, time.Millisecond)
+		assert.True(t, w.end())
+	})
+
 	t.Run("a wait shorter than the one the watch is set for is still kept", func(t *testing.T) {
 		var expired atomic.Int64
 		w := watchIdle(time.Hour, func() { expired.Add(1) })

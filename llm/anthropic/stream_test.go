@@ -807,6 +807,19 @@ func TestClient_Stream_Fallback(t *testing.T) {
 		{Index: 1, ID: "toolu_01A09q90qw90lq917835lq9", Name: "get_weather"},
 	}, announced)
 
+	// Nor are they arguments to deliver: the two code_execution calls in
+	// this stream reach fn as nothing at all.
+	arguments := map[int]string{}
+	for _, d := range deltas {
+		if d.ToolCall != nil {
+			arguments[d.ToolCall.Index] += d.ToolCall.InputJSON
+		}
+	}
+	assert.Equal(t, map[int]string{
+		0: `{"location": "San Francisco, CA"}`,
+		1: `{"unit": "celsius", "location": "San Francisco, CA"}`,
+	}, arguments)
+
 	// The call the declining model made is not one to run: the echo rule
 	// drops it from the turn, so a result for it would answer nothing.
 	require.Len(t, resp.Message.ToolCalls, 1)

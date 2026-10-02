@@ -1015,6 +1015,26 @@ func TestClient_Redirects(t *testing.T) {
 		assert.Zero(t, elsewhere.count())
 	})
 
+	t.Run("a policy that asks for the redirect itself is given it", func(t *testing.T) {
+		// http.ErrUseLastResponse is not a refusal: net/http hands back the
+		// 3xx with its body, and that body is what the error says.
+		api := newFakeAPI(t, func(w http.ResponseWriter, _ received) {
+			w.Header().Set("Location", "https://elsewhere.keel.test/v1/messages")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			_, _ = io.WriteString(w, `{"type":"error","error":{"type":"moved_error","message":"the API has moved"}}`)
+		})
+		hc := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		c := api.client(t, opts(hc))
+
+		_, err := c.Generate(context.Background(), llm.Request{Messages: hello()})
+		var e *llm.Error
+		require.ErrorAs(t, err, &e)
+		assert.Equal(t, http.StatusTemporaryRedirect, e.Status)
+		assert.Equal(t, "moved_error", e.Type)
+		assert.Equal(t, "the API has moved", e.Message)
+	})
+
 	t.Run("the caller's client is left as it was", func(t *testing.T) {
 		hc := &http.Client{}
 		_, err := anthropic.New(anthropic.Options{APIKey: testKey, HTTPClient: hc})
