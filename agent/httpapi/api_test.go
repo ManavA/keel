@@ -1,6 +1,7 @@
 package httpapi_test
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
@@ -784,6 +786,10 @@ func TestMutations_RefuseACrossOriginBrowserRequest(t *testing.T) {
 		{"neither header", nil, nil, true},
 		{"an Origin that differs from the host", []string{"Origin", "https://other.example"}, nil, false},
 		{"an Origin that is the host", []string{"Origin", "http://example.com"}, nil, true},
+		// What a sandboxed frame, a page from a file and some redirects send.
+		{"an Origin that is null", []string{"Origin", "null"}, nil, false},
+		{"an Origin that is null, with an origin trusted", []string{"Origin", "null"}, trusting(front), false},
+		{"cross-site with an Origin that is null", []string{"Sec-Fetch-Site", "cross-site", "Origin", "null"}, nil, false},
 		{"cross-site from an origin that is trusted", []string{"Sec-Fetch-Site", "cross-site", "Origin", front}, trusting(front), true},
 		{"an Origin that is trusted", []string{"Origin", front}, trusting(front), true},
 		{"the same, when none is trusted", []string{"Sec-Fetch-Site", "cross-site", "Origin", front}, nil, false},
@@ -833,6 +839,193 @@ func TestReadRoutes_AreNotGuardedAgainstCrossOrigin(t *testing.T) {
 			rec := do(t, h, http.MethodGet, path, "", headers...)
 			assert.Equal(t, http.StatusOK, rec.Code, "%s with %v", path, headers)
 		}
+	}
+}
+
+// A name of nothing but white space is nobody: a decision recorded under it
+// would be a decision by no one.
+func TestMutations_RefuseAnActorThatNamesNobody(t *testing.T) {
+	names := map[string]string{
+		"empty":                    "",
+		"a space":                  " ",
+		"a tab":                    "\t",
+		"a line feed":              "\n",
+		"a no-break space":         "\u00a0",
+		"an em space":              "\u2003",
+		"a next line":              "\u0085",
+		"several kinds of spacing": " \t\r\n\u00a0\u2003 ",
+	}
+	for _, m := range mutations() {
+		t.Run(m.name, func(t *testing.T) {
+			path := fmt.Sprintf(m.path, m.pending)
+			for name, who := range names {
+				t.Run(name, func(t *testing.T) {
+					f := mutationFake()
+					h := newAPI(t, f, func(o *httpapi.Options) { o.Actor = func(*http.Request) string { return who } })
+					rec := do(t, h, http.MethodPost, path, `{"reason":"x"}`)
+					requireError(t, rec, http.StatusForbidden)
+					assert.Empty(t, f.calls, "a decision by nobody reaches nothing")
+				})
+			}
+			t.Run("the spacing round a name is not part of it", func(t *testing.T) {
+				f := mutationFake()
+				h := newAPI(t, f, func(o *httpapi.Options) { o.Actor = func(*http.Request) string { return " \tsam lee\u00a0\n" } })
+				rec := do(t, h, http.MethodPost, path, "")
+				require.Equal(t, m.status, rec.Code, rec.Body.String())
+				call, ok := m.seen(f)
+				require.True(t, ok)
+				assert.Equal(t, "sam lee", call.By)
+			})
+		})
+	}
+}
+
+// A reason is text a database keeps: it has no NUL and is valid UTF-8, and the
+// body that carries it is already bounded at 4 KiB.
+func TestMutations_RefuseAReasonADatabaseCouldNotKeep(t *testing.T) {
+	for _, m := range mutations() {
+		t.Run(m.name, func(t *testing.T) {
+			path := fmt.Sprintf(m.path, m.pending)
+			for name, body := range map[string]string{
+				"a NUL escaped":                 `{"reason":"before\u0000after"}`,
+				"a NUL at the end":              `{"reason":"x\u0000"}`,
+				"a byte that is not UTF-8":      "{\"reason\":\"caf\xe9\"}",
+				"the start of a sequence":       "{\"reason\":\"\xe2\x82\"}",
+				"an overlong encoding":          "{\"reason\":\"\xc0\xaf\"}",
+				"a surrogate encoded as UTF-8":  "{\"reason\":\"\xed\xa0\x80\"}",
+				"bytes that are not UTF-8 only": "\xff\xfe",
+			} {
+				t.Run(name, func(t *testing.T) {
+					f := mutationFake()
+					rec := do(t, newAPI(t, f), http.MethodPost, path, body, "X-Actor", "sam")
+					requireError(t, rec, http.StatusBadRequest)
+					assert.Empty(t, f.calls)
+				})
+			}
+			t.Run("text in any script is kept as it is", func(t *testing.T) {
+				for _, reason := range []string{"caf\u00e9", "\u65e5\u672c\u8a9e", "emoji \U0001F600", "tab\there", "replacement \ufffd", "line\nbreak"} {
+					f := mutationFake()
+					body, err := json.Marshal(map[string]string{"reason": reason})
+					require.NoError(t, err)
+					rec := do(t, newAPI(t, f), http.MethodPost, path, string(body), "X-Actor", "sam")
+					require.Equal(t, m.status, rec.Code, rec.Body.String())
+					call, ok := m.seen(f)
+					require.True(t, ok)
+					assert.Equal(t, reason, call.Reason)
+				}
+			})
+		})
+	}
+}
+
+// A client that has gone, or a request whose time ran out, is not a fault of
+// the store whatever the store was doing when it found out.
+func TestFailures_WhenTheRequestIsOver(t *testing.T) {
+	type route struct {
+		name, method, path, body, call string
+		stream                         bool
+	}
+	routes := []route{
+		{"run", http.MethodGet, "/runs/" + uid(1), "", "GetRun", false},
+		{"timeline", http.MethodGet, "/runs/" + uid(1) + "/timeline", "", "Changes", false},
+		{"list of runs", http.MethodGet, "/runs", "", "ListRuns", false},
+		{"list of approvals", http.MethodGet, "/approvals", "", "ListApprovals", false},
+		{"cancel", http.MethodPost, "/runs/" + uid(1) + "/cancel", "", "Cancel", false},
+		{"approve", http.MethodPost, "/approvals/" + uid(50) + "/approve", "", "Approve", false},
+		{"decline", http.MethodPost, "/approvals/" + uid(50) + "/decline", "", "Decline", false},
+		{"the first read of a stream", http.MethodGet, "/runs/" + uid(1) + "/events", "", "Changes", true},
+		{"head of a stream", http.MethodHead, "/runs/" + uid(1) + "/events", "", "GetRun", true},
+	}
+	gone := func() context.Context {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
+	}
+	timedOut := func() context.Context {
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		t.Cleanup(cancel)
+		return ctx
+	}
+	for _, r := range routes {
+		t.Run(r.name, func(t *testing.T) {
+			serve := func(t *testing.T, ctx context.Context, err error) (*httptest.ResponseRecorder, *logSink) {
+				var sink logSink
+				f := mutationFake().fail(r.call, err)
+				h := newAPI(t, f, func(o *httpapi.Options) { o.Logger = sink.logger() })
+				return doCtx(t, ctx, h, r.method, r.path, r.body, "X-Actor", "sam"), &sink
+			}
+
+			t.Run("a client that went away is told nothing and raises no alarm", func(t *testing.T) {
+				for name, err := range map[string]error{
+					"a cancelled call":        fmt.Errorf("store: %w", context.Canceled),
+					"any error at all":        errStoreDown,
+					"a deadline of its own":   fmt.Errorf("store: %w", context.DeadlineExceeded),
+					"the store's own failure": errors.New("connection reset"),
+					"an answer that stands":   agent.ErrNotFound,
+				} {
+					rec, sink := serve(t, gone(), err)
+					assert.Zero(t, rec.Body.Len(), name)
+					assert.Equal(t, http.StatusOK, rec.Code, "%s: no status was written", name)
+					assert.Empty(t, rec.Header().Get("Content-Type"), name)
+					assert.Empty(t, sink.atLeast(slog.LevelInfo), name)
+					logged := sink.all()
+					require.Len(t, logged, 1, name)
+					assert.Equal(t, slog.LevelDebug, logged[0].Level, name)
+					assert.Contains(t, logged[0].Attrs["error"], err.Error(), name)
+				}
+			})
+
+			t.Run("a request whose time ran out, with the client still there, is 503", func(t *testing.T) {
+				rec, _ := serve(t, timedOut(), fmt.Errorf("store: %w", context.DeadlineExceeded))
+				requireError(t, rec, http.StatusServiceUnavailable)
+			})
+
+			t.Run("a store that gives up on its own, with the request live, is a fault", func(t *testing.T) {
+				for _, err := range []error{
+					fmt.Errorf("store: %w", context.Canceled),
+					fmt.Errorf("store: %w", context.DeadlineExceeded),
+				} {
+					rec, sink := serve(t, context.Background(), err)
+					requireError(t, rec, http.StatusInternalServerError)
+					assert.NotEmpty(t, sink.atLeast(slog.LevelError))
+				}
+			})
+		})
+	}
+
+	t.Run("an answer the store gave stands while the client is still there", func(t *testing.T) {
+		f := newFake().fail("GetRun", agent.ErrNotFound)
+		rec := doCtx(t, timedOut(), newAPI(t, f), http.MethodGet, "/runs/"+uid(1), "")
+		requireError(t, rec, http.StatusNotFound)
+	})
+}
+
+// A journal is private to whoever is allowed to see it: nothing is kept.
+func TestJSONRoutes_AreNotCached(t *testing.T) {
+	f := mutationFake()
+	f.edit(func(f *fakeRuns) { f.steps[uid(1)] = []agent.Step{mkStep(uid(1), 1, 2)} })
+	h := newAPI(t, f)
+	for _, tt := range []struct {
+		name, method, path string
+	}{
+		{"list of runs", http.MethodGet, "/runs"},
+		{"run", http.MethodGet, "/runs/" + uid(1)},
+		{"timeline", http.MethodGet, "/runs/" + uid(1) + "/timeline"},
+		{"list of approvals", http.MethodGet, "/approvals"},
+		{"approve", http.MethodPost, "/approvals/" + uid(50) + "/approve"},
+		{"cancel", http.MethodPost, "/runs/" + uid(1) + "/cancel"},
+		{"not found", http.MethodGet, "/runs/" + uid(9)},
+		{"bad request", http.MethodGet, "/runs?limit=0"},
+		{"refused", http.MethodPost, "/runs/" + uid(1) + "/cancel"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := []string{"X-Actor", "sam"}
+			if tt.name == "refused" {
+				headers = []string{"Sec-Fetch-Site", "cross-site"}
+			}
+			rec := do(t, h, tt.method, tt.path, "", headers...)
+			assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+		})
 	}
 }
 

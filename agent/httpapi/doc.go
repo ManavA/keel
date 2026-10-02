@@ -10,11 +10,19 @@
 //
 // # What it serves, and to whom
 //
-// A run's journal holds whatever its tools handled, so [API.Routes] belongs
-// behind whatever guards operator traffic. The three routes that change
-// something (cancel, approve, decline) also need [Options.Actor] to name the
-// caller, for the record of who decided, and answer 403 without one: the zero
-// [Options] serves a read-only surface. A step's provider-private form,
+// This package does not authenticate, and it does not decide who may decide
+// which approval. Anyone for whom [Options.Actor] returns a name can approve,
+// decline or cancel anything the API can see: Actor is a name for the record
+// of who decided, not an authorisation, and authorising is the mount's. A
+// run's journal holds whatever its tools handled, so [API.Routes] belongs
+// behind whatever says who may read it and who may decide.
+//
+// The three routes that change something (cancel, approve, decline) need Actor
+// to name the caller and answer 403 without a name, or with one that is
+// nothing but white space: the zero [Options] serves a read-only surface. A
+// reason that is not valid UTF-8 or has a NUL in it is refused with 400, since
+// a database could not keep it. Everything but the stream is sent with
+// Cache-Control: no-store. A step's provider-private form,
 // Message.Opaque, which can hold the model's own reasoning, is removed from
 // every step before it is served, on the timeline and on the stream.
 //
@@ -35,7 +43,9 @@
 // An id in a path or a filter is given to the engine as written. Whether it
 // has the form of an id is the store's to say, and one that does not names
 // nothing: 404, not 400. A failure answers with httpx's generic body and the
-// cause goes to the log. A listing's limit and status, a cursor, and a body
+// cause goes to the log; but a request whose client has gone is logged at debug
+// level and given no status, and one whose time ran out with the client still
+// there is 503. A listing's limit and status, a cursor, and a body
 // that is over 4 KiB or says more than a reason are refused with 400 rather
 // than clamped or ignored. A cursor is the client's input, and is read
 // strictly: one that does not decode, or whose time does not parse, or whose
@@ -50,9 +60,13 @@
 // run and cannot skip a change. It sends one step or approval event for each
 // that changed, then one run event whose id is the run's revision, and when
 // the run has ended an end event, after which the response is over. A client
-// that reconnects with that id in Last-Event-ID is sent what came after it.
-// What the stream carries is state and not history: a step that started and
-// completed between two reads appears once, completed.
+// that reconnects with that id in Last-Event-ID is sent what came after it. A
+// client closes its event source on end: a reconnect to a finished run is sent
+// end again, so one that goes on reconnecting would loop at the browser's retry
+// interval. A read that finds nothing new sends nothing, and an idle stream
+// sends a comment every Heartbeat. What the stream carries is state and not
+// history: a step that started and completed between two reads appears once,
+// completed.
 //
 // A Last-Event-ID that is not a revision of this run (not a number, negative,
 // or beyond the run's own) is taken as no position, and the whole state is

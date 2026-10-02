@@ -3524,14 +3524,23 @@ var _ Runs = (*agent.Engine)(nil)
 
 Responses go through `httpx.JSON`, and failures through `httpx.NotFound`,
 `httpx.BadRequest` and `httpx.Error`, so error bodies are the generic ones
-and the reason is in the log. `Message.Opaque` is removed from every step
-before it is served: it is the provider's private data, large, and of no
-use to a reader.
+and the reason is in the log. A request whose client has gone is logged at
+debug level and is given no status, and one whose time ran out with the
+client still there is 503. Everything but the stream is sent with
+`Cache-Control: no-store`: it is journal content. `Message.Opaque` is removed
+from every step before it is served: it is the provider's private data,
+large, and of no use to a reader.
 
 The three routes that change something need `Options.Actor` to return a
-name, and answer 403 without one. The zero `Options` therefore serves a
-read-only surface. A request body is read through `http.MaxBytesReader` at
-4 KiB and decoded with unknown fields disallowed.
+name, and answer 403 without one; a name is what is left after the white
+space round it, so one of nothing but white space is no name. The zero
+`Options` therefore serves a read-only surface. `Actor` is a name for the
+record and not an authorisation: the package does not authenticate and does
+not decide who may decide which approval, so anyone `Actor` names can
+approve, decline or cancel anything the API can see, and authorisation is
+the mount's. A request body is read through `http.MaxBytesReader` at 4 KiB
+and decoded with unknown fields disallowed; a reason that is not valid UTF-8
+or has a NUL in it is 400, since a database could not keep it.
 
 Those three routes are also behind `http.CrossOriginProtection`
 (`Options.CrossOrigin`), checked before `Actor` is asked. A request that
@@ -3554,15 +3563,39 @@ may start one, belong to the service; the example has its own.
 The stream. `GET /runs/{id}/events` answers 404 for an unknown run before
 any stream starts. Then, through `httpx.NewEventStream`:
 
-1. `since` is `Last-Event-ID` as an integer, or 0.
-2. Read `Changes(id, since)`. Send one `step` event per step and one
-   `approval` event per approval, in `Rev` order, with no id. Then send one
-   `run` event whose id is `Run.Rev`, and set `since` to it. Sending the id
-   last means a client that reconnects mid-batch is sent the whole batch
-   again, which is harmless: each event is the current state of one thing.
-3. If the run has ended, send an `end` event and return.
+1. `since` is `Last-Event-ID` as a non-negative integer, or 0. A value that
+   is not a number, is negative, or overflows is 0, and a value ahead of
+   the run's own `Rev` is read again from 0: the stream carries state, so
+   sending it all again is always safe, where refusing the header would
+   strand an `EventSource`, which cannot change what it sends, and waiting
+   for a run to reach a revision it never had would skip every change in
+   between.
+2. Read `Changes(id, since)`. This first read is the lookup, made before
+   the stream opens, so that an unknown run is a 404 and a failing store a
+   500. Send one `step` event per step and one `approval` event per
+   approval, in `Rev` order (a step before an approval of the same
+   revision), with no id. Then send one `run` event whose id is `Run.Rev`,
+   and set `since` to it. Sending the id last means a client that
+   reconnects mid-batch is sent the whole batch again, which is harmless:
+   each event is the current state of one thing. When the read holds
+   nothing and `Run.Rev` has not passed `since`, nothing is sent, not even
+   the `run` event.
+3. If the run has ended, send an `end` event, whose data is `{}` and which
+   has no id, and return. A client closes its event source on `end`: a
+   reconnect to a finished run is sent `end` again, so one that did not
+   would loop at the browser's retry interval.
 4. Wait `PollInterval`, sending a comment line every `Heartbeat` while
-   nothing changes, and go to 2. Return when the request's context ends.
+   nothing is sent (any send restarts the wait), and go to 2. Return when
+   the request's context ends, when a send fails (the client has gone and
+   the stream is unusable), or when a read fails: the stream then ends with
+   no `end` event, which is how a client knows to reconnect from the id it
+   has, and the cause is logged.
+
+A `HEAD` request on the route is answered with the headers a stream has
+and no stream, after the same lookup, and the package keeps the two in step
+with a test; a stream started for a `HEAD` would only wait for the client to
+leave. A writer that cannot flush is answered with an ordinary 500, before
+anything is written.
 
 The stream carries state, not history: a step that started and completed
 between two polls appears once, completed. The journal is the history.

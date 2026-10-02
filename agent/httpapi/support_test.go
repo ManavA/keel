@@ -398,11 +398,17 @@ func quick(o *httpapi.Options) {
 // do sends one request to h without a server.
 func do(t *testing.T, h http.Handler, method, target, body string, headers ...string) *httptest.ResponseRecorder {
 	t.Helper()
+	return doCtx(t, context.Background(), h, method, target, body, headers...)
+}
+
+// doCtx is do with the request made under ctx.
+func doCtx(t *testing.T, ctx context.Context, h http.Handler, method, target, body string, headers ...string) *httptest.ResponseRecorder {
+	t.Helper()
 	var rd io.Reader
 	if body != "" {
 		rd = strings.NewReader(body)
 	}
-	req := httptest.NewRequest(method, target, rd)
+	req := httptest.NewRequestWithContext(ctx, method, target, rd)
 	require.Zero(t, len(headers)%2, "headers come in pairs")
 	for i := 0; i < len(headers); i += 2 {
 		req.Header.Set(headers[i], headers[i+1])

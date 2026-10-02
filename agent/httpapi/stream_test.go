@@ -669,6 +669,79 @@ func TestStream_AClientGoneAtTheOpeningEndsTheHandlerQuietly(t *testing.T) {
 	assert.Len(t, f.changesCalls(), 1, "the journal is not read for a client that is gone")
 }
 
+// An event that cannot be encoded, a step whose stored arguments are not JSON,
+// fails the stream for a reason no client can mend: it reconnects to the same
+// step and fails again. Nothing but the log shows it, so it is logged as a
+// fault, which a client that leaves is not.
+func TestStream_AnEventThatCannotBeEncodedIsAFaultAndIsLogged(t *testing.T) {
+	notJSON := json.RawMessage("this is not JSON")
+	for _, tt := range []struct {
+		name  string
+		build func(f *fakeRuns)
+	}{
+		{"a step", func(f *fakeRuns) {
+			st := mkStep(uid(1), 1, 2)
+			st.Call = &agent.Call{ID: "c1", Name: "send", Input: notJSON}
+			f.steps[uid(1)] = []agent.Step{st}
+		}},
+		{"an approval", func(f *fakeRuns) {
+			a := mkApproval(uid(51), uid(1), 1, 2)
+			a.Input = notJSON
+			f.approvals = []agent.Approval{a}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var sink logSink
+			f := newFake().addRun(mkRun(uid(1), withStatus(agent.StatusWaiting), withRev(2)))
+			f.edit(tt.build)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, stream1, nil) // a context that never ends
+			h := newAPI(t, f, quick, func(o *httpapi.Options) { o.Logger = sink.logger() })
+
+			runHandler(t, h, rec, req) // the handler returns, or the test fails
+
+			assert.Empty(t, realEvents(eventsOf(rec.Body.String())), "nothing was sent, and no end")
+			logged := sink.atLeast(slog.LevelError)
+			require.Len(t, logged, 1)
+			assert.Equal(t, uid(1), logged[0].Attrs["run_id"])
+			assert.Contains(t, logged[0].Attrs["error"], "encode")
+			assert.Len(t, f.changesCalls(), 1, "the journal is not read again for a stream that has ended")
+		})
+	}
+}
+
+// A client that is gone while a send is under way is the stream's own failure,
+// and is not logged as one.
+func TestStream_ABrokenConnectionIsNotLoggedAsAFault(t *testing.T) {
+	var sink logSink
+	f := newFake().addRun(mkRun(uid(1), withStatus(agent.StatusWaiting), withRev(2)))
+	f.edit(func(f *fakeRuns) { f.steps[uid(1)] = []agent.Step{mkStep(uid(1), 1, 2)} })
+	w := &failingWriter{ResponseRecorder: httptest.NewRecorder(), failAfter: 0}
+	req := httptest.NewRequest(http.MethodGet, stream1, nil)
+	runHandler(t, newAPI(t, f, quick, func(o *httpapi.Options) { o.Logger = sink.logger() }), w, req)
+	assert.Empty(t, sink.atLeast(slog.LevelWarn))
+}
+
+// A HEAD says what a GET would, and what a GET of a stream says is httpx's to
+// decide: the two are compared, so that a header added there is not forgotten
+// here.
+func TestStream_AHeadRequestSendsTheHeadersAStreamDoes(t *testing.T) {
+	opened := httptest.NewRecorder()
+	_, err := httpx.NewEventStream(opened, httptest.NewRequest(http.MethodGet, "/", nil), httpx.EventStreamOptions{})
+	require.NoError(t, err)
+	want := opened.Header().Clone()
+	require.NotEmpty(t, want)
+
+	f := endedRun(agent.StatusCompleted)
+	h := newAPI(t, f, quick)
+	head := do(t, h, http.MethodHead, stream1, "")
+	require.Equal(t, http.StatusOK, head.Code)
+	assert.Equal(t, want, head.Header(), "a HEAD carries the headers httpx.NewEventStream sets, and no others")
+
+	get := do(t, h, http.MethodGet, stream1, "")
+	assert.Equal(t, want, get.Header(), "and so does the stream itself")
+}
+
 // A HEAD asks what a GET would answer and wants no body. A stream has no end,
 // so one started for it would only wait for the client to leave.
 func TestStream_AHeadRequestDoesNotStartAStream(t *testing.T) {

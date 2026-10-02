@@ -3,6 +3,7 @@ package httpapi
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -113,7 +114,17 @@ func (a *API) changesSince(ctx context.Context, id string, since int64) (agent.C
 // revision it has).
 func (a *API) follow(ctx context.Context, s *httpx.EventStream, id string, changes agent.Changes, since int64) {
 	log := a.logger(ctx)
-	sendFailed := func(err error) {
+	// ended says why a stream was cut off by a send. A connection that broke is
+	// the client leaving. An event that cannot be encoded is a fault of the data
+	// that no client can mend: it will reconnect to the same step and meet it
+	// again, so that is not left for a debug log.
+	ended := func(err error) {
+		var bad *encodeError
+		if errors.As(err, &bad) && ctx.Err() == nil {
+			log.LogAttrs(ctx, slog.LevelError, "event stream: an event cannot be encoded",
+				slog.String("run_id", id), slog.Any("error", err))
+			return
+		}
 		log.LogAttrs(ctx, slog.LevelDebug, "event stream: send failed",
 			slog.String("run_id", id), slog.Any("error", err))
 	}
@@ -126,7 +137,7 @@ func (a *API) follow(ctx context.Context, s *httpx.EventStream, id string, chang
 	for {
 		next, sent, err := deliver(s, changes, since)
 		if err != nil {
-			sendFailed(err)
+			ended(err)
 			return
 		}
 		since = next
@@ -135,7 +146,7 @@ func (a *API) follow(ctx context.Context, s *httpx.EventStream, id string, chang
 		}
 		if changes.Run.Terminal() {
 			if err := s.Send(httpx.ServerEvent{Type: eventEnd, Data: []byte("{}")}); err != nil {
-				sendFailed(err)
+				ended(err)
 			}
 			return
 		}
@@ -147,7 +158,7 @@ func (a *API) follow(ctx context.Context, s *httpx.EventStream, id string, chang
 				return
 			case <-beat.C:
 				if err := s.Comment("heartbeat"); err != nil {
-					sendFailed(err)
+					ended(err)
 					return
 				}
 				beat.Reset(a.heartbeat)
@@ -166,6 +177,24 @@ func (a *API) follow(ctx context.Context, s *httpx.EventStream, id string, chang
 			return
 		}
 	}
+}
+
+// encodeError is an event that could not be encoded, as against one that could
+// not be sent.
+type encodeError struct{ err error }
+
+func (e *encodeError) Error() string { return "encode event: " + e.err.Error() }
+func (e *encodeError) Unwrap() error { return e.err }
+
+// sendJSON sends v as the data of one event. It is EventStream.SendJSON with
+// the encoding done here, so that a failure to encode can be told from one to
+// write.
+func sendJSON(s *httpx.EventStream, id, typ string, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return &encodeError{err}
+	}
+	return s.Send(httpx.ServerEvent{ID: id, Type: typ, Data: data})
 }
 
 // change is one thing an event reports.
@@ -200,12 +229,12 @@ func deliver(s *httpx.EventStream, changes agent.Changes, since int64) (rev int6
 	// they were asked, and neither is the order they changed in.
 	slices.SortStableFunc(batch, func(a, b change) int { return cmp.Compare(a.rev, b.rev) })
 	for _, c := range batch {
-		if err := s.SendJSON("", c.event, c.value); err != nil {
+		if err := sendJSON(s, "", c.event, c.value); err != nil {
 			return since, false, err
 		}
 	}
 	rev = changes.Run.Rev
-	if err := s.SendJSON(strconv.FormatInt(rev, 10), eventRun, changes.Run); err != nil {
+	if err := sendJSON(s, strconv.FormatInt(rev, 10), eventRun, changes.Run); err != nil {
 		return since, false, err
 	}
 	return rev, true, nil

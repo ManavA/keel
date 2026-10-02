@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -12,7 +13,9 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -57,8 +60,10 @@ type Runs interface {
 type Options struct {
 	Runs Runs
 	// Actor names who is making a request, for the record of an approval or
-	// a cancellation. Nil, or an empty name, refuses those requests with
-	// 403, so the zero value serves a read-only API.
+	// a cancellation. Nil, or a name with nothing in it but white space,
+	// refuses those requests with 403, so the zero value serves a read-only
+	// API. It is a name for the record and not a check: whoever it names may
+	// decide anything the API can see.
 	Actor func(r *http.Request) string
 	// PollInterval is how often an event stream reads the journal. Default
 	// 500 milliseconds; zero or less means the default.
@@ -141,7 +146,7 @@ func New(opts Options) (*API, error) {
 // and anything else the engine says is 500.
 func (a *API) Routes() chi.Router {
 	r := chi.NewRouter()
-	r.Use(a.withLogger)
+	r.Use(a.prepare)
 
 	r.Get("/runs", a.listRuns)
 	r.Get("/runs/{id}", a.getRun)
@@ -182,26 +187,38 @@ func (a *API) logger(ctx context.Context) *slog.Logger {
 	return a.log
 }
 
-// withLogger puts the logger on the request, so that the failures httpx's
-// helpers log are logged through it.
-func (a *API) withLogger(next http.Handler) http.Handler {
+// prepare is what every request starts with. It puts the logger on the request,
+// so that the failures httpx's helpers log are logged through it, and says that
+// nothing served here is to be kept: the journal is private to whoever may read
+// it. The event stream sets its own Cache-Control over this one.
+func (a *API) prepare(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		ctx := r.Context()
 		next.ServeHTTP(w, r.WithContext(httpx.WithLogger(ctx, a.logger(ctx))))
 	})
 }
 
-// fail answers a failure of the engine. A name the engine does not know is
-// 404, whatever its form: the engine judges it. What has been settled already
-// is 409. Anything else is the service's fault and says nothing of itself; the
-// cause is in the log.
+// fail answers a failure of the engine. A client that has gone is told nothing
+// and nothing is raised: whatever the engine was doing when it found out, the
+// fault is not the service's. Otherwise a name the engine does not know is 404,
+// whatever its form: the engine judges it. What has been settled already is
+// 409. A request whose time ran out with the client still there is 503, and
+// anything else is the service's fault and says nothing of itself. The cause is
+// in the log.
 func fail(w http.ResponseWriter, r *http.Request, what string, err error) {
 	err = fmt.Errorf("agent/httpapi: %s: %w", what, err)
+	ctx := r.Context()
 	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		httpx.Logger(ctx).LogAttrs(ctx, slog.LevelDebug, "request abandoned",
+			slog.String("method", r.Method), slog.String("path", r.URL.Path), slog.Any("error", err))
 	case errors.Is(err, agent.ErrNotFound):
 		httpx.NotFound(w, r)
 	case errors.Is(err, agent.ErrAlreadyDecided), errors.Is(err, agent.ErrFinished):
 		httpx.Error(w, r, http.StatusConflict, err)
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		httpx.Error(w, r, http.StatusServiceUnavailable, err)
 	default:
 		httpx.InternalError(w, r, err)
 	}
@@ -466,11 +483,14 @@ func (a *API) decide(call func(ctx context.Context, approvalID, by, reason strin
 
 // actorAndReason is what the three routes that change something start with. It
 // names the actor and reads the reason, and answers the request itself,
-// returning false, when there is no actor or the body is not acceptable. The
-// actor comes first: a caller who may not change anything is not read a body.
+// returning false, when no one is named or the body is not acceptable. A name
+// is what is left after the white space round it, and nothing left is no one:
+// a decision recorded under no name is a decision by nobody. The actor is asked
+// first: a request with no one to record is not read a body. Whether the actor
+// may do this is not asked here at all, and is the mount's to decide.
 func (a *API) actorAndReason(w http.ResponseWriter, r *http.Request) (by, reason string, ok bool) {
 	if a.actor != nil {
-		by = a.actor(r)
+		by = strings.TrimSpace(a.actor(r))
 	}
 	if by == "" {
 		httpx.Error(w, r, http.StatusForbidden, errors.New("agent/httpapi: the request names no actor"))
@@ -486,12 +506,22 @@ func (a *API) actorAndReason(w http.ResponseWriter, r *http.Request) (by, reason
 
 // readReason reads the one thing a body may say. No body, an empty one and an
 // empty object all say nothing; anything else that is not an object with only
-// a reason in it, or that is over 4 KiB, is an error.
+// a reason in it, or that is over 4 KiB, is an error. So is a reason a database
+// could not keep: the body is checked as bytes, since decoding would turn bytes
+// that are not UTF-8 into U+FFFD without a word, and a NUL is refused after.
+// The reason is no longer than the body, which is what bounds its length.
 func readReason(w http.ResponseWriter, r *http.Request) (string, error) {
 	if r.Body == nil || r.Body == http.NoBody {
 		return "", nil
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+	if err != nil {
+		return "", fmt.Errorf("read body: %w", err)
+	}
+	if !utf8.Valid(body) {
+		return "", errors.New("read body: not valid UTF-8")
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	var in struct {
 		Reason string `json:"reason"`
@@ -502,13 +532,15 @@ func readReason(w http.ResponseWriter, r *http.Request) (string, error) {
 		}
 		return "", fmt.Errorf("read body: %w", err)
 	}
-	// Nothing may follow the object, and reading to the end is also what
-	// finds a body that is only too long.
+	// Nothing may follow the object.
 	switch _, err := dec.Token(); {
 	case err == nil:
 		return "", errors.New("read body: more than one JSON value")
 	case !errors.Is(err, io.EOF):
 		return "", fmt.Errorf("read body: %w", err)
+	}
+	if strings.ContainsRune(in.Reason, 0) {
+		return "", errors.New("read body: the reason has a NUL character")
 	}
 	return in.Reason, nil
 }
