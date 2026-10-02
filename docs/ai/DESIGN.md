@@ -3021,11 +3021,24 @@ every rebuild:
 | Interrupted and not run again | `interrupted before its result was recorded; not run again` | true |
 | Malformed arguments | `arguments were not valid JSON` | true |
 | Tool missing from this build | `tool is not available` | true |
-| Tool returned an error | The error's text | true |
-| Tool panicked | `tool panicked` (the stack goes to the log) | true |
+| Tool returned an error | The error's text, made fit for the journal: bytes that are not UTF-8 replaced by U+FFFD, then NUL bytes removed | true |
+| Tool panicked | `tool panicked` (the value and the stack go to the log) | true |
 | Tool ran past its timeout | `timed out after <duration>` | true |
 | Result over 1 MiB | `result too large: <n> bytes` | true |
+| Result not valid UTF-8 | `result is not valid UTF-8` | true |
+| Result with a NUL byte | `result contains a NUL byte` | true |
 | Child run failed or was cancelled | `<agent> <status>: <reason>` | true |
+
+A result is stored as text, and Postgres refuses, in a text column, a NUL
+byte and bytes that are not UTF-8. A write refused for its content would be
+refused on every attempt, and the run could never move past the step. So
+`invoke` hands the journal only text it can hold. A tool's result with such
+bytes is refused with one of the two fixed texts above, as one that is too
+large is, and the model is told: a result with bytes changed would no longer
+be the tool's answer. An error's text is repaired instead, since it only has
+to say what went wrong. The 1 MiB bound is on bytes, and for an error's text
+is applied after the repair. A result that fails more than one check is
+reported by the first of: too large, not valid UTF-8, a NUL byte.
 
 ### 6.5 Execution
 
@@ -3163,12 +3176,21 @@ type keepOptions struct {
 // returns is ctx, cancelled with cause ErrLeaseLost when a heartbeat finds
 // the lease gone or no heartbeat has succeeded for a whole TTL, and with
 // cause errCancelRequested when a heartbeat reports the request.
+//
+// stop returns once the goroutine that makes the heartbeats has exited, and
+// releases the held context: one still live ends with context.Canceled as
+// its cause. Whatever is written after stop is written under ctx.
 func keep(ctx context.Context, lease Lease, opts keepOptions) (held context.Context, stop func())
 
 // invoke.go
 
 // outcome is what one execution of a tool produced. retry is set, and the
 // rest empty, when the tool's error wraps ErrTransient.
+//
+// retry is also set, and the rest empty, when the context invoke was given
+// ended before a result was taken: it is then that context's cause. Either
+// way there is nothing to record, and the caller reads its own context to
+// tell the two apart.
 type outcome struct {
 	result  string
 	isError bool
@@ -3176,9 +3198,14 @@ type outcome struct {
 }
 
 // invoke runs tool.Run once: under timeout, with a panic recovered and
-// logged, an error turned into an error result, and a result over 1 MiB
-// refused. The fixed result texts are those in 6.4.
-func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration) outcome
+// logged to logger, an error turned into an error result, and a result the
+// journal cannot hold refused: one over 1 MiB, one that is not valid UTF-8,
+// one with a NUL byte. The fixed result texts are those in 6.4.
+//
+// timeout is the whole bound: invoke does not read Tool.Timeout, and a
+// timeout of zero or less does not run the tool. A nil logger is
+// slog.Default.
+func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration, logger *slog.Logger) outcome
 
 // actionFor is the Action the Guard is asked about: the tool's own, or the
 // default for its kind, with AttrAgent, AttrTool, AttrRun and AttrSeq set

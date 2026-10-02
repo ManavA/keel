@@ -51,8 +51,7 @@ func invokeTool(run ToolFunc) Tool {
 	return Tool{Name: "lookup", Run: run}
 }
 
-// invokeLog collects what invoke logs. invoke is given no logger, so it logs
-// to the default one, which newInvokeLog replaces for the length of a test.
+// invokeLog collects what invoke logs to the logger it is given.
 type invokeLog struct {
 	mu      sync.Mutex
 	entries []invokeEntry
@@ -81,25 +80,26 @@ func (l *invokeLog) Handle(_ context.Context, r slog.Record) error {
 func (l *invokeLog) WithAttrs([]slog.Attr) slog.Handler { return l }
 func (l *invokeLog) WithGroup(string) slog.Handler      { return l }
 
+func (l *invokeLog) logger() *slog.Logger { return slog.New(l) }
+
 func (l *invokeLog) all() []invokeEntry {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return append([]invokeEntry(nil), l.entries...)
 }
 
-func newInvokeLog(t *testing.T) *invokeLog {
+// invokeDefaultLog makes logs the default logger until the test ends.
+func invokeDefaultLog(t *testing.T, logs *invokeLog) {
 	t.Helper()
-	logs := &invokeLog{}
 	// Setting the default logger also points the log package at it, and
 	// setting it back does not undo that.
 	previous, writer, flags := slog.Default(), log.Writer(), log.Flags()
-	slog.SetDefault(slog.New(logs))
+	slog.SetDefault(logs.logger())
 	t.Cleanup(func() {
 		slog.SetDefault(previous)
 		log.SetOutput(writer)
 		log.SetFlags(flags)
 	})
-	return logs
 }
 
 // invokeFlaky is an error of a type of its own that wraps ErrTransient.
@@ -157,9 +157,9 @@ func TestInvoke_ReturnsWhatTheToolReturned(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			logs := newInvokeLog(t)
+			logs := &invokeLog{}
 
-			got := invoke(context.Background(), invokeTool(tc.run), invokeCall(), invokeAmple)
+			got := invoke(context.Background(), invokeTool(tc.run), invokeCall(), invokeAmple, logs.logger())
 
 			assert.Equal(t, tc.want, got)
 			assert.Empty(t, logs.all(), "only a panic is logged")
@@ -188,7 +188,7 @@ func TestInvoke_ATransientErrorAsksForAnotherTry(t *testing.T) {
 				return "half an answer", tc.err
 			})
 
-			got := invoke(context.Background(), tool, invokeCall(), invokeAmple)
+			got := invoke(context.Background(), tool, invokeCall(), invokeAmple, nil)
 
 			// The error comes back as the tool gave it, and nothing else:
 			// there is no result to record.
@@ -220,13 +220,13 @@ func TestInvoke_APanicIsRecoveredAndLogged(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			logs := newInvokeLog(t)
+			logs := &invokeLog{}
 			tool := invokeTool(func(_ context.Context, in Invocation) (string, error) {
 				tc.panic(in)
 				return "not reached", nil
 			})
 
-			got := invoke(context.Background(), tool, invokeCall(), invokeAmple)
+			got := invoke(context.Background(), tool, invokeCall(), invokeAmple, logs.logger())
 
 			assert.Equal(t, outcome{result: "tool panicked", isError: true}, got)
 
@@ -282,9 +282,9 @@ func TestInvoke_APanicOutsideTheToolsOwnBodyIsStillTheTools(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			logs := newInvokeLog(t)
+			logs := &invokeLog{}
 
-			got := invoke(context.Background(), tc.tool, invokeCall(), invokeAmple)
+			got := invoke(context.Background(), tc.tool, invokeCall(), invokeAmple, logs.logger())
 
 			assert.Equal(t, outcome{result: "tool panicked", isError: true}, got)
 			assert.Len(t, logs.all(), 1)
@@ -299,13 +299,13 @@ func (invokeUnwrapPanics) Error() string { return "unwrap panics" }
 func (invokeUnwrapPanics) Unwrap() error { panic("unwrap panics") }
 
 func TestInvoke_AToolThatExitsItsGoroutineIsTreatedAsAPanic(t *testing.T) {
-	logs := newInvokeLog(t)
+	logs := &invokeLog{}
 	tool := invokeTool(func(context.Context, Invocation) (string, error) {
 		runtime.Goexit()
 		return "not reached", nil
 	})
 
-	got := invoke(context.Background(), tool, invokeCall(), invokeAmple)
+	got := invoke(context.Background(), tool, invokeCall(), invokeAmple, logs.logger())
 
 	assert.Equal(t, outcome{result: "tool panicked", isError: true}, got)
 	logged := logs.all()
@@ -393,7 +393,7 @@ func TestInvoke_AToolPastItsTimeoutIsTimedOut(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			logs := newInvokeLog(t)
+			logs := &invokeLog{}
 			synctest.Test(t, func(t *testing.T) {
 				release := make(chan struct{})
 				defer close(release)
@@ -402,7 +402,7 @@ func TestInvoke_AToolPastItsTimeoutIsTimedOut(t *testing.T) {
 				tool := Tool{Name: "lookup", Timeout: time.Nanosecond, Run: tc.run(release)}
 				start := time.Now()
 
-				got := invoke(context.Background(), tool, invokeCall(), tc.timeout)
+				got := invoke(context.Background(), tool, invokeCall(), tc.timeout, logs.logger())
 
 				assert.Equal(t, outcome{result: tc.want, isError: true}, got)
 				assert.Equal(t, tc.timeout, time.Since(start), "invoke returns when the time is up, and not before")
@@ -419,7 +419,7 @@ func TestInvoke_AToolThatFinishesJustInsideItsTimeoutIsNotTimedOut(t *testing.T)
 			return "just in time", nil
 		})
 
-		got := invoke(context.Background(), tool, invokeCall(), 2*time.Minute)
+		got := invoke(context.Background(), tool, invokeCall(), 2*time.Minute, nil)
 
 		assert.Equal(t, outcome{result: "just in time"}, got)
 	})
@@ -444,7 +444,7 @@ func TestInvoke_ATimeoutOfZeroOrLessDoesNotRunTheTool(t *testing.T) {
 					return "ran", nil
 				}}
 
-				got := invoke(context.Background(), tool, invokeCall(), tc.timeout)
+				got := invoke(context.Background(), tool, invokeCall(), tc.timeout, nil)
 
 				assert.Equal(t, outcome{result: tc.want, isError: true}, got)
 				// Nothing is left running that could still call the tool.
@@ -469,7 +469,7 @@ func TestInvoke_AToolLeftBehindEndsCleanly(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			logs := newInvokeLog(t)
+			logs := &invokeLog{}
 			// The bubble fails if the tool's goroutine is still blocked when
 			// the test ends, as it would be were it waiting to hand over a
 			// result nobody will take.
@@ -480,7 +480,7 @@ func TestInvoke_AToolLeftBehindEndsCleanly(t *testing.T) {
 					return tc.after()
 				})
 
-				got := invoke(context.Background(), tool, invokeCall(), time.Minute)
+				got := invoke(context.Background(), tool, invokeCall(), time.Minute, logs.logger())
 				require.Equal(t, outcome{result: "timed out after 1m0s", isError: true}, got)
 				require.Empty(t, logs.all())
 
@@ -518,6 +518,9 @@ func TestInvoke_ResultsAreBoundedAtOneMebibyte(t *testing.T) {
 		{name: "one byte over is refused with its size", result: exactly + "x", want: "result too large: 1048577 bytes", isError: true},
 		{name: "exactly a mebibyte of wider characters is kept", result: wide},
 		{name: "one wider character over is refused with its size in bytes", result: wide + "é", want: "result too large: 1048578 bytes", isError: true},
+		{name: "exactly a mebibyte ending in a three-byte character is kept", result: strings.Repeat("x", mebibyte-3) + "€"},
+		{name: "one byte over, ending in a three-byte character, is refused", result: strings.Repeat("x", mebibyte-2) + "€", want: "result too large: 1048577 bytes", isError: true},
+		{name: "exactly a mebibyte ending in a four-byte character is kept", result: strings.Repeat("x", mebibyte-4) + "🙂"},
 		{name: "an error whose text is exactly a mebibyte is kept", err: errors.New(exactly), want: exactly, isError: true},
 		{name: "an error whose text is one byte over is refused the same way", err: errors.New(exactly + "x"), want: "result too large: 1048577 bytes", isError: true},
 	}
@@ -529,13 +532,148 @@ func TestInvoke_ResultsAreBoundedAtOneMebibyte(t *testing.T) {
 				want = tc.result
 			}
 
-			got := invoke(context.Background(), tool, invokeCall(), invokeAmple)
+			got := invoke(context.Background(), tool, invokeCall(), invokeAmple, nil)
 
 			// Compared without assert.Equal, which would print a mebibyte.
 			assert.Len(t, got.result, len(want))
 			assert.True(t, got.result == want, "the result is not the one expected")
 			assert.Equal(t, tc.isError, got.isError)
 			assert.NoError(t, got.retry)
+		})
+	}
+}
+
+func TestInvoke_AResultTheJournalCannotHoldIsRefused(t *testing.T) {
+	const mebibyte = 1 << 20
+	nul := outcome{result: "result contains a NUL byte", isError: true}
+	invalid := outcome{result: "result is not valid UTF-8", isError: true}
+
+	cases := []struct {
+		name   string
+		result string
+		want   outcome
+	}{
+		{"a NUL byte in the middle", "before\x00after", nul},
+		{"a NUL byte at the end", "found\x00", nul},
+		{"a NUL byte and nothing else", "\x00", nul},
+		{"bytes that are not UTF-8 at the end", "found\xff\xfe", invalid},
+		{"a character cut short at the end", "caf" + "é"[:1], invalid},
+		{"a stray continuation byte in the middle", "be\x80fore", invalid},
+		{"both, which is reported as not valid UTF-8", "be\x00fore\xff", invalid},
+		{
+			"over a mebibyte and not valid UTF-8, which is reported as too large",
+			strings.Repeat("x", mebibyte) + "\xff",
+			outcome{result: "result too large: 1048577 bytes", isError: true},
+		},
+		{
+			"over a mebibyte with a NUL byte, which is reported as too large",
+			strings.Repeat("x", mebibyte) + "\x00",
+			outcome{result: "result too large: 1048577 bytes", isError: true},
+		},
+		{"characters of several bytes are text the journal holds", "naïve 日本語 🙂", outcome{result: "naïve 日本語 🙂"}},
+		{"the replacement character is text the journal holds", "found \uFFFD", outcome{result: "found \uFFFD"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tool := invokeTool(func(context.Context, Invocation) (string, error) { return tc.result, nil })
+
+			got := invoke(context.Background(), tool, invokeCall(), invokeAmple, nil)
+
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestInvoke_AnErrorsTextIsMadeFitForTheJournal(t *testing.T) {
+	const mebibyte = 1 << 20
+
+	cases := []struct {
+		name string
+		text string
+		want string
+	}{
+		{"a NUL byte is removed", "no such\x00 record", "no such record"},
+		{"bytes that are not UTF-8 are replaced", "no such record\xff\xfe", "no such record\uFFFD"},
+		{"both at once", "bad\x00 byte \xff in \x00\xc3 it", "bad byte \uFFFD in \uFFFD it"},
+		{
+			// Taking the NUL out first would join the two halves into a
+			// character the tool never wrote.
+			"a NUL byte between the halves of a character leaves no character behind",
+			"caf\xc3\x00\xa9",
+			"caf\uFFFD\uFFFD",
+		},
+		{"nothing but bytes the journal cannot hold", "\x00\xff\x00", "\uFFFD"},
+		{"text the journal can hold is left alone", "naïve 日本語 🙂 \uFFFD", "naïve 日本語 🙂 \uFFFD"},
+		{
+			"the bound is on the text as it would be stored: over it once replaced",
+			strings.Repeat("\xffa", mebibyte/2),
+			"result too large: 2097152 bytes",
+		},
+		{
+			"the bound is on the text as it would be stored: within it once a NUL is gone",
+			strings.Repeat("x", mebibyte) + "\x00",
+			strings.Repeat("x", mebibyte),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tool := invokeTool(func(context.Context, Invocation) (string, error) { return "", errors.New(tc.text) })
+
+			got := invoke(context.Background(), tool, invokeCall(), invokeAmple, nil)
+
+			// Compared without assert.Equal, which could print a mebibyte.
+			assert.Len(t, got.result, len(tc.want))
+			assert.True(t, got.result == tc.want, "the result is not the one expected")
+			assert.True(t, got.isError)
+			assert.NoError(t, got.retry)
+		})
+	}
+}
+
+func TestInvoke_APanicValueTheJournalCannotHoldStaysOutOfIt(t *testing.T) {
+	logs := &invokeLog{}
+	tool := invokeTool(func(context.Context, Invocation) (string, error) {
+		panic("index \x00is corrupt\xff")
+	})
+
+	got := invoke(context.Background(), tool, invokeCall(), invokeAmple, logs.logger())
+
+	// The result of a panic is the fixed text. The value goes to the log
+	// only, as the tool raised it.
+	assert.Equal(t, outcome{result: "tool panicked", isError: true}, got)
+	logged := logs.all()
+	require.Len(t, logged, 1)
+	assert.Equal(t, "index \x00is corrupt\xff", logged[0].attrs["panic"])
+}
+
+func TestInvoke_LogsToTheLoggerItIsGiven(t *testing.T) {
+	cases := []struct {
+		name string
+		// given is whether invoke is handed a logger of its own.
+		given bool
+	}{
+		{"the one it is given, and not the default", true},
+		{"the default when it is given none", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fallback, own := &invokeLog{}, &invokeLog{}
+			invokeDefaultLog(t, fallback)
+			var logger *slog.Logger
+			if tc.given {
+				logger = own.logger()
+			}
+			tool := invokeTool(func(context.Context, Invocation) (string, error) { panic("no rows") })
+
+			got := invoke(context.Background(), tool, invokeCall(), invokeAmple, logger)
+
+			require.Equal(t, outcome{result: "tool panicked", isError: true}, got)
+			if tc.given {
+				assert.Len(t, own.all(), 1)
+				assert.Empty(t, fallback.all())
+			} else {
+				assert.Len(t, fallback.all(), 1)
+			}
 		})
 	}
 }
@@ -560,7 +698,7 @@ func TestInvoke_TheToolReceivesTheInvocationAndABoundedContext(t *testing.T) {
 		}}
 		start := time.Now()
 
-		got := invoke(ctx, tool, invokeCall(), 90*time.Second)
+		got := invoke(ctx, tool, invokeCall(), 90*time.Second, nil)
 
 		require.Equal(t, outcome{result: "found"}, got)
 		assert.Equal(t, invokeCall(), received)
@@ -634,7 +772,7 @@ func TestInvoke_ACallersContextThatEndsLeavesNothingToRecord(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			logs := newInvokeLog(t)
+			logs := &invokeLog{}
 			synctest.Test(t, func(t *testing.T) {
 				release := make(chan struct{})
 				defer close(release)
@@ -642,7 +780,7 @@ func TestInvoke_ACallersContextThatEndsLeavesNothingToRecord(t *testing.T) {
 				defer cancel(nil)
 				tool := invokeTool(tc.run(func() { cancel(errTaken) }, release))
 
-				got := invoke(ctx, tool, invokeCall(), invokeAmple)
+				got := invoke(ctx, tool, invokeCall(), invokeAmple, logs.logger())
 
 				// Whatever the tool did, the caller is told why its own
 				// context ended, and is given no result it might record.
@@ -677,7 +815,7 @@ func TestInvoke_ACallersContextThatHasEndedDoesNotRunTheTool(t *testing.T) {
 				ctx, cancel := context.WithCancelCause(context.Background())
 				cancel(tc.cause)
 
-				got := invoke(ctx, tool, invokeCall(), invokeAmple)
+				got := invoke(ctx, tool, invokeCall(), invokeAmple, nil)
 
 				assert.Same(t, tc.want, got.retry)
 				assert.Empty(t, got.result)
@@ -700,7 +838,7 @@ func TestInvoke_ACallersDeadlineIsNotTheToolsTimeout(t *testing.T) {
 		})
 		start := time.Now()
 
-		got := invoke(ctx, tool, invokeCall(), 2*time.Minute)
+		got := invoke(ctx, tool, invokeCall(), 2*time.Minute, nil)
 
 		// The fixed text is for the timeout invoke was given. A context that
 		// ran out first is the caller's business.
@@ -721,7 +859,7 @@ func TestInvoke_IsSafeForManyCallsAtOnce(t *testing.T) {
 		calls.Go(func() {
 			in := invokeCall()
 			in.Seq = seq
-			got := invoke(context.Background(), tool, in, invokeAmple)
+			got := invoke(context.Background(), tool, in, invokeAmple, nil)
 			assert.Equal(t, outcome{result: fmt.Sprintf("found %d", seq)}, got)
 		})
 	}

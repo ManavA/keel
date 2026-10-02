@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"maps"
 	"runtime/debug"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // maxResultBytes is the largest result returned to the model.
@@ -40,13 +42,15 @@ type toolReturn struct {
 }
 
 // invoke runs tool.Run once: under timeout, with a panic recovered and
-// logged, an error turned into an error result, and a result over 1 MiB
-// refused. The fixed result texts are those in 6.4.
+// logged to logger, an error turned into an error result, and a result the
+// journal cannot hold refused: one over 1 MiB, one that is not valid UTF-8,
+// one with a NUL byte. The fixed result texts are those in 6.4.
 //
 // timeout is the whole bound. The tool's own Timeout, its default, and what
 // is left of the run's budget are the caller's to work out: invoke does not
 // read Tool.Timeout. A timeout of zero or less has already passed, so the
-// tool is not run and the result is the timed-out text.
+// tool is not run and the result is the timed-out text. A nil logger is
+// slog.Default.
 //
 // What comes back, in the order the cases are tried:
 //
@@ -58,15 +62,27 @@ type toolReturn struct {
 //     whatever the tool returned once its time was up. A context of the
 //     caller's that runs out first is the case above and not this one.
 //   - The tool panicked, a tool with no Run among them: "tool panicked",
-//     an error result. The value and the stack go to the default logger,
-//     since invoke is given none, with the tool, the run, the step and the
-//     attempt. The call's arguments are not logged.
+//     an error result. The value and the stack go to logger, with the tool,
+//     the run, the step and the attempt. The call's arguments are not
+//     logged, and the value is not put in the result.
 //   - The tool's error wraps ErrTransient: retry is that error.
-//   - Any other error: its text, as an error result.
-//   - Otherwise the tool's result.
+//   - Any other error: its text, as an error result, made fit for the
+//     journal by journalText. Only then is it measured: over 1 MiB it is
+//     replaced by "result too large: <n> bytes".
+//   - A result of more than 1 MiB: "result too large: <n> bytes", an error
+//     result. The bound is on bytes.
+//   - A result that is not valid UTF-8: "result is not valid UTF-8", an
+//     error result.
+//   - A result with a NUL byte in it: "result contains a NUL byte", an
+//     error result.
+//   - Otherwise the tool's result, unchanged.
 //
-// A result, or an error's text, of more than 1 MiB is replaced by
-// "result too large: <n> bytes", an error result.
+// A result is refused where an error's text is repaired because the two are
+// owed differently. A result is the tool's answer, and one with bytes
+// changed is no longer that answer; an error's text only has to say what
+// went wrong. Either way what invoke returns as a result is text Postgres
+// will store, so the write that records it cannot fail for its content on
+// every attempt and leave the run unable to move.
 //
 // The tool runs in a goroutine of its own, so one that ignores its context
 // does not hold invoke past the timeout or past the end of ctx. That
@@ -75,7 +91,10 @@ type toolReturn struct {
 // logged. A tool that never returns therefore costs a goroutine for the
 // life of the process, and may still be doing its work after the model has
 // been told it timed out: honouring the context is the tool's part.
-func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration) outcome {
+func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration, logger *slog.Logger) outcome {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if ctx.Err() != nil {
 		return outcome{retry: context.Cause(ctx)}
 	}
@@ -98,7 +117,7 @@ func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration
 					// leaves no result either.
 					value = "the tool ended its goroutine without returning"
 				}
-				slog.ErrorContext(ctx, "agent: tool panicked",
+				logger.ErrorContext(ctx, "agent: tool panicked",
 					"tool", tool.Name, "run", in.RunID, "agent", in.Agent, "seq", in.Seq, "attempt", in.Attempt,
 					"panic", fmt.Sprint(value), "stack", string(debug.Stack()))
 			}
@@ -133,14 +152,38 @@ func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration
 		return outcome{result: "tool panicked", isError: true}
 	case ret.transient != nil:
 		return outcome{retry: ret.transient}
+	case ret.failed:
+		text := journalText(ret.text)
+		if len(text) > maxResultBytes {
+			return tooLarge(len(text))
+		}
+		return outcome{result: text, isError: true}
 	case len(ret.text) > maxResultBytes:
-		return outcome{result: fmt.Sprintf("result too large: %d bytes", len(ret.text)), isError: true}
+		return tooLarge(len(ret.text))
+	case !utf8.ValidString(ret.text):
+		return outcome{result: "result is not valid UTF-8", isError: true}
+	case strings.IndexByte(ret.text, 0) >= 0:
+		return outcome{result: "result contains a NUL byte", isError: true}
 	}
-	return outcome{result: ret.text, isError: ret.failed}
+	return outcome{result: ret.text}
 }
 
 func timedOut(timeout time.Duration) outcome {
 	return outcome{result: "timed out after " + timeout.String(), isError: true}
+}
+
+func tooLarge(bytes int) outcome {
+	return outcome{result: fmt.Sprintf("result too large: %d bytes", bytes), isError: true}
+}
+
+// journalText is text as the journal can hold it. Postgres refuses, in a
+// text column, bytes that are not UTF-8 and the NUL byte: the first are
+// replaced by U+FFFD, a run of them by one, and then the second are removed.
+// In that order, so that a NUL between the two halves of a character does
+// not leave a character the text never had. Text that has neither comes
+// back as it is.
+func journalText(text string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(text, "\uFFFD"), "\x00", "")
 }
 
 // actionFor is the Action the Guard is asked about: the tool's own, or the
