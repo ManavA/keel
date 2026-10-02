@@ -51,7 +51,10 @@ type Run struct {
 	Reason string `json:"reason,omitempty"`
 	Input  string `json:"input"`
 	Output string `json:"output,omitempty"`
-	Error  string `json:"error,omitempty"`
+	// Error is the last failure. A failed execution records it, and it stays
+	// through later executions that go well, until the run ends and records
+	// its own, which is none for a run that ended well.
+	Error string `json:"error,omitempty"`
 
 	// ParentID and ParentSeq name the tool step of the run that started
 	// this one. Depth is 0 for a run nobody delegated.
@@ -60,9 +63,11 @@ type Run struct {
 	Depth     int    `json:"depth,omitempty"`
 
 	// Key is the caller's idempotency key for starting the run.
-	Key        string            `json:"key,omitempty"`
-	Definition Snapshot          `json:"definition"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
+	Key        string   `json:"key,omitempty"`
+	Definition Snapshot `json:"definition"`
+	// Metadata is the caller's own. It reads back as JSON gives it, and as
+	// an empty map when the run was started with none.
+	Metadata map[string]string `json:"metadata,omitempty"`
 
 	Usage        Usage `json:"usage"`
 	ModelCalls   int   `json:"model_calls"`
@@ -206,18 +211,25 @@ type Approval struct {
 	Cause   ApprovalCause `json:"cause"`
 	Tool    string        `json:"tool"`
 	// Input is the call's arguments: exactly what runs if approved.
-	Input  json.RawMessage `json:"input"`
-	Action Action          `json:"action"`
-	Rule   string          `json:"rule"`
+	Input json.RawMessage `json:"input"`
+	// Action is what the Guard was asked about. Its Attrs read back as JSON
+	// gives them, and as an empty map when there were none. A number comes
+	// back as a float64, so an integer above 2^53 is no longer exact: put
+	// one that must be in a string.
+	Action Action `json:"action"`
+	Rule   string `json:"rule"`
 
 	Status    ApprovalStatus `json:"status"`
 	DecidedBy string         `json:"decided_by,omitempty"`
 	Reason    string         `json:"reason,omitempty"`
 	Rev       int64          `json:"rev"`
 
-	RequestedAt time.Time  `json:"requested_at"`
-	DecidedAt   *time.Time `json:"decided_at,omitempty"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	RequestedAt time.Time `json:"requested_at"`
+	// DecidedAt is when the approval stopped being pending, whether a person
+	// answered it, it lapsed, or its run ended. It is nil exactly while the
+	// approval is pending.
+	DecidedAt *time.Time `json:"decided_at,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // Changes is what happened to a run after a revision.
@@ -255,13 +267,19 @@ type ApprovalFilter struct {
 
 // ClaimRequest asks for a run to execute.
 type ClaimRequest struct {
+	// Owner names who will hold the run. It must not be empty.
 	Owner string
 	// Agents limits the claim to runs of these agents.
 	Agents []string
-	// RunID, when set, claims that run or fails with ErrNotClaimable.
+	// RunID, when set, claims that run or fails: with ErrNotFound when there
+	// is no such run, and with ErrNotClaimable when it cannot be taken. A
+	// claim by RunID waits for a write to the run that is in progress and
+	// then decides. A claim without one passes over a run being written to.
 	RunID string
 	Now   time.Time
-	TTL   time.Duration
+	// TTL is how long the lease lasts without a heartbeat. It must be more
+	// than zero.
+	TTL time.Duration
 }
 
 // YieldRequest gives a run back without finishing it.
