@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS digests;
+DROP TABLE IF EXISTS summaries;
+DROP TABLE IF EXISTS documents;
