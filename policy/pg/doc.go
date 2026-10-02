@@ -41,9 +41,9 @@
 // Each record carries its ID, the log's own number for it, which with its time
 // is its place in the log and is what a [Cursor] is made of.
 //
-// A time is stored and read in UTC. The column keeps microseconds: Record drops
-// what is finer, and a time read back equals the one written truncated to the
-// microsecond.
+// A time is stored and read in UTC, in the years 1 to 9999. The column keeps
+// microseconds: Record drops what is finer, and a time read back equals the one
+// written truncated to the microsecond.
 //
 // Attribute values come back as encoding/json decodes them into an any: maps,
 // lists, strings, booleans, nil, and numbers as [encoding/json.Number]. An
@@ -62,8 +62,10 @@
 // a json.Number: a float64 is written as encoding/json writes it, the shortest
 // decimal that gives it back, and a float64 holding an integer too large to be
 // exact is therefore stored as that decimal and not as its exact value.
-// jsonb holds a number of up to 131071 digits before the point; past that the
-// record fails.
+// jsonb holds a number of up to 131072 digits before the point and 16383 after
+// it, an exponent counting as it expands (1e131071 fills the first limit,
+// 1e-16383 the second); past either the record fails, as one that can never be
+// stored.
 //
 // # What cannot be recorded
 //
@@ -71,26 +73,39 @@
 // refuses \u0000 in a string or a key. Attribute values come from tool input a
 // model wrote, so one can arrive. Record looks for it before it sends anything,
 // in the kind, the target, the rule names, the version and every attribute name
-// and value, and returns an error that says so. Nothing is written, the next
-// record is unaffected, and because the statement was never sent, a transaction
-// the caller has open is not left aborted, as it would be by the error Postgres
-// gives. The action whose record failed is not allowed. Text that only contains
-// a backslash followed by u0000 is not a NUL and is stored.
+// and value, and returns an error that says so. Nothing is written and the next
+// record is unaffected. The action whose record failed is not allowed. Text
+// that only contains a backslash followed by u0000 is not a NUL and is stored.
 //
-// Record also refuses, without sending anything, a decision whose effect is not
-// allow, ask or block (the table would refuse it), attributes that JSON cannot
-// hold (NaN, an infinity, a function, a channel, a value that contains itself),
-// and an empty json.Number anywhere encoding/json would write it, since it
-// would write 0 and nobody sent a zero. Each wraps [policy.ErrUnrecordable].
-// Anything else Postgres refuses, such as a number past its range, is its own
-// error, wrapped, and is unrecordable when the server says the fault is in the
-// record.
+// Record also refuses, without sending anything: a decision whose effect is not
+// allow, ask or block (the table would refuse it); a kind, target, rule or
+// version that is not valid UTF-8 (a text column refuses it); a time outside the
+// years 1 to 9999 (the driver counts microseconds in an int64, so a huge Unix
+// time would not be refused but stored as some other time); a rule index outside
+// what an integer column holds; attributes that JSON cannot hold (NaN, an
+// infinity, a function, a channel, a value that contains itself); and an empty
+// json.Number, since encoding/json would write 0 and nobody sent a zero. The
+// empty number is looked for in what decoded JSON holds, a map, a list and a
+// number, however they nest: a struct, a pointer or a list of another type is
+// left to encoding/json, whose rules for a struct a copy here could disagree
+// with. Each refusal wraps [policy.ErrUnrecordable]. Anything else the server
+// refuses (a number past its range, a value nested more deeply than its stack
+// allows, an escape in raw JSON that jsonb does not take) is its own error,
+// wrapped, and unrecordable when the server says the fault is in the record.
 //
-// Text that is not valid UTF-8 is not refused in a rule name, an attribute name
-// or an attribute value: encoding/json replaces each bad byte with U+FFFD, so
-// the log holds the replacement character and not the bytes. A text column (the
-// kind, the target, the rule and the version) does refuse it, and the record
-// fails as unrecordable.
+// Text that is not valid UTF-8 inside a rule name, an attribute name or an
+// attribute value, which is written as JSON, is not refused: encoding/json
+// replaces each bad byte with U+FFFD, so the log holds the replacement character
+// and not the bytes.
+//
+// # A caller's transaction
+//
+// A Store built over a pgx.Tx shares the caller's transaction, and a statement
+// the server refuses aborts a transaction: every statement after it fails, with
+// SQLSTATE 25P02, until the rollback. So over a pgx.Tx, Record runs the insert in
+// a savepoint, rolled back to when it fails, and whatever Record refuses, the
+// caller's transaction can go on. Over a pool, or any connection that is not a
+// pgx.Tx, the insert is one statement.
 //
 // # Reading the log
 //
@@ -98,15 +113,21 @@
 // Of decisions decided at the same instant the one recorded later comes first,
 // so the order does not change from one call to the next. A page is at most
 // 1000 decisions, and 100 when the filter sets no limit: a larger limit is read
-// as 1000, and the cursor reaches what a page leaves behind.
+// as 1000, and the cursor reaches what a page leaves behind. The effect, rule
+// and kind of a filter match exactly, and so case-sensitively; a filter on a
+// rule is served by an index in the order of the listing, and reads only that
+// rule's rows.
 //
 // To read the whole log, or all of it that matches a filter, set Filter.Before
 // to the [Cursor] of the last record of each page, {At: rec.At, ID: rec.ID},
 // and stop at an empty page. A cursor is a position: it returns what is older
 // than it by time and then by ID, so records that share a time are each on one
 // page and only one, however the pages fall among them, and, unlike an offset,
-// it does not move when records are added. A cursor whose ID is below 1 is an
-// error and no query is made.
+// it does not move when records are added. That holds for the records already
+// committed: a record that commits late, with a time older than the cursor of a
+// pass that is already beyond it, is not in that pass, and a fresh pass from the
+// newest finds it. A cursor whose ID is below 1, or whose time is outside the
+// years 1 to 9999, is an error and no query is made; so is a Since outside them.
 //
 // Apply [MigrationsFS] with keel's pg/migrate package before use; the migration
 // is safe to run twice.

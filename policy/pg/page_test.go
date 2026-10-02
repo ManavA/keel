@@ -3,6 +3,7 @@ package pg_test
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -328,4 +329,50 @@ func seedBulk(t *testing.T, pool *pgxpool.Pool, n int) {
 		select timestamptz '2026-10-02 09:00:00+00' + n * interval '1 second', 'bulk', n::text, 'allow', 'r', 0
 		from generate_series(1, $1::int) as n`, n)
 	require.NoError(t, err)
+}
+
+// A rule is the one thing to filter on that has an index of its own, and it must
+// serve the listing's order, or a rare rule is found by reading the time index
+// from the newest decision back, or by sorting every decision of the rule. The
+// server is asked for the plan of exactly the statement List runs.
+func TestStore_ARuleFilterIsServedByTheIndexInTheOrderOfTheListing(t *testing.T) {
+	store, pool := openStore(t)
+	ctx := t.Context()
+
+	// 30000 decisions, one second apart, of which every 3000th is of a rare rule.
+	_, err := pool.Exec(ctx, `
+		insert into `+policypg.Table+` (decided_at, kind, target, effect, rule, rule_index)
+		select timestamptz '2026-10-02 09:00:00+00' + n * interval '1 second', 'bulk', n::text, 'allow',
+		       case when n % 3000 = 0 then 'rare' else 'common' end, 0
+		from generate_series(1, 30000) as n`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `analyze `+policypg.Table)
+	require.NoError(t, err)
+
+	middle := &policypg.Cursor{At: base.Add(15000 * time.Second), ID: 15000}
+	for name, f := range map[string]policypg.Filter{
+		"a rule":                       {Rule: "rare"},
+		"a rule and a cursor":          {Rule: "rare", Before: middle},
+		"a rule, a cursor and a limit": {Rule: "rare", Before: middle, Limit: 3},
+		"a rule, an effect and since":  {Rule: "rare", Effect: policy.Allow, Since: base.Add(time.Hour)},
+	} {
+		sql, args := f.Query()
+		rows, err := pool.Query(ctx, "explain (costs off) "+sql, args...)
+		require.NoErrorf(t, err, "%s", name)
+		var plan []string
+		for rows.Next() {
+			var line string
+			require.NoError(t, rows.Scan(&line))
+			plan = append(plan, line)
+		}
+		require.NoError(t, rows.Err())
+		text := strings.Join(plan, "\n")
+		assert.Contains(t, text, "policy_decisions_rule_idx", "%s:\n%s", name, text)
+		assert.NotContains(t, text, "Sort", "%s: the index must hand rows over in the order of the listing:\n%s", name, text)
+	}
+
+	// And it reads what was asked for.
+	got, err := store.List(ctx, policypg.Filter{Rule: "rare", Before: middle})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"12000", "9000", "6000", "3000"}, targets(got))
 }

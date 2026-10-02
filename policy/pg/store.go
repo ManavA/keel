@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -56,17 +58,53 @@ values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 // asks the database (see the package comment) and what the server refuses of
 // the record's own content or size. An error that is the database's, or the
 // moment's, does not.
+//
+// Over a transaction (a pgx.Tx) the insert runs in a savepoint, rolled back
+// when it fails, so that a statement the server refuses does not leave the
+// caller's transaction aborted. Over anything else it is one statement.
 func (s *Store) Record(ctx context.Context, rec policy.Record) error {
 	args, err := insertArgs(rec)
 	if err != nil {
 		return fmt.Errorf("policy/pg: record %q action: %w", rec.Action.Kind, unrecordable(err))
 	}
-	tag, err := s.db.Exec(ctx, insertSQL, args...)
-	if err != nil {
+	if err := s.insert(ctx, args); err != nil {
 		return fmt.Errorf("policy/pg: record %q action: %w", rec.Action.Kind, asUnrecordable(err))
 	}
+	return nil
+}
+
+// insert writes one row, in a savepoint when the connection is a transaction.
+// If the savepoint's own rollback fails, the connection is gone, and the
+// caller's next statement says so: the error returned is the insert's.
+func (s *Store) insert(ctx context.Context, args []any) error {
+	db := s.db
+	var savepoint pgx.Tx
+	if tx, ok := s.db.(pgx.Tx); ok {
+		var err error
+		if savepoint, err = tx.Begin(ctx); err != nil {
+			return err
+		}
+		db = savepoint
+	}
+	err := insertOne(ctx, db, args)
+	switch {
+	case savepoint == nil:
+		return err
+	case err != nil:
+		_ = savepoint.Rollback(ctx)
+		return err
+	}
+	return savepoint.Commit(ctx)
+}
+
+// insertOne runs the insert, and is an error unless it wrote one row.
+func insertOne(ctx context.Context, db conn, args []any) error {
+	tag, err := db.Exec(ctx, insertSQL, args...)
+	if err != nil {
+		return err
+	}
 	if n := tag.RowsAffected(); n != 1 {
-		return fmt.Errorf("policy/pg: record %q action: the insert wrote %d rows, not 1", rec.Action.Kind, n)
+		return fmt.Errorf("the insert wrote %d rows, not 1", n)
 	}
 	return nil
 }
@@ -79,6 +117,12 @@ func insertArgs(rec policy.Record) ([]any, error) {
 	if !d.Effect.Valid() {
 		return nil, fmt.Errorf("the decision's effect is %q, not allow, ask or block", d.Effect)
 	}
+	if !inColumnRange(rec.At) {
+		return nil, fmt.Errorf("the decision's time is in year %d, outside the years 1 to 9999", rec.At.UTC().Year())
+	}
+	if d.Index < math.MinInt32 || d.Index > math.MaxInt32 {
+		return nil, fmt.Errorf("the deciding rule's index %d is outside what an integer column holds", d.Index)
+	}
 	for _, t := range []struct{ what, text string }{
 		{"the action's kind", rec.Action.Kind},
 		{"the action's target", rec.Action.Target},
@@ -87,6 +131,9 @@ func insertArgs(rec policy.Record) ([]any, error) {
 	} {
 		if strings.IndexByte(t.text, 0) >= 0 {
 			return nil, errNUL(t.what)
+		}
+		if !utf8.ValidString(t.text) {
+			return nil, fmt.Errorf("%s is not valid UTF-8, which a text column refuses", t.what)
 		}
 	}
 	matched, err := encodeNames("a matched rule's name", d.Matched)
@@ -109,6 +156,14 @@ func insertArgs(rec policy.Record) ([]any, error) {
 		string(d.Effect), d.Rule, d.Index, matched, uncertain,
 		rec.Version,
 	}, nil
+}
+
+// inColumnRange reports whether t is in the years the package records, 1 to
+// 9999, which is what a time written as text can be and what the column holds
+// without the driver's microsecond count wrapping.
+func inColumnRange(t time.Time) bool {
+	y := t.UTC().Year()
+	return y >= 1 && y <= 9999
 }
 
 func errNUL(what string) error {
@@ -144,14 +199,15 @@ type Cursor struct {
 
 // Filter narrows List. The zero Filter lists the newest decisions.
 type Filter struct {
-	// Effect, Rule and Kind each match a decision's own value exactly, with no
-	// regard to case. Empty matches any. An Effect that is not allow, ask or
+	// Effect, Rule and Kind each match a decision's own value exactly, and so
+	// case-sensitively. Empty matches any. An Effect that is not allow, ask or
 	// block is an error, not an empty result.
 	Effect policy.Effect
 	Rule   string
 	Kind   string
 	// Since keeps the decisions decided at this time or later. It is read to the
-	// microsecond, as a decision's time is stored. The zero time keeps all.
+	// microsecond, as a decision's time is stored, and a time outside the years
+	// 1 to 9999 is an error. The zero time keeps all.
 	Since time.Time
 	// Before returns decisions older than this position: those decided earlier,
 	// and those decided at the same time and recorded earlier, so a record that
@@ -232,6 +288,12 @@ func (s *Store) List(ctx context.Context, f Filter) ([]policy.Record, error) {
 	}
 	if f.Before != nil && f.Before.ID < 1 {
 		return nil, fmt.Errorf("policy/pg: list: the cursor's id %d is not an id the log gives, which starts at 1", f.Before.ID)
+	}
+	if !f.Since.IsZero() && !inColumnRange(f.Since) {
+		return nil, fmt.Errorf("policy/pg: list: since is in year %d, outside the years 1 to 9999", f.Since.UTC().Year())
+	}
+	if f.Before != nil && !inColumnRange(f.Before.At) {
+		return nil, fmt.Errorf("policy/pg: list: the cursor's time is in year %d, outside the years 1 to 9999", f.Before.At.UTC().Year())
 	}
 	sql, args := f.query()
 	rows, err := s.db.Query(ctx, sql, args...)

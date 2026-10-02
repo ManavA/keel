@@ -2,11 +2,9 @@ package pg
 
 import (
 	"bytes"
-	"encoding"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -28,7 +26,7 @@ func encodeAttrs(attrs map[string]any) ([]byte, error) {
 	if hasNULEscape(b) {
 		return nil, errNUL("an attribute name or value")
 	}
-	if hasEmptyNumber(reflect.ValueOf(attrs)) {
+	if hasEmptyNumber(attrs) {
 		return nil, errors.New("an attribute holds an empty json.Number, which is not a number and which JSON would write as 0")
 	}
 	return b, nil
@@ -50,95 +48,34 @@ func hasNULEscape(text []byte) bool {
 	return false
 }
 
-var (
-	numberType        = reflect.TypeFor[json.Number]()
-	marshalerType     = reflect.TypeFor[json.Marshaler]()
-	textMarshalerType = reflect.TypeFor[encoding.TextMarshaler]()
-)
-
-// hasEmptyNumber reports whether v holds a json.Number with no digits where
-// encoding/json would write it. It writes such a number as 0, which nobody sent.
-// It follows what encoding/json follows: through pointers, interfaces, maps,
-// lists, arrays and the written fields of structs, and not into a value that
-// writes itself. It runs only on a value that json.Marshal has accepted, which
-// bounds how deep it can go.
-func hasEmptyNumber(v reflect.Value) bool {
-	if !v.IsValid() {
-		return false
-	}
-	if t := v.Type(); t == numberType {
-		return v.String() == ""
-	} else if t.Implements(marshalerType) || t.Implements(textMarshalerType) {
-		return false
-	}
-	switch v.Kind() {
-	case reflect.Interface, reflect.Pointer:
-		return !v.IsNil() && hasEmptyNumber(v.Elem())
-	case reflect.Map:
-		for it := v.MapRange(); it.Next(); {
-			if hasEmptyNumber(it.Value()) {
+// hasEmptyNumber reports whether v holds a json.Number with no digits. For
+// such a number encoding/json writes 0, which nobody sent.
+//
+// It looks at what [encoding/json.Decoder.UseNumber] produces, which is what
+// attribute values are when they come from decoded tool input: a map[string]any,
+// a []any and a json.Number, however deeply they nest. Anything else, a struct,
+// a pointer or a list of another type, it leaves to encoding/json, which has
+// its own rules for what it writes of a struct and of its fields; a copy of
+// them here could disagree. It runs only on a value that json.Marshal has
+// accepted, so it is not given a cycle.
+func hasEmptyNumber(v any) bool {
+	switch v := v.(type) {
+	case json.Number:
+		return v == ""
+	case map[string]any:
+		for _, e := range v {
+			if hasEmptyNumber(e) {
 				return true
 			}
 		}
-	case reflect.Slice, reflect.Array:
-		if v.Type().Elem().Kind() == reflect.Uint8 {
-			return false // bytes are written as text
-		}
-		for i := range v.Len() {
-			if hasEmptyNumber(v.Index(i)) {
-				return true
-			}
-		}
-	case reflect.Struct:
-		for i := range v.NumField() {
-			if f := v.Type().Field(i); writtenField(f, v.Field(i)) && hasEmptyNumber(v.Field(i)) {
+	case []any:
+		for _, e := range v {
+			if hasEmptyNumber(e) {
 				return true
 			}
 		}
 	}
 	return false
-}
-
-// writtenField reports whether encoding/json would write the field f of a
-// struct, whose value is v: not when it is unexported (an embedded struct's own
-// fields are promoted), tagged "-", or empty and tagged omitempty or omitzero.
-func writtenField(f reflect.StructField, v reflect.Value) bool {
-	if !f.IsExported() && !f.Anonymous {
-		return false
-	}
-	name, options, _ := strings.Cut(f.Tag.Get("json"), ",")
-	if name == "-" && options == "" {
-		return false
-	}
-	for _, option := range strings.Split(options, ",") {
-		switch option {
-		case "omitzero":
-			if v.IsZero() {
-				return false
-			}
-		case "omitempty":
-			if emptyForJSON(v) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// emptyForJSON is encoding/json's test for a value that omitempty leaves out.
-func emptyForJSON(v reflect.Value) bool {
-	switch v.Kind() {
-	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
-		return v.Len() == 0
-	case reflect.Interface, reflect.Pointer:
-		return v.IsNil()
-	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
-		reflect.Float32, reflect.Float64:
-		return v.IsZero()
-	default:
-		return false
-	}
 }
 
 // unrecordableError is an error that no retry will cure: its text is the

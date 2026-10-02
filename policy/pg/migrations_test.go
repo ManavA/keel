@@ -98,6 +98,20 @@ func TestMigrations_CreateTheTableTheDesignDescribes(t *testing.T) {
 		assert.Equal(t, []string{"policy_decisions_decided_idx", "policy_decisions_rule_idx"}, names)
 	})
 
+	t.Run("each index is in the order of the listing", func(t *testing.T) {
+		// The time index is the order of the listing; the rule index is the same
+		// order within a rule, so that a filter on a rare rule reads only its own
+		// rows and does not sort them.
+		for name, want := range map[string]string{
+			"policy_decisions_decided_idx": "(decided_at DESC, id DESC)",
+			"policy_decisions_rule_idx":    "(rule, decided_at DESC, id DESC)",
+		} {
+			var def string
+			require.NoError(t, pool.QueryRow(ctx, `select indexdef from pg_indexes where schemaname = current_schema() and indexname = $1`, name).Scan(&def))
+			assert.Contains(t, def, want, name)
+		}
+	})
+
 	t.Run("the columns that are left out take their defaults", func(t *testing.T) {
 		_, err := pool.Exec(ctx, `insert into `+policypg.Table+` (decided_at, kind, effect, rule, rule_index) values ($1, 'k', 'allow', 'r', 0)`, base)
 		require.NoError(t, err)

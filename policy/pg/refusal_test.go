@@ -2,14 +2,13 @@ package pg_test
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -142,6 +141,20 @@ func TestStore_RecordRefusesWhatCannotBeRecordedAtAll(t *testing.T) {
 		{"a number that is not a number", func(r *policy.Record) { r.Action.Attrs["n"] = json.Number("12abc") }, "attributes"},
 		{"a number with no digits", func(r *policy.Record) { r.Action.Attrs["n"] = json.Number("") }, "empty json.Number"},
 		{"no effect, the zero Decision", func(r *policy.Record) { r.Decision = policy.Decision{} }, "effect"},
+		{"a kind that is not UTF-8", func(r *policy.Record) { r.Action.Kind = "a\xffb" }, "kind"},
+		{"a target that is not UTF-8", func(r *policy.Record) { r.Action.Target = "a\xffb" }, "target"},
+		{"a rule that is not UTF-8", func(r *policy.Record) { r.Decision.Rule = "a\xffb" }, "rule"},
+		{"a version that is not UTF-8", func(r *policy.Record) { r.Version = "a\xffb" }, "version"},
+		{"a truncated character at the end of a kind", func(r *policy.Record) { r.Action.Kind = "caf\xc3" }, "kind"},
+		{"a time before year 1", func(r *policy.Record) { r.At = time.Time{}.Add(-time.Hour) }, "year"},
+		{"a time in year 10000", func(r *policy.Record) { r.At = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC) }, "year"},
+		{"a time in year 300000", func(r *policy.Record) { r.At = time.Date(300000, 1, 1, 0, 0, 0, 0, time.UTC) }, "year"},
+		{"a time too large for the clock the column uses", func(r *policy.Record) { r.At = time.Unix(1<<60, 0) }, "year"},
+		{"the largest time there is", func(r *policy.Record) { r.At = time.Unix(math.MaxInt64, 0) }, "year"},
+		{"the smallest time there is", func(r *policy.Record) { r.At = time.Unix(math.MinInt64, 0) }, "year"},
+		{"an index one past the column's", func(r *policy.Record) { r.Decision.Index = math.MaxInt32 + 1 }, "index"},
+		{"an index one before the column's", func(r *policy.Record) { r.Decision.Index = math.MinInt32 - 1 }, "index"},
+		{"the largest index there is", func(r *policy.Record) { r.Decision.Index = math.MaxInt }, "index"},
 		{"an effect that is not one of the three", func(r *policy.Record) { r.Decision.Effect = "approve" }, "effect"},
 		{"an effect in capitals", func(r *policy.Record) { r.Decision.Effect = "ALLOW" }, "effect"},
 	}
@@ -155,6 +168,72 @@ func TestStore_RecordRefusesWhatCannotBeRecordedAtAll(t *testing.T) {
 			assert.Zero(t, db.execs, "nothing is sent")
 		})
 	}
+}
+
+// What the columns hold, at their edges, is taken: the checks refuse what the
+// column cannot hold and no more.
+func TestStore_RecordTakesWhatTheColumnsHoldAtTheirEdges(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*policy.Record)
+	}{
+		{"the first instant of year 1", func(r *policy.Record) { r.At = time.Time{} }},
+		{"the last instant of year 9999", func(r *policy.Record) { r.At = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC) }},
+		{"the last instant of year 9999 in a zone that makes it year 10000", func(r *policy.Record) {
+			r.At = time.Date(10000, 1, 1, 5, 29, 59, 0, time.FixedZone("east", 5*3600+1800))
+		}},
+		{"the largest index the column holds", func(r *policy.Record) { r.Decision.Index = math.MaxInt32 }},
+		{"the smallest", func(r *policy.Record) { r.Decision.Index = math.MinInt32 }},
+		{"no rule index, which is -1", func(r *policy.Record) { r.Decision.Index = -1 }},
+		{"text that is valid UTF-8 and not ASCII", func(r *policy.Record) {
+			r.Action.Kind, r.Action.Target, r.Decision.Rule, r.Version = "caf\u00e9", "\u2603:\U0001F600", "r\u00e8gle", "v\u00e9"
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &fakeDB{tag: pgconn.NewCommandTag("INSERT 0 1")}
+			require.NoError(t, policypg.New(db).Record(t.Context(), recordWith(tt.change)))
+			assert.Equal(t, 1, db.execs)
+		})
+	}
+}
+
+func TestStore_ListRefusesATimeTheColumnCannotHold(t *testing.T) {
+	// A time the driver cannot write would wrap, and the filter would then be
+	// for some other time than the one asked for.
+	tests := []struct {
+		name   string
+		filter policypg.Filter
+	}{
+		{"since in year 10000", policypg.Filter{Since: time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)}},
+		{"since before year 1", policypg.Filter{Since: time.Time{}.Add(-time.Hour)}},
+		{"since too large for the clock", policypg.Filter{Since: time.Unix(1<<60, 0)}},
+		{"a cursor in year 10000", policypg.Filter{Before: &policypg.Cursor{At: time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC), ID: 1}}},
+		{"a cursor too large for the clock", policypg.Filter{Before: &policypg.Cursor{At: time.Unix(1<<60, 0), ID: 1}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &fakeDB{}
+			got, err := policypg.New(db).List(t.Context(), tt.filter)
+			require.Error(t, err)
+			assert.Nil(t, got)
+			assert.Contains(t, err.Error(), "year")
+			assert.Zero(t, db.queries, "a query is not made")
+		})
+	}
+
+	t.Run("the edges are taken", func(t *testing.T) {
+		for _, f := range []policypg.Filter{
+			{Since: time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)},
+			{Before: &policypg.Cursor{At: time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC), ID: 1}},
+			{Before: &policypg.Cursor{At: time.Time{}, ID: 1}},
+		} {
+			db := &fakeDB{rows: brokenRows{}}
+			_, err := policypg.New(db).List(t.Context(), f)
+			require.NoError(t, err)
+			assert.Equal(t, 1, db.queries)
+		}
+	})
 }
 
 func TestStore_RecordIsAnErrorUnlessOneRowWasWritten(t *testing.T) {
@@ -259,8 +338,8 @@ func TestPostgres_RefusesANulItself(t *testing.T) {
 
 func TestStore_ANumberPostgresCannotHoldIsAnErrorAndLeavesNothing(t *testing.T) {
 	// The package compares a number of any size up to 4096 bytes and an exponent
-	// of 4096; jsonb holds one up to 131071 digits and no more. Past that the
-	// record fails, and the action is not allowed.
+	// of 4096; jsonb holds one of up to 131072 digits before the point and 16383
+	// after it. Past that the record fails, and the action is not allowed.
 	store, pool := openStore(t)
 	ctx := t.Context()
 
@@ -301,10 +380,12 @@ func TestStore_ARecordThatIsRefusedLeavesNothingInTheLog(t *testing.T) {
 }
 
 // An empty json.Number is not a number, and encoding/json writes one as 0: a
-// zero nobody sent. Record refuses it wherever encoding/json would write it, and
-// takes what encoding/json would not write.
-func TestStore_RecordRefusesAnEmptyNumberWhereverItWouldBeWritten(t *testing.T) {
-	var empty json.Number
+// zero nobody sent. Record refuses it in what decoded JSON holds: a map, a list
+// and a number, however they nest. What it does not look into (a struct, a
+// pointer, a typed list) it leaves to encoding/json, since a rule for which
+// fields of a struct are written is encoding/json's, and a copy of it here could
+// disagree.
+func TestStore_RecordRefusesAnEmptyNumberInWhatDecodedJSONHolds(t *testing.T) {
 	tests := []struct {
 		name    string
 		attrs   map[string]any
@@ -313,27 +394,15 @@ func TestStore_RecordRefusesAnEmptyNumberWhereverItWouldBeWritten(t *testing.T) 
 		{"in an attribute", map[string]any{"n": json.Number("")}, true},
 		{"in a nested object", map[string]any{"a": map[string]any{"b": map[string]any{"n": json.Number("")}}}, true},
 		{"in a list", map[string]any{"a": []any{"x", json.Number("")}}, true},
-		{"in a list of numbers", map[string]any{"a": []json.Number{"1", ""}}, true},
-		{"in an array", map[string]any{"a": [2]json.Number{"1", ""}}, true},
-		{"behind a pointer", map[string]any{"a": &empty}, true},
-		{"behind a pointer in a list", map[string]any{"a": []any{&empty}}, true},
-		{"in a map of numbers", map[string]any{"a": map[string]json.Number{"k": ""}}, true},
-		{"in a field of a struct", map[string]any{"a": numbered{}}, true},
-		{"in a field of a struct behind a pointer", map[string]any{"a": &numbered{}}, true},
-		{"in a field of an embedded struct", map[string]any{"a": embedsNumbered{}}, true},
-		{"in a written field of a struct that skips others", map[string]any{"a": tagged{Shown: ""}}, true},
-		{"deep in a mixture", map[string]any{"a": []any{map[string]any{"b": []any{&numbered{}}}}}, true},
+		{"deep in lists and objects", map[string]any{"a": []any{map[string]any{"b": []any{[]any{json.Number("")}}}}}, true},
 		{"after numbers that are fine", map[string]any{"a": json.Number("1"), "b": []any{json.Number("2"), json.Number("")}}, true},
 
 		{"zero, which was sent", map[string]any{"n": json.Number("0")}, false},
-		{"a number with digits", map[string]any{"n": json.Number("1.50"), "m": []json.Number{"1", "-2e3"}}, false},
-		{"a nil pointer to one", map[string]any{"n": (*json.Number)(nil)}, false},
+		{"a number with digits", map[string]any{"n": json.Number("1.50"), "m": []any{json.Number("1"), json.Number("-2e3")}}, false},
 		{"a string with nothing in it", map[string]any{"n": ""}, false},
-		{"a list with nothing in it", map[string]any{"n": []any{}, "m": []json.Number{}, "o": map[string]json.Number{}}, false},
+		{"nothing in a list or an object", map[string]any{"n": []any{}, "m": map[string]any{}}, false},
+		{"null", map[string]any{"n": nil}, false},
 		{"bytes", map[string]any{"n": []byte("abc")}, false},
-		{"a struct field encoding/json does not write", map[string]any{"a": tagged{Shown: "1", hidden: ""}}, false},
-		{"a struct that writes itself", map[string]any{"a": selfWriting{}}, false},
-		{"a struct that writes itself, behind a pointer", map[string]any{"a": &selfWriting{}}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -350,26 +419,27 @@ func TestStore_RecordRefusesAnEmptyNumberWhereverItWouldBeWritten(t *testing.T) 
 			assert.Zero(t, db.execs, "nothing is sent")
 		})
 	}
+
+	// Pinned so that the edge of the rule is not an accident: these are not
+	// looked into, and encoding/json writes the empty number as 0.
+	var empty json.Number
+	t.Run("what is left to encoding/json is written as it writes it", func(t *testing.T) {
+		for name, attrs := range map[string]map[string]any{
+			"a typed list":   {"a": []json.Number{"1", ""}},
+			"a map of them":  {"a": map[string]json.Number{"k": ""}},
+			"an array":       {"a": [2]json.Number{"1", ""}},
+			"behind pointer": {"a": &empty},
+			"in a struct":    {"a": numbered{}},
+		} {
+			db := &fakeDB{tag: pgconn.NewCommandTag("INSERT 0 1")}
+			require.NoErrorf(t, policypg.New(db).Record(t.Context(), recordWith(func(r *policy.Record) { r.Action.Attrs = attrs })), "%s", name)
+			assert.Equal(t, 1, db.execs, name)
+		}
+	})
 }
 
+// numbered holds a number encoding/json writes whatever it is.
 type numbered struct{ N json.Number }
-
-type embedsNumbered struct{ numbered }
-
-// tagged has fields encoding/json writes and fields it does not, each of them
-// empty.
-type tagged struct {
-	Shown   json.Number `json:"shown"`
-	Skipped json.Number `json:"-"`
-	Omitted json.Number `json:"omitted,omitempty"`
-	Zeroed  json.Number `json:"zeroed,omitzero"`
-	hidden  json.Number
-}
-
-// selfWriting writes itself, whatever it holds.
-type selfWriting struct{ N json.Number }
-
-func (selfWriting) MarshalJSON() ([]byte, error) { return []byte(`{"written":true}`), nil }
 
 func TestStore_ARecordThatCanNeverBeStoredIsToldFromADatabaseThatFailed(t *testing.T) {
 	// What the server says about the record's own content or size is something no
@@ -423,10 +493,7 @@ func TestStore_ARecordThatCanNeverBeStoredIsToldFromADatabaseThatFailed(t *testi
 		}
 		// A name too large to be an entry in the index on the rule: it does not
 		// compress, since it is a hash of each of its own pieces.
-		var long strings.Builder
-		for i := range 400 {
-			fmt.Fprintf(&long, "%x", sha256.Sum256([]byte{byte(i), byte(i >> 8)}))
-		}
+		long := hashed(400)
 
 		for _, tt := range []struct {
 			name   string
@@ -435,7 +502,7 @@ func TestStore_ARecordThatCanNeverBeStoredIsToldFromADatabaseThatFailed(t *testi
 		}{
 			{"a number past the server's range", func(r *policy.Record) { r.Action.Attrs["n"] = json.Number("1e131072") }, "22003"},
 			{"a value nested too deeply", func(r *policy.Record) { r.Action.Attrs["deep"] = deep }, "54001"},
-			{"a rule name too large for its index", func(r *policy.Record) { r.Decision.Rule = long.String() }, "54000"},
+			{"a rule name too large for its index", func(r *policy.Record) { r.Decision.Rule = long }, "54000"},
 		} {
 			err := store.Record(ctx, recordWith(tt.change))
 			require.Errorf(t, err, "%s", tt.name)

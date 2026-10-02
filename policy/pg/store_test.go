@@ -11,11 +11,13 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -317,6 +319,8 @@ func TestStore_AtIsStoredAndReadInUTCToTheMicrosecond(t *testing.T) {
 		{"nanoseconds below a microsecond are dropped", base.Add(123456789 * time.Nanosecond), base.Add(123456 * time.Microsecond)},
 		{"just under a microsecond is dropped, not rounded up", base.Add(999 * time.Nanosecond), base},
 		{"the zero time", time.Time{}, time.Time{}},
+		{"the last microsecond of year 9999", time.Date(9999, 12, 31, 23, 59, 59, 999999000, time.UTC), time.Date(9999, 12, 31, 23, 59, 59, 999999000, time.UTC)},
+		{"the last nanosecond of year 9999, which is dropped to the microsecond", time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC), time.Date(9999, 12, 31, 23, 59, 59, 999999000, time.UTC)},
 	}
 	store, pool := openStore(t)
 	ctx := t.Context()
@@ -469,7 +473,8 @@ func TestStore_ListFilters(t *testing.T) {
 		{"a rule nobody wrote", policypg.Filter{Rule: "No such rule"}, []string{}},
 		{"a filter and a limit", policypg.Filter{Effect: policy.Ask, Limit: 2}, []string{"n:5", "n:2"}},
 		{"a limit alone", policypg.Filter{Limit: 3}, []string{"n:6", "n:5", "n:4"}},
-		{"filters match exactly, without regard to case", policypg.Filter{Kind: "PAY"}, []string{}},
+		{"filters match exactly, and so case-sensitively", policypg.Filter{Kind: "PAY"}, []string{}},
+		{"a rule is matched case-sensitively too", policypg.Filter{Rule: "payment above the limit"}, []string{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -640,4 +645,76 @@ func TestStore_InvalidUTF8IsReplacedInJSONAndRefusedInText(t *testing.T) {
 	var n int
 	require.NoError(t, pool.QueryRow(ctx, `select count(*) from `+policypg.Table).Scan(&n))
 	assert.Equal(t, 1, n, "only the first record is on the log")
+}
+
+func TestStore_AnIndexIsKeptWhateverTheColumnHolds(t *testing.T) {
+	store, _ := openStore(t)
+	ctx := t.Context()
+	indexes := []int{math.MinInt32, -1, 0, 1, math.MaxInt32}
+	for n, index := range indexes {
+		rec := sample("k", base.Add(time.Duration(n)*time.Second))
+		rec.Decision.Index = index
+		require.NoError(t, store.Record(ctx, rec))
+	}
+	got, err := store.List(ctx, policypg.Filter{})
+	require.NoError(t, err)
+	require.Len(t, got, len(indexes))
+	for n, rec := range got {
+		assert.Equal(t, indexes[len(indexes)-1-n], rec.Decision.Index)
+	}
+}
+
+// jsonb keeps a number as a numeric, which holds at most 131072 digits before
+// the point and 16383 after it; a number written with an exponent is held as it
+// expands. The package comment says so, and past either limit the record fails
+// as one that can never be stored.
+func TestStore_JSONBsNumberLimitsAreWhatTheDocumentationSays(t *testing.T) {
+	tests := []struct {
+		name      string
+		number    string
+		ok        bool
+		wantDigit int // the digits read back, when the spelling changes
+	}{
+		{"131072 digits before the point", strings.Repeat("9", 131072), true, 0},
+		{"131073 digits before the point", strings.Repeat("9", 131073), false, 0},
+		{"16383 digits after the point", "0." + strings.Repeat("1", 16383), true, 0},
+		{"16384 digits after the point", "0." + strings.Repeat("1", 16384), false, 0},
+		{"an exponent that fills the limit before the point", "1e131071", true, 131072},
+		{"an exponent past it", "1e131072", false, 0},
+		{"an exponent that fills the limit after the point", "1e-16383", true, 16385},
+		{"an exponent past it, after the point", "1e-16384", false, 0},
+	}
+	store, pool := openStore(t)
+	ctx := t.Context()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := store.Record(ctx, policy.Record{
+				At:       base,
+				Action:   policy.Action{Kind: tt.name, Attrs: map[string]any{"n": json.Number(tt.number)}},
+				Decision: policy.Decision{Effect: policy.Allow},
+			})
+			if !tt.ok {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, policy.ErrUnrecordable)
+				var pgErr *pgconn.PgError
+				require.ErrorAs(t, err, &pgErr)
+				assert.Equal(t, "22003", pgErr.Code)
+				return
+			}
+			require.NoError(t, err)
+			got, err := store.List(ctx, policypg.Filter{Kind: tt.name})
+			require.NoError(t, err)
+			require.Len(t, got, 1)
+			n, ok := got[0].Action.Attrs["n"].(json.Number)
+			require.True(t, ok)
+			if tt.wantDigit > 0 {
+				assert.Len(t, n.String(), tt.wantDigit)
+			} else {
+				assert.Equal(t, tt.number, n.String())
+			}
+		})
+	}
+	var n int
+	require.NoError(t, pool.QueryRow(ctx, `select count(*) from `+policypg.Table).Scan(&n))
+	assert.Equal(t, 4, n, "the four that fit")
 }

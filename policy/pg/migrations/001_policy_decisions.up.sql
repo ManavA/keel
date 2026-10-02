@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS policy_decisions (
     policy_version TEXT NOT NULL DEFAULT ''
 );
 
--- List reads newest first, optionally narrowed by effect or rule.
+-- List reads newest first, optionally narrowed by effect or rule. The rule index
+-- is in that order within a rule, so a filter on one reads only its rows.
 CREATE INDEX IF NOT EXISTS policy_decisions_decided_idx ON policy_decisions (decided_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS policy_decisions_rule_idx ON policy_decisions (rule, id DESC);
+CREATE INDEX IF NOT EXISTS policy_decisions_rule_idx ON policy_decisions (rule, decided_at DESC, id DESC);
