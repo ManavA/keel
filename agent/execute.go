@@ -273,7 +273,11 @@ func (x *execution) loop(run Run) (ending, error) {
 
 		changes, children, err := x.read()
 		if err != nil {
-			return x.broke(run, err)
+			// A read cut off by a request to cancel the run is made again.
+			if end, err := x.broke(run, err); end != going {
+				return end, err
+			}
+			continue
 		}
 		run = changes.Run
 		// Claim took a run of an agent registered here, and no agent is ever
@@ -459,9 +463,11 @@ func (x *execution) judge(run Run, def Definition, st Step) (ending, error) {
 		var err error
 		decision, err = x.e.opts.Guard.Decide(x.work, act)
 		switch {
-		case err == nil:
 		case x.work.Err() != nil:
+			// The lease is gone, the run is being cancelled or the drain ran
+			// out. Whatever the guard said, nothing is done about it.
 			return x.halted(run, false)
+		case err == nil:
 		case errors.Is(err, ErrPermanent):
 			// No retry will get this decision recorded, and a call whose
 			// decision is on no record is not run.
@@ -662,7 +668,7 @@ func (x *execution) spawn(run Run, tool Tool, st Step) (ending, error) {
 	switch {
 	case err != nil:
 		return x.broke(run, fmt.Errorf("start the child run of step %d: %w", st.Seq, err))
-	case child.ParentID != run.ID || child.ParentSeq != st.Seq:
+	case child.ParentID != run.ID:
 		// A run somebody started with this step's key. It is not this run's
 		// child, and its end would never wake this run.
 		return x.settle(run, st, StepCompleted, "delegation refused: its key belongs to another run", Usage{})
@@ -839,6 +845,9 @@ func (x *execution) cancelChildren(run Run, status Status, reason string) error 
 
 	var before *Cursor
 	for {
+		if cause := x.interrupted(); cause != nil {
+			return cause
+		}
 		children, err := x.e.store.ListRuns(x.work, RunFilter{ParentID: run.ID, Before: before, Limit: maxListLimit})
 		if err != nil {
 			return err
@@ -894,15 +903,10 @@ func (x *execution) fail(run Run, failure error, longest bool) (ending, error) {
 	}
 	wait := x.e.opts.RetryMax
 	if !longest {
-		wait = x.e.opts.RetryBase
+		wait = min(x.e.opts.RetryBase, wait)
 		for range number - 1 {
-			if wait > x.e.opts.RetryMax/2 {
-				wait = x.e.opts.RetryMax
-				break
-			}
-			wait *= 2
+			wait = min(2*wait, x.e.opts.RetryMax)
 		}
-		wait = min(wait, x.e.opts.RetryMax)
 	}
 	ctx, cancel := x.last()
 	defer cancel()
@@ -968,7 +972,6 @@ func (x *execution) cut(run Run, cause error, toolRunning bool) (ending, error) 
 	case x.step.Err() == nil:
 		return x.lost(run, cause)
 	case toolRunning:
-		x.letGo()
 		x.e.log.WarnContext(x.step, "agent: a tool was still running when the drain ran out; nothing is written and the lease is left to lapse",
 			"run", run.ID, "agent", run.Agent)
 		return endedUnwritten, cause
@@ -979,7 +982,6 @@ func (x *execution) cut(run Run, cause error, toolRunning bool) (ending, error) 
 // lost ends an execution whose lease another process took: it writes nothing
 // more, and does not give the run back, which is no longer its to give.
 func (x *execution) lost(run Run, err error) (ending, error) {
-	x.letGo()
 	x.e.log.WarnContext(x.step, "agent: the run was lost to another worker; nothing more is written",
 		"run", run.ID, "agent", run.Agent, "error", err)
 	return endedUnwritten, err
@@ -990,8 +992,12 @@ func (x *execution) lost(run Run, err error) (ending, error) {
 // the next, and the lease lapsing gives the run to an execution that makes
 // it again.
 func (x *execution) unwritten(run Run, err error) (ending, error) {
-	x.letGo()
-	if errors.Is(err, ErrLeaseLost) {
+	switch {
+	case x.released():
+		// The lease had gone, and the write failed for it or under a
+		// context that ended with it.
+		return x.lost(run, errors.Join(x.cause, err))
+	case errors.Is(err, ErrLeaseLost):
 		return x.lost(run, err)
 	}
 	x.e.log.WarnContext(x.step, "agent: an execution could not let its run go; the lease is left to lapse",

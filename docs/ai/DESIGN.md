@@ -3359,13 +3359,15 @@ a reply are appended in the same transaction that stores the reply, in the
 order the model wrote them, as `proposed`. Each then moves on its own:
 
 ```
-proposed ──► blocked                           the guard said no
+proposed ──► blocked                           the guard said no, or no decision could be had or kept
 proposed ──► waiting ──► declined              a person said no, or the approval lapsed
 proposed ──► waiting ──► started ──► completed a person said yes
 proposed ──► started ──► completed             allowed
 proposed ──► started ──► waiting ──► completed a delegating tool: waiting on the child run
 started  ──► waiting ──► started | declined    an at-most-once call was interrupted; a person decides
+started  ──► started                           a call that was interrupted is made again
 proposed ──► completed                         malformed arguments, or a tool this build does not have
+started  ──► completed                         a delegation that cannot be made
 ```
 
 `blocked`, `declined` and `completed` are final and carry the `Result`
@@ -3393,11 +3395,18 @@ every rebuild:
 | Outcome | `Result` | `IsError` |
 |---|---|---|
 | Blocked | `blocked by policy: <rule>` | true |
-| Declined | `declined by <who>: <reason>` | true |
+| Blocked because the tool's own `Action` function panicked | `blocked by policy: the tool's Action function panicked`: the row above, with that text recorded as the rule | true |
+| Blocked because the guard's decision could never be recorded | `not run: the policy decision could not be recorded`, with `decision could not be recorded` as the rule | true |
+| Declined | `declined by <who>: <reason>`, and `declined by <who>` when no reason was given | true |
 | Approval lapsed | `declined: approval expired` | true |
-| Interrupted and not run again | `interrupted before its result was recorded; not run again` | true |
+| Approval cancelled | `declined: approval cancelled` | true |
+| Interrupted, and a person declined to have it run again | `interrupted before its result was recorded; not run again: declined by <who>: <reason>`, the reason left out as above | true |
+| Interrupted, and the question lapsed or was cancelled | `interrupted before its result was recorded; not run again` | true |
 | Malformed arguments | `arguments were not valid JSON` | true |
-| Tool missing from this build | `tool is not available` | true |
+| Tool missing from this build, whether the call was proposed, interrupted or approved | `tool is not available` | true |
+| Delegation by a run already at `MaxDepth` | `delegation refused: the depth limit of <n> is reached` | true |
+| Delegation to an agent not registered in this process | `delegation refused: agent "<name>" is not registered` | true |
+| Delegation whose key a run that is not this step's child already has | `delegation refused: its key belongs to another run` | true |
 | Tool returned an error | The error's text, made fit for the journal: bytes that are not UTF-8 replaced by U+FFFD, then NUL bytes removed | true |
 | Tool panicked | `tool panicked` (the value and the stack go to the log) | true |
 | Tool ran past its timeout | `timed out after <duration>` | true |
@@ -3406,6 +3415,18 @@ every rebuild:
 | Result not valid UTF-8 | `result is not valid UTF-8` | true |
 | Result with a NUL byte | `result contains a NUL byte` | true |
 | Child run failed or was cancelled | `<agent> <status>: <reason>` | true |
+
+The result of an interrupted call says so first, whoever answered and
+however: the model has to be told that the call may have happened. A blocked
+step always records `Block` as its decision, whatever the guard wrote for an
+effect the engine does not know, and one that no guard rule blocked records
+the engine's own text as its rule, as `RuleNoGuard` and `RuleToolApproval`
+are recorded.
+
+Every text the executor writes that it did not make itself goes through the
+same repair as a tool's error: a guard's rule, who declined and why, a
+model's or a guard's error on a run that is given back or ended, a run's
+output, a child's input, and who cancelled a parent and why.
 
 A result is stored as text, and Postgres refuses, in a text column, a NUL
 byte and bytes that are not UTF-8. A write refused for its content would be
@@ -3425,19 +3446,29 @@ letting it go. It is a loop with no state of its own:
 
 ```
 claim the run                                      (Store.Claim)
-if its Failures have reached MaxFailures: finish it as abandoned, and stop
 start a heartbeat
+if its Failures have reached MaxFailures: finish it as abandoned, and stop
 loop:
-    read the journal, the run's approvals, and its children
+    if the lease is lost: stop, writing nothing
+    if the caller's context has ended: yield, and stop
+    read the run, its whole journal, its approvals, and its children
     decide the next action from them               (next, a pure function)
     perform it, which writes to the journal
 until the run is finished, parked or yielded
-stop the heartbeat
+stop the heartbeat, then make the write that lets the run go
 ```
 
 Because each turn of the loop starts from the journal, resuming after a
 crash is not a special path. A new execution reads what is there and decides
 the same way.
+
+A turn reads everything again and carries nothing across a write: the run,
+every step from the first and every approval in one call,
+`Changes(ctx, runID, 0)`, and each child a waiting step names with a
+`GetRun` of its own. `ListApprovals` and `ListRuns` are not used for this,
+since each stops at 200. A journal whose steps are not numbered from 1
+without a gap is not acted on: the execution ends as failed. A child that
+is not there is left out, and `next` gives the run up for it.
 
 `next` is the unexported heart of the engine, in `plan.go`:
 
@@ -3579,20 +3610,42 @@ limit on failed executions ends it with the same message; parking it
 instead would leave nothing to wake it. A budget does not replace
 `actYield`, and cancellation still comes first.
 
-How each action is performed:
+How each action is performed. In every row a write is made before the thing
+it records is done, so that whatever stops an execution, the journal never
+holds less than what happened:
 
 | Action | Store calls | Notes |
 |---|---|---|
-| `actModel` | `BeginModel`, then `Model.Generate`, then `CompleteModel` | The request is the snapshot plus `conversation`. An error wrapping `ErrPermanent` finishes the run failed; any other error ends the execution as failed (6.6) |
-| `actJudge` | `UpdateStep` or `RequestApproval` | A malformed call, or a tool not registered in this process, goes `proposed → completed` with the fixed error result. Otherwise the tool's `Action` is built, `AttrAgent`, `AttrTool`, `AttrRun` and `AttrSeq` are set where absent, and the `Guard` is asked. `Block`, or an effect that is none of the three: `proposed → blocked`. `Ask`, or `Allow` on a tool with `Approval`: `RequestApproval`, cause `guard` or `tool`. `Allow`: `proposed → started`, recording the decision and rule, and then, in the same action, the tool is run as `actRun` runs it, or the child started as `actSpawn` starts it. A `Guard` error ends the execution as failed; it is never read as allow or as block |
-| `actRun` | `UpdateStep` twice | First the step is started: `waiting → started` for an approved step, or `started → started` for an interrupted one, which counts the new attempt. Then the tool runs with a context bounded by its `Timeout` and the time left in the budget, inside a `recover`. Then `started → completed` with the result. An error wrapping `ErrTransient` skips the last write and ends the execution as failed, so the call is made again with the same `Key` |
-| `actSpawn` | `CreateRun`, `UpdateStep` | The child's `Key` is the step's idempotency key, so asked twice it is created once. Its input is the call's arguments, its depth one more than the parent's, and its cost limit as 6.9 says. Then `started → waiting` with `ChildRunID`. A depth past `MaxDepth`, or an agent not registered, completes the step with an error instead |
+| `actModel` | `BeginModel`, then `Model.Generate`, then `CompleteModel` | The request is the snapshot plus `conversation`, from the same read; `MaxTokens` is the snapshot's, and a zero is left for the `Model` to bound, as `app.AgentModel` does. The call is given a context that ends when what is left of the time budget runs out: a call cut off that way finishes the run failed with `ReasonTimeBudget`, since tried again it would be cut off again. An error wrapping `ErrPermanent` finishes the run failed, `ReasonError`, with the error's text; any other error ends the execution as failed (6.6). A reply whose `Stop` is none of the six is not stored: it is a permanent error. The reply is stored with the assistant's role, whatever role its model wrote on it |
+| `actJudge` | `UpdateStep` or `RequestApproval` | A malformed call, or a tool not registered in this process, goes `proposed → completed` with the fixed error result, and the guard is not asked. Otherwise the tool's `Action` is built, `AttrAgent`, `AttrTool`, `AttrRun` and `AttrSeq` are set where absent, and the `Guard` is asked. A panic in the tool's own `Action` function is recovered and blocks the call, the guard unasked. `Block`, or an effect that is none of the three: `proposed → blocked`, recording `Block`. `Ask`, or `Allow` on a tool with `Approval`: `RequestApproval`, cause `guard` or `tool`, the step recording `Ask` and the guard's rule, or `Allow` and `RuleToolApproval`. `Allow`: `proposed → started`, recording the decision and rule, and then, in the same action, the tool is run as `actRun` runs it, or the child started as `actSpawn` starts it; if the caller's context ended while the guard was asked, nothing is started and the run is yielded. A `Guard` error wrapping `ErrPermanent` blocks the call with its fixed result (6.4) and the run goes on; any other `Guard` error ends the execution as failed with the step still `proposed`. No error is read as allow |
+| `actRun` | `UpdateStep` twice | First the step is started: `waiting → started` for an approved step, or `started → started` for an interrupted one, which counts the new attempt. A tool this build does not have is then completed with `tool is not available`. A delegating tool's child is started as `actSpawn` starts it. Otherwise the tool runs under `invoke`, with a timeout that is the smaller of its `Timeout` and the time left in the budget, and then `started → completed` with the result. An error wrapping `ErrTransient` skips the last write and ends the execution as failed, so the call is made again with the same `Key` |
+| `actSpawn` | `CreateRun`, `UpdateStep` | The child's `Key` is the step's idempotency key, so asked twice it is created once. Its input is the call's arguments, its depth one more than the parent's, its snapshot its own agent's, and its cost limit as 6.9 says. Then `started → waiting` with `ChildRunID`. A run already at `MaxDepth`, an agent not registered, or a key that a run which is not this step's child already has, completes the step with an error instead (6.4) |
 | `actCollect` | `UpdateStep` | `waiting → completed` with the child's output, or the fixed error result, and the child's `Usage`, which so counts against the parent's budget |
-| `actResolve` | `UpdateStep` | `waiting → declined` with the fixed result |
-| `actAsk` | `RequestApproval` | `From: StepStarted`, cause `interrupted`, rule `RuleInterrupted` |
-| `actPark` | `Park` | If `Park` reports false, something changed since the journal was read; the loop goes round again |
-| `actFinish` | `Finish` | For a run that fails or is cancelled, each child that has not ended is sent `RequestCancel` first |
-| `actYield` | `Yield` | The execution ends as one whose step failed (6.6), with `errmsg` as the error: `Yield{Failed: true}` with the back-off, or, when this is failure number `MaxFailures`, `Finish` as failed, `ReasonError`, with the same message. Nothing is written to the journal |
+| `actResolve` | `UpdateStep` | `waiting → declined` with the fixed result for the approval's status and cause (6.4) |
+| `actAsk` | `RequestApproval` | `From: StepStarted`, cause `interrupted`, rule `RuleInterrupted`, no decision, so the guard's answer stays on the step. The action is built again; if the tool's `Action` function panics, the person is asked all the same, and shown the call as a tool with no `Action` is described |
+| `actPark` | `Park` | The heartbeat is stopped first. If `Park` reports false, something changed since the journal was read: a new heartbeat is started and the loop goes round again. If it reports false twice with the run's `Rev` unchanged, nothing changed and nothing will, and the execution ends as failed |
+| `actFinish` | `Finish` | For a run that fails or is cancelled, each child that has not ended is sent `RequestCancel` first. The children are found by `ParentID`, not from the journal, since one created just before a crash is on no step; one that ended meanwhile (`ErrFinished`) is passed over; and because the request is not fenced, the lease is checked before each. If the children cannot be asked, the run is not finished |
+| `actYield` | `Yield` | The execution ends as one whose step failed (6.6), with `errmsg` as the error: `Yield{Failed: true}` with a wait of `RetryMax` from the first time, since it is most often an old worker meeting a newer build's journal and the usual wait would spend the failure limit in seconds; or, when this is failure number `MaxFailures`, `Finish` as failed, `ReasonError`, with the same message. Nothing is written to the journal |
+
+Either question to a person, `actJudge`'s or `actAsk`'s, can be handed back
+an approval that is not the one it asked for: the store returns the one
+already recorded for the step's attempt, and leaves the step where it was.
+Asking again would be handed it again, so the execution ends as failed.
+
+`Execute` returns the run as it stands with a nil error exactly when the run
+ended, whatever its status, or parked. Any other end returns the run with
+the reason: the failed step's error when the run was given back to be tried
+again, the context's when the caller stopped, `ErrLeaseLost` when another
+process took the run. `Tick` returns an error only for the pass itself, the
+store refusing to lapse approvals or to claim; how each execution ended is
+in its `Report`.
+
+A panic on the execution's own goroutine, in the `Model`, the `Guard` or
+the engine, is recovered, logged with its stack, and ends the execution as
+one whose step failed. A worker runs many runs, and one that panics must
+not take the others down. What a later execution finds is what a crash at
+that point would have left. A panic in a tool is recovered where the tool
+runs, as before, and is a result.
 
 A delegating tool is described to the `Guard` as
 `Action{Kind: "delegate", Target: <agent name>}` unless it has its own
@@ -3721,7 +3774,9 @@ execution does any of the run's work.
 It also reads `cancel_requested`. If the heartbeat finds the epoch has
 moved, or cannot reach the store for a whole `LeaseTTL`, it cancels the
 execution's context: the step in flight is abandoned and nothing more is
-written.
+written. A request to cancel ends the same context with another cause, and
+the heartbeat goes on: the step in flight is abandoned, and the run is the
+execution's to finish as cancelled.
 
 **Fencing.** `lease_epoch` rises by one on every claim. Every journal write
 is one transaction that begins by locking the run's row and comparing its
@@ -3752,23 +3807,61 @@ small fraction of `LeaseTTL` of each other. A clock that runs fast only
 costs work: its process may take a lease early, and fencing then stops the
 first holder from writing. No journal is corrupted by a wrong clock.
 
-**Letting go.** An execution ends in one of four ways:
+**Letting go.** An execution ends in one of six ways. Four of them are a
+write, and two are no write at all:
 
 | Ends by | Store call | Leaves the run |
 |---|---|---|
 | The run ended | `Finish` | Completed, failed or cancelled |
 | Nothing can proceed | `Park` | Waiting, with no lease |
-| Its context ended and the step in flight finished | `Yield` | Runnable, lease free |
-| A step failed | `Yield{Failed: true}` | Runnable, with one more failure and `NextAttemptAt` set to now plus `RetryBase` doubled per failure, capped at `RetryMax`. When this would be failure number `MaxFailures`, the run is finished as failed instead, `ReasonError`, with the step's error |
+| Its context ended and the step in flight finished | `Yield` | Runnable, lease free, with no failure counted and `NextAttemptAt` cleared |
+| A step failed | `Yield{Failed: true}` | Runnable, with one more failure and `NextAttemptAt` set to now plus `RetryBase` doubled per failure, capped at `RetryMax`: `RetryBase` after the first, twice that after the second. For `actYield` the wait is `RetryMax` from the first. When this would be failure number `MaxFailures`, the run is finished as failed instead, `ReasonError`, with the step's error |
+| The lease was lost | None | As its new holder leaves it. The execution writes nothing more and does not yield a run that is no longer its own |
+| The write that would have let the run go failed, or a tool was still running when the drain ran out | None | Runnable and still leased. Nothing is tried in place of the write: the lease lapses, and the execution that takes the run over, which counts a failure, makes it again |
+
+The failure count that decides between giving the run back and finishing it
+is read fresh from the store when a step fails, since a step that completed
+earlier in the same execution has reset it. A store error in the middle of
+an action is a step that failed, with what was being done as its error. An
+`ErrLeaseLost` from any write is the lease lost.
+
+The order at the end of an execution is always the same: why the held
+context ended is read, the heartbeat is stopped, and only then is the last
+write made, under the step's context. A `Finish`, a `Park` or a `Yield`
+gives the lease back, and a heartbeat that landed after one would find the
+lease gone and report it lost. The heartbeat is stopped on every path out
+of an execution, a panic included: one left running under a context that
+nothing cancels would extend the lease for the life of the process.
 
 Any step that completes resets `failures` to zero.
 
 **Shutdown.** `Work` stops claiming when its context is cancelled. A step
-in flight is not cancelled with it: the step's context is detached and
-given `DrainTimeout` to finish, so a model call that has already been paid
-for is recorded rather than thrown away. Then the run is yielded. After
-`DrainTimeout` the step is cancelled, nothing is written, and the lease is
-left to lapse.
+in flight is not cancelled with it: an execution's steps, its heartbeat and
+its store calls run under a context that is its caller's without its end,
+and that ends `DrainTimeout` after the caller's does. So a model call that
+has already been paid for is recorded rather than thrown away. No other
+action is begun once the caller's context has ended, a tool that the guard
+has just allowed included; the run is yielded, and no failure is counted,
+because a worker stopping is not something the run did. The same holds for
+`Execute` and `Tick` when the context they were given ends.
+
+After `DrainTimeout` the step is cancelled. What happens then depends on
+whether anything of it can still be running. A tool runs on a goroutine of
+its own and may not have stopped when told to, so nothing is written for
+its run and the lease is left to lapse: giving the run back would let
+another worker start the same call while this one is still making it. A
+model call or a guard call is made on the execution's own goroutine, so
+once it has returned nothing is running: nothing is recorded for it, and the
+run is yielded with no failure counted, under a context of its own with a
+few seconds to live, since the step's has ended. `Work` waits for those last
+writes, for no longer than that past `DrainTimeout`, and then returns; an
+execution stuck in a model that ignores its context is left behind, its
+heartbeat already stopped with the drain.
+
+`Work` lapses overdue approvals as it starts and then every `PollInterval`,
+as `Tick` does on every pass, so that `ApprovalTTL` means the same under
+either. `Tick` claims its runs first and then executes them at once, so a
+run its own pass made runnable waits for the next.
 
 ### 6.7 What a crash does at each point
 
@@ -5355,3 +5448,55 @@ them. These are written from the OpenAI provider's side.
     kept for the run that has ended cancelled (rejected: `EventRunCancelled`
     for both, which makes one type mean two things, and nothing at all, which
     leaves a subscriber no hint that a run is about to stop).
+
+**An execution writes before it acts, ends in one of six ways, and guesses at
+nothing it could not record.** The executor is the loop of 6.5 with every
+write ahead of the thing it records, and the rest are the choices 6.5 and 6.6
+left open. A write that would have let the run go and failed is followed by
+no other (rejected: giving the run back as failed in its place, since a write
+that failed says nothing good about the next, and at the failure limit the
+write in its place is the same `Finish`); the lease lapses and the next
+execution makes it. When a worker is stopped and the drain runs out, a run
+whose tool may still be running is left to its lease, and a run whose model
+or guard call has returned is yielded with no failure counted (rejected:
+letting both lapse, as 6.6 first read, which costs every run caught in a
+model call a lease's wait and a failure for a call that is no longer running;
+and yielding both, which lets another worker start a call this one is still
+making). No action is begun once the caller's context has ended, and a
+stopping worker counts no failure against a run. A panic on the execution's
+own goroutine ends the execution as failed (rejected: letting it take the
+process down, which ends every other run the worker holds and leaves the run
+that panicked to do the same to the next `MaxFailures` workers before it is
+abandoned). A guard error that is permanent blocks the call, with the
+engine's own text as the rule, and one in the tool's own `Action` function
+likewise (rejected: completing the step with an error as a malformed call is,
+when it is governance that refused it and a reader of the timeline looks for
+what was blocked; and trying again for ever). A reply whose `Stop` the engine
+does not know is refused before it is stored, as a permanent error (rejected:
+storing it, which `next` then gives up once for every execution allowed). A
+model call is bounded by what is left of the time budget, and cut off by it
+the run fails with `ReasonTimeBudget` (rejected: a failed execution, since a
+model step's time is counted only when it completes and the retry would be
+given the same time). `Request.MaxTokens` is the snapshot's, and a zero is
+left for the `Model` to bound (rejected: a default of the engine's own, which
+knows no model and would put a number on every one). The count of failures is
+read from the store when a step fails (rejected: the count the turn began
+with, which a step completed since has reset, so that a run could be ended
+for failures it no longer has). A run that fails or is cancelled asks its
+children to stop before it is finished, and is not finished if they cannot be
+asked (rejected: after, which a crash in between turns into children nothing
+will ever stop). A child is asked to stop in its parent's canceller's name
+with the parent named in the reason, and in the parent run's own name when
+the parent failed. A run found under a step's key that is not that step's
+child is an error result (rejected: waiting on it, when its end wakes
+nobody). `Execute`'s error is nil exactly when the run ended or parked
+(rejected: nil whenever a write was made, which hides from a caller that the
+run it was handed back is one to try again). A step that is declined is
+announced as `EventStepCompleted`, the event of a step that has its final
+result; a child that is created as `EventRunStarted`; a child asked to stop as
+`EventRunCancelRequested`. `Work` lapses overdue approvals every
+`PollInterval` (rejected: leaving that to `Tick`, under which `ApprovalTTL`
+does nothing in a service that runs `Work`, which is every service the design
+describes). `Tick` claims and then executes (rejected: executing each run as
+it is claimed, under which how many of a parent's children a pass picks up
+depends on the scheduler).

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -319,6 +320,8 @@ func TestWork_PicksUpARunStartedAfterItBegan(t *testing.T) {
 			tune:   func(o *agent.Options) { o.PollInterval = 3 * time.Second },
 		})
 		stop, done := f.working()
+		// More polls that find nothing than the worker has slots.
+		time.Sleep(6 * 3 * time.Second)
 		synctest.Wait()
 
 		started := f.start("clerk", "what is the total?")
@@ -360,6 +363,8 @@ func TestWork_CancelledWhileIdleReturnsAtOnce(t *testing.T) {
 
 		require.ErrorIs(t, err, context.Canceled)
 		assert.Zero(t, time.Since(began), "an idle worker waits for nothing")
+		assert.Empty(t, f.logs.at(slog.LevelWarn), "and has nothing to warn of")
+		assert.Empty(t, f.logs.at(slog.LevelError))
 	})
 }
 
@@ -482,7 +487,11 @@ func TestWork_OnCancelAStepInFlightFinishesAndIsRecordedAndTheRunIsYielded(t *te
 				agenttest.Use(agenttest.Call("call-1", "slow", `{}`), agenttest.Call("call-2", "slow", `{}`)),
 				agenttest.Say("never said by this worker"),
 			),
-			tune: func(o *agent.Options) { o.DrainTimeout = workDrain },
+			// One slot, so that the worker is waiting for it when it is stopped.
+			tune: func(o *agent.Options) {
+				o.DrainTimeout = workDrain
+				o.Concurrency = 1
+			},
 		})
 		started := f.start("clerk", "take your time")
 		stop, done := f.working()
@@ -706,5 +715,142 @@ func TestWork_AModelThatIgnoresItsContextIsLeftBehind(t *testing.T) {
 		assert.Equal(t, []string{"1 model started"}, f.journal(started.ID))
 		assert.Empty(t, got.LeaseOwner, "the run nobody took meanwhile is given back")
 		assert.Zero(t, got.Failures)
+	})
+}
+
+func TestWork_AModelCallThatFailsInsideTheDrainIsAFailureAndIsRecorded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		began, release := make(chan struct{}), make(chan struct{})
+		f := newExecFixture(t, execConfig{
+			defs: []agent.Definition{execClerk()},
+			model: execModelFunc(func(context.Context, agent.Request) (agent.Response, error) {
+				close(began)
+				<-release
+				return agent.Response{}, errors.New("rate limited")
+			}),
+			tune: func(o *agent.Options) { o.DrainTimeout = workDrain },
+		})
+		started := f.start("clerk", "what is the total?")
+		stop, done := f.working()
+		<-began
+
+		stop()
+		synctest.Wait()
+		close(release)
+		require.ErrorIs(t, <-done, context.Canceled)
+
+		got := f.run(started.ID)
+		assert.Equal(t, 1, got.Failures, "the model's own error is the run's failure, whenever it comes")
+		assert.Equal(t, "rate limited", got.Error)
+		assert.Empty(t, got.LeaseOwner)
+		require.NotNil(t, got.NextAttemptAt)
+	})
+}
+
+func TestWork_AModelThatIgnoresItsContextOverAStoreThatIgnoresItsOwn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		began, release := make(chan struct{}), make(chan struct{})
+		f := newExecFixture(t, execConfig{
+			defs: []agent.Definition{execClerk()},
+			model: execModelFunc(func(context.Context, agent.Request) (agent.Response, error) {
+				close(began)
+				<-release
+				return agenttest.Say("too late"), nil
+			}),
+			tune: func(o *agent.Options) { o.DrainTimeout = workDrain },
+			lax:  true,
+		})
+		started := f.start("clerk", "what is the total?")
+		stop, done := f.working()
+		<-began
+		stop()
+		require.ErrorIs(t, <-done, context.Canceled)
+
+		close(release)
+		synctest.Wait()
+
+		got := f.run(started.ID)
+		assert.Equal(t, []string{"1 model started"}, f.journal(started.ID),
+			"a reply that arrives after the drain ran out is not recorded, whatever the store would take")
+		assert.Zero(t, got.ModelCalls)
+		assert.Empty(t, got.LeaseOwner)
+		assert.Zero(t, got.Failures)
+	})
+}
+
+func TestWork_AStoreThatFailsIsLoggedAndTheWorkerGoesOn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var store *execHooked
+		f := newExecFixture(t, execConfig{
+			defs:   []agent.Definition{execClerk()},
+			script: agenttest.Replies(agenttest.Say("done")),
+			over:   hooked(&store),
+		})
+		store.claim = func(n int) error {
+			if n == 1 {
+				return errors.New("connection reset")
+			}
+			return nil
+		}
+		f.faults.FailBefore("ExpireApprovals", 1)
+		started := f.start("clerk", "hello")
+
+		stop, done := f.working()
+		synctest.Wait()
+
+		warned := f.logs.at(slog.LevelWarn)
+		require.Len(t, warned, 2)
+		assert.Contains(t, strings.Join(warned, "\n"), "agent: work: no run could be claimed error=connection reset")
+		assert.Contains(t, strings.Join(warned, "\n"), "agent: work: overdue approvals could not be lapsed error=agenttest: store fault")
+		assert.Equal(t, agent.StatusRunnable, f.run(started.ID).Status)
+
+		// The next poll goes through, and nothing more is logged.
+		time.Sleep(time.Second)
+		synctest.Wait()
+		assert.Equal(t, agent.StatusCompleted, f.run(started.ID).Status)
+		assert.Len(t, f.logs.at(slog.LevelWarn), 2)
+
+		stop()
+		require.ErrorIs(t, <-done, context.Canceled)
+	})
+}
+
+func TestWork_ACallCutOffByItsOwnShutdownIsNotLogged(t *testing.T) {
+	for _, op := range []string{"Claim", "ExpireApprovals"} {
+		t.Run(op, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newExecFixture(t, execConfig{defs: []agent.Definition{execClerk()}})
+				// The call is in flight when the worker is stopped.
+				f.wire.hold(op, func(ctx context.Context) { <-ctx.Done() })
+				stop, done := f.working()
+				synctest.Wait()
+
+				stop()
+
+				require.ErrorIs(t, <-done, context.Canceled)
+				assert.Empty(t, f.logs.at(slog.LevelWarn), "a call the shutdown cut off is not a store that failed")
+			})
+		})
+	}
+}
+
+func TestWork_ReturnsOnlyOnceItsLastCallToTheStoreHas(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newExecFixture(t, execConfig{defs: []agent.Definition{execClerk()}})
+		// A store that does not answer, and does not look at its context.
+		release := make(chan struct{})
+		f.wire.hold("ExpireApprovals", func(context.Context) { <-release })
+		stop, done := f.working()
+		synctest.Wait()
+
+		stop()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			require.Fail(t, "Work returned with a call to the store in flight", "%v", err)
+		default:
+		}
+		close(release)
+		require.ErrorIs(t, <-done, context.Canceled)
 	})
 }

@@ -56,19 +56,26 @@ type execConfig struct {
 	tune func(*agent.Options)
 	// over, when set, wraps the store the engine is given.
 	over func(agent.Store) agent.Store
+	// lax gives the engine a store that takes a call under a context that
+	// has ended, as MemoryStore does and a database driver does not.
+	lax bool
 }
 
 // execFixture is one engine, as one process is: over a store that can be
-// killed, a clock the test moves, and a bus and a log that keep what they are
-// given. Its rivals are other engines over the same store and clock.
+// killed and that refuses a call under a context that has ended, a clock the
+// test moves, and a bus and a log that keep what they are given. Its rivals
+// are other engines over the same store and clock.
 type execFixture struct {
 	t      *testing.T
 	engine *agent.Engine
 	memory *agent.MemoryStore
 	faults *agenttest.FaultStore
-	clock  *agenttest.Clock
-	bus    *engineBus
-	logs   *engineLogs
+	// wire is what the engine is given, around faults and under whatever a
+	// test wraps it in.
+	wire  *execWire
+	clock *agenttest.Clock
+	bus   *engineBus
+	logs  *engineLogs
 	// model is the scripted model, which every engine of a test shares, so
 	// that its requests are the run's whatever process sent them.
 	model  *agenttest.Model
@@ -112,7 +119,8 @@ func buildExecFixture(
 		number:  *engines,
 		engines: engines,
 	}
-	var store agent.Store = f.faults
+	f.wire = &execWire{inner: f.faults, lax: cfg.lax}
+	var store agent.Store = f.wire
 	if cfg.over != nil {
 		store = cfg.over(store)
 	}
@@ -1283,6 +1291,30 @@ func TestExecute_AModelError(t *testing.T) {
 		})
 	})
 
+	t.Run("a RetryBase above RetryMax waits RetryMax", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := newExecFixture(t, execConfig{
+				defs: []agent.Definition{execClerk()},
+				model: execModelFunc(func(context.Context, agent.Request) (agent.Response, error) {
+					return agent.Response{}, errors.New("rate limited")
+				}),
+				tune: func(o *agent.Options) {
+					o.RetryBase = 10 * time.Second
+					o.RetryMax = 5 * time.Second
+				},
+			})
+			started := f.start("clerk", "is order 7 paid?")
+
+			for failure := 1; failure <= 2; failure++ {
+				got, err := f.engine.Execute(t.Context(), started.ID)
+				require.Error(t, err)
+				require.NotNil(t, got.NextAttemptAt)
+				assert.Equal(t, f.clock.Now().Add(5*time.Second), *got.NextAttemptAt, "after failure %d", failure)
+				f.clock.Advance(5 * time.Second)
+			}
+		})
+	})
+
 	t.Run("the wait is capped at RetryMax", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			f := newExecFixture(t, execConfig{
@@ -1382,6 +1414,19 @@ func TestExecute_ChildRuns(t *testing.T) {
 				assert.Equal(t, agent.Allow, st.Decision)
 			}
 			assert.Len(t, f.model.Requests(), 1, "no child has run yet")
+
+			announced := map[string]bool{}
+			for _, published := range f.bus.published() {
+				if event := published.(agent.Event); event.Type == agent.EventRunStarted {
+					assert.False(t, announced[event.RunID], "run %s is announced once", event.RunID)
+					announced[event.RunID] = true
+					if child, ok := byID[event.RunID]; ok {
+						assert.Equal(t, "reviewer", event.Agent)
+						assert.Equal(t, child.CreatedAt, event.At)
+					}
+				}
+			}
+			assert.Len(t, announced, 4, "the run and each child it started")
 		})
 	})
 
@@ -1398,8 +1443,12 @@ func TestExecute_ChildRuns(t *testing.T) {
 				require.Equal(t, agent.StatusCompleted, child.Status)
 			}
 			require.Equal(t, agent.StatusRunnable, f.run(started.ID).Status, "a child that ends wakes its parent")
+			read := f.wire.made("GetRun")
 
 			got := f.execute(started.ID)
+
+			assert.Equal(t, 3+2+1+1, f.wire.made("GetRun")-read,
+				"each turn reads the children that waiting steps name and no others, and Execute reads the run back")
 
 			assert.Equal(t, agent.StatusCompleted, got.Status)
 			assert.Equal(t, "all three are reviewed", got.Output)
@@ -1855,6 +1904,213 @@ func TestExecute_APublisherThatFailsOrPanicsChangesNothing(t *testing.T) {
 	}
 }
 
+// errWire is what an execWire returns for the one call it is told to fail.
+var errWire = errors.New("the store failed this one call")
+
+// execWire is a store as a process reaches one over a wire, and every engine
+// of a fixture is given one. It refuses a call whose context has ended, as a
+// database driver does and MemoryStore does not, so a test fails when the
+// engine makes a call under a context that is dead. It can fail exactly one
+// call, the nth to arrive, before it reaches the store or after the store has
+// answered it, and go on working: a failure the process outlives, at any call
+// a test chooses. And it can hold a call of a named method up, or act once
+// the store has answered one.
+type execWire struct {
+	inner agent.Store
+
+	// lax makes it take a call under a context that has ended, as
+	// MemoryStore does.
+	lax bool
+
+	mu    sync.Mutex
+	calls int
+	// asked counts the calls by the name of their method.
+	asked map[string]int
+	// at is the call to fail, counted from 1, and none for zero. after says
+	// the store is reached first.
+	at    int
+	after bool
+	// holds are run, by the name of a Store method, as a call of it arrives,
+	// with the call's context. thens are run once the store has answered.
+	holds map[string]func(ctx context.Context)
+	thens map[string]func()
+	// spawns counts the child runs the store was asked to create.
+	spawns int
+}
+
+// failAt makes the nth call fail: before it reaches the store, or after the
+// store has answered it.
+func (s *execWire) failAt(n int, after bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.at, s.after = n, after
+}
+
+// hold sets what runs as a call of op arrives, and none for nil.
+func (s *execWire) hold(op string, run func(ctx context.Context)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.holds == nil {
+		s.holds = map[string]func(ctx context.Context){}
+	}
+	s.holds[op] = run
+}
+
+// then sets what runs once the store has answered a call of op.
+func (s *execWire) then(op string, run func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.thens == nil {
+		s.thens = map[string]func(){}
+	}
+	s.thens[op] = run
+}
+
+func (s *execWire) count() (calls, spawns int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, s.spawns
+}
+
+// made is how many calls of op have arrived, refused ones included.
+func (s *execWire) made(op string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.asked[op]
+}
+
+// total is how many calls have arrived, refused ones included.
+func (s *execWire) total() int {
+	calls, _ := s.count()
+	return calls
+}
+
+func wired[T any](ctx context.Context, s *execWire, op string, call func() (T, error)) (T, error) {
+	var zero T
+	s.mu.Lock()
+	s.calls++
+	if s.asked == nil {
+		s.asked = map[string]int{}
+	}
+	s.asked[op]++
+	due, after := s.calls == s.at, s.after
+	hold, then := s.holds[op], s.thens[op]
+	s.mu.Unlock()
+	if hold != nil {
+		hold(ctx)
+	}
+	if err := ctx.Err(); err != nil && !s.lax {
+		return zero, err
+	}
+	if due && !after {
+		return zero, errWire
+	}
+	got, err := call()
+	if then != nil {
+		then()
+	}
+	if due {
+		return zero, errWire
+	}
+	return got, err
+}
+
+func wiredErr(ctx context.Context, s *execWire, op string, call func() error) error {
+	_, err := wired(ctx, s, op, func() (struct{}, error) { return struct{}{}, call() })
+	return err
+}
+
+func (s *execWire) CreateRun(ctx context.Context, run agent.Run) (agent.Run, bool, error) {
+	type result struct {
+		run     agent.Run
+		created bool
+	}
+	if run.ParentID != "" {
+		s.mu.Lock()
+		s.spawns++
+		s.mu.Unlock()
+	}
+	got, err := wired(ctx, s, "CreateRun", func() (result, error) {
+		stored, created, err := s.inner.CreateRun(ctx, run)
+		return result{stored, created}, err
+	})
+	return got.run, got.created, err
+}
+
+func (s *execWire) GetRun(ctx context.Context, id string) (agent.Run, error) {
+	return wired(ctx, s, "GetRun", func() (agent.Run, error) { return s.inner.GetRun(ctx, id) })
+}
+
+func (s *execWire) ListRuns(ctx context.Context, f agent.RunFilter) ([]agent.Run, error) {
+	return wired(ctx, s, "ListRuns", func() ([]agent.Run, error) { return s.inner.ListRuns(ctx, f) })
+}
+
+func (s *execWire) Claim(ctx context.Context, req agent.ClaimRequest) (*agent.Run, error) {
+	return wired(ctx, s, "Claim", func() (*agent.Run, error) { return s.inner.Claim(ctx, req) })
+}
+
+func (s *execWire) Heartbeat(ctx context.Context, lease agent.Lease, now time.Time, ttl time.Duration) (bool, error) {
+	return wired(ctx, s, "Heartbeat", func() (bool, error) { return s.inner.Heartbeat(ctx, lease, now, ttl) })
+}
+
+func (s *execWire) Yield(ctx context.Context, lease agent.Lease, req agent.YieldRequest) error {
+	return wiredErr(ctx, s, "Yield", func() error { return s.inner.Yield(ctx, lease, req) })
+}
+
+func (s *execWire) Park(ctx context.Context, lease agent.Lease, req agent.ParkRequest) (bool, error) {
+	return wired(ctx, s, "Park", func() (bool, error) { return s.inner.Park(ctx, lease, req) })
+}
+
+func (s *execWire) Finish(ctx context.Context, lease agent.Lease, req agent.FinishRequest) error {
+	return wiredErr(ctx, s, "Finish", func() error { return s.inner.Finish(ctx, lease, req) })
+}
+
+func (s *execWire) Steps(ctx context.Context, runID string) ([]agent.Step, error) {
+	return wired(ctx, s, "Steps", func() ([]agent.Step, error) { return s.inner.Steps(ctx, runID) })
+}
+
+func (s *execWire) BeginModel(ctx context.Context, lease agent.Lease, seq int, now time.Time) error {
+	return wiredErr(ctx, s, "BeginModel", func() error { return s.inner.BeginModel(ctx, lease, seq, now) })
+}
+
+func (s *execWire) CompleteModel(ctx context.Context, lease agent.Lease, req agent.CompleteModelRequest) error {
+	return wiredErr(ctx, s, "CompleteModel", func() error { return s.inner.CompleteModel(ctx, lease, req) })
+}
+
+func (s *execWire) UpdateStep(ctx context.Context, lease agent.Lease, req agent.StepUpdate) error {
+	return wiredErr(ctx, s, "UpdateStep", func() error { return s.inner.UpdateStep(ctx, lease, req) })
+}
+
+func (s *execWire) RequestApproval(ctx context.Context, lease agent.Lease, req agent.ApprovalRequest) (agent.Approval, error) {
+	return wired(ctx, s, "RequestApproval", func() (agent.Approval, error) { return s.inner.RequestApproval(ctx, lease, req) })
+}
+
+func (s *execWire) GetApproval(ctx context.Context, id string) (agent.Approval, error) {
+	return wired(ctx, s, "GetApproval", func() (agent.Approval, error) { return s.inner.GetApproval(ctx, id) })
+}
+
+func (s *execWire) ListApprovals(ctx context.Context, f agent.ApprovalFilter) ([]agent.Approval, error) {
+	return wired(ctx, s, "ListApprovals", func() ([]agent.Approval, error) { return s.inner.ListApprovals(ctx, f) })
+}
+
+func (s *execWire) DecideApproval(ctx context.Context, req agent.DecideRequest) (agent.Approval, error) {
+	return wired(ctx, s, "DecideApproval", func() (agent.Approval, error) { return s.inner.DecideApproval(ctx, req) })
+}
+
+func (s *execWire) ExpireApprovals(ctx context.Context, now time.Time) (int, error) {
+	return wired(ctx, s, "ExpireApprovals", func() (int, error) { return s.inner.ExpireApprovals(ctx, now) })
+}
+
+func (s *execWire) RequestCancel(ctx context.Context, req agent.CancelRequest) error {
+	return wiredErr(ctx, s, "RequestCancel", func() error { return s.inner.RequestCancel(ctx, req) })
+}
+
+func (s *execWire) Changes(ctx context.Context, runID string, since int64) (agent.Changes, error) {
+	return wired(ctx, s, "Changes", func() (agent.Changes, error) { return s.inner.Changes(ctx, runID, since) })
+}
+
+var _ agent.Store = (*execWire)(nil)
+
 // execHooked is a store a test reaches into: it can change what the engine
 // reads, act as a call arrives or after the store has answered it, and
 // refuse one. It counts the heartbeats, the claims and the parks it is given.
@@ -1906,6 +2162,14 @@ func (s *execHooked) once(op string, run func()) {
 		s.after = map[string]func(){}
 	}
 	s.after[op] = run
+}
+
+// refusePark sets whether Park reports that there is nothing to wait for
+// without reaching the store, from the call after the one in flight.
+func (s *execHooked) refusePark(refused bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.parkRefused = refused
 }
 
 func (s *execHooked) count() (claims, beats, parks int) {
@@ -2289,6 +2553,7 @@ func TestExecute_Park(t *testing.T) {
 			assert.Equal(t, 1, got.Failures)
 			assert.Empty(t, got.LeaseOwner)
 			require.NotNil(t, got.NextAttemptAt)
+			assert.Equal(t, execStart.Add(time.Second), *got.NextAttemptAt)
 			assert.Empty(t, calls.of("refund"))
 			assert.Len(t, f.approvals(started.ID), 1, "and asks nothing new on the way round")
 		})
@@ -2359,7 +2624,8 @@ func TestExecute_TheKeeperIsStoppedBeforeTheWriteThatLetsTheRunGo(t *testing.T) 
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				if tc.ended {
-					cancel()
+					// The caller stops as soon as the run is claimed.
+					f.wire.then("Claim", cancel)
 				}
 
 				_, _ = f.engine.Execute(ctx, started.ID)
@@ -2457,14 +2723,17 @@ func (s *execPicky) RequestCancel(ctx context.Context, req agent.CancelRequest) 
 func TestExecute_WritesOnlyTextTheJournalCanHold(t *testing.T) {
 	// dirty is text with both things a text column refuses, and clean is what
 	// journalText makes of it.
-	const dirty, clean = "a\x00b \xff\xfe c", "ab � c"
+	const dirty, clean = "marked a\x00b \xff\xfe c", "marked ab \uFFFD c"
 	lookup := agenttest.Use(agenttest.Call("call-1", "lookup", `{"order":7}`))
 
 	for _, tc := range []struct {
 		name string
 		// arrange builds the scenario over the picky store and plays it.
 		arrange func(t *testing.T, over func(agent.Store) agent.Store)
-		// want is what the store must have been given.
+		// want is what the store must have been given, for text the engine
+		// was handed by a model or a guard. Text that reached the engine
+		// through the store has none: a store may have repaired it already,
+		// in a way of its own, and then all that is asked is that it arrived.
 		want string
 	}{
 		{
@@ -2503,7 +2772,6 @@ func TestExecute_WritesOnlyTextTheJournalCanHold(t *testing.T) {
 				})
 				f.execute(f.start("clerk", "hello").ID)
 			},
-			want: clean,
 		},
 		{
 			name: "a guard's error",
@@ -2572,19 +2840,17 @@ func TestExecute_WritesOnlyTextTheJournalCanHold(t *testing.T) {
 				require.NoError(t, err)
 				f.execute(started.ID)
 			},
-			want: "declined by " + clean + ": " + clean,
 		},
 		{
 			name: "a delegated call's arguments, which are the child's input",
 			arrange: func(t *testing.T, over func(agent.Store) agent.Store) {
-				call := agent.Call{ID: "call-1", Name: "review", Input: json.RawMessage("{\"doc\":\"\xff\xfe\"}")}
+				call := agent.Call{ID: "call-1", Name: "review", Input: json.RawMessage("{\"doc\":\"marked \xff\xfe\"}")}
 				f := newExecFixture(t, execConfig{
 					defs: []agent.Definition{execLead(), execReviewer()}, over: over,
 					script: agenttest.ByAgent(map[string]agenttest.Script{"lead": agenttest.Replies(agenttest.Use(call))}),
 				})
 				f.execute(f.start("lead", "hello").ID)
 			},
-			want: "{\"doc\":\"�\"}",
 		},
 		{
 			name: "who cancelled a run and why, passed on to its child",
@@ -2600,7 +2866,6 @@ func TestExecute_WritesOnlyTextTheJournalCanHold(t *testing.T) {
 				}))
 				f.execute(started.ID)
 			},
-			want: "parent run 00000000-0000-4000-8000-010000000001 was cancelled: " + clean,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2613,7 +2878,13 @@ func TestExecute_WritesOnlyTextTheJournalCanHold(t *testing.T) {
 
 				texts, refused := store.kept()
 				assert.Empty(t, refused, "the engine handed the store text it cannot hold")
-				assert.Contains(t, texts, tc.want)
+				if tc.want != "" {
+					assert.Contains(t, texts, tc.want)
+					return
+				}
+				assert.True(t, slices.ContainsFunc(texts, func(text string) bool {
+					return strings.Contains(text, "marked")
+				}), "the text reached the store: %q", texts)
 			})
 		})
 	}
@@ -2718,6 +2989,7 @@ func TestExecute_APanicOnTheExecutionsOwnGoroutineEndsItAsFailed(t *testing.T) {
 			assert.Equal(t, "the execution panicked: model exploded", got.Error)
 			assert.Empty(t, got.LeaseOwner, "the run is given back, and its keeper stopped")
 			require.NotNil(t, got.NextAttemptAt)
+			assert.Equal(t, execStart.Add(time.Second), *got.NextAttemptAt, "with the wait of any failed step")
 			assert.Equal(t, []string{"1 model started"}, f.journal(started.ID))
 			logged := f.logs.at(slog.LevelError)
 			require.Len(t, logged, 1)
@@ -2795,6 +3067,55 @@ func TestExecute_ARunAbandonedByEveryExecutionIsFinishedBeforeAnyWork(t *testing
 		assert.Equal(t, "run "+started.ID, child.CancelBy)
 		assert.Equal(t, fmt.Sprintf("parent run %s failed: abandoned", started.ID), child.CancelReason)
 		assert.Equal(t, "run.failed", f.events()[len(f.events())-1])
+	})
+}
+
+func TestExecute_ARunThatIsCancelledAsksEveryChildHoweverMany(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newExecFixture(t, execConfig{
+			defs:   []agent.Definition{execLead(), execReviewer()},
+			script: execLeadScript(execSummaries),
+		})
+		started := f.start("lead", "review the batch")
+		// More children than one listing holds, some of them created at the
+		// same instant, and one in every seven already ended.
+		const many = 451
+		ctx := t.Context()
+		for i := range many {
+			at := execStart.Add(time.Duration(i/3) * time.Second)
+			child, _, err := f.memory.CreateRun(ctx, agent.Run{
+				ID: execID(7, i+1), Agent: "reviewer", Status: agent.StatusRunnable, Input: "{}",
+				ParentID: started.ID, ParentSeq: 2, Depth: 1, CreatedAt: at, UpdatedAt: at,
+			})
+			require.NoError(t, err)
+			if i%7 == 0 {
+				claimed, err := f.memory.Claim(ctx, agent.ClaimRequest{
+					Owner: "worker-9", Agents: []string{"reviewer"}, RunID: child.ID, Now: at, TTL: execTTL,
+				})
+				require.NoError(t, err)
+				require.NoError(t, f.memory.Finish(ctx, claimed.Lease(), agent.FinishRequest{Status: agent.StatusCompleted, Now: at}))
+			}
+		}
+		require.NoError(t, f.engine.Cancel(ctx, started.ID, "ops@example.test", "wrong batch"))
+		f.bus.forget()
+
+		got := f.execute(started.ID)
+
+		require.Equal(t, agent.StatusCancelled, got.Status)
+		assert.Equal(t, 3, f.wire.made("ListRuns"), "a listing shorter than the limit is the last")
+		asked := 0
+		for i := range many {
+			child := f.run(execID(7, i+1))
+			if i%7 == 0 {
+				assert.False(t, child.CancelRequested, "child %d had ended", i+1)
+				continue
+			}
+			if assert.True(t, child.CancelRequested, "child %d", i+1) {
+				asked++
+			}
+		}
+		assert.Equal(t, many-many/7-1, asked)
+		assert.Len(t, f.events(), asked+1, "each request is announced once, and then the run's end")
 	})
 }
 
@@ -3130,7 +3451,9 @@ func TestExecute_AnInterruptedCallWhoseActionPanicsIsStillPutToAPerson(t *testin
 			return "charged", nil
 		})
 		charge.AtMostOnce = true
+		var described []int
 		charge.Action = func(in agent.Invocation) agent.Action {
+			described = append(described, in.Attempt)
 			if in.Attempt > 1 {
 				panic("no action for a second attempt")
 			}
@@ -3158,6 +3481,7 @@ func TestExecute_AnInterruptedCallWhoseActionPanicsIsStillPutToAPerson(t *testin
 		assert.Equal(t, "charge", approvals[0].Action.Target)
 		assert.Len(t, calls.of("charge"), 1)
 		assert.Len(t, guard.questions(), 1, "the guard is not asked about an interrupted call")
+		assert.Equal(t, []int{1, 2}, described, "an Action function is given the attempt that would be made")
 	})
 }
 
@@ -3184,6 +3508,8 @@ func TestExecute_AnApprovalHandedBackThatIsNotTheOneAskedForEndsTheExecutionAsFa
 
 		require.ErrorContains(t, err, "step 2 is proposed and already has approval "+execID(8, 8)+" for attempt 0, which is declined")
 		assert.Equal(t, 1, got.Failures)
+		require.NotNil(t, got.NextAttemptAt)
+		assert.Equal(t, execStart.Add(time.Second), *got.NextAttemptAt)
 		assert.Len(t, guard.questions(), 1, "it does not go round and ask again")
 		assert.NotContains(t, f.events(), "approval.requested 2")
 	})
@@ -3343,11 +3669,14 @@ func TestExecute_ALeaseLostWhileAToolRuns(t *testing.T) {
 
 			// The first process wakes, and its next heartbeat finds the lease
 			// gone.
+			asked := tk.first.wire.total()
 			time.Sleep(execHeartbeat)
 			synctest.Wait()
 			got := <-tk.outcome
 
 			require.ErrorIs(t, got.err, agent.ErrLeaseLost)
+			assert.Equal(t, 2, tk.first.wire.total()-asked,
+				"the heartbeat that found the lease gone and Execute's read of the run: no write is so much as tried")
 			assert.Same(t, agent.ErrLeaseLost, <-tk.stopped, "the tool's context ends with the lost lease as its cause")
 			assert.Equal(t, before, tk.first.state(tk.run.ID),
 				"the first worker writes nothing: no result, no failure, and it does not give back a run that is not its own")
@@ -3374,10 +3703,13 @@ func TestExecute_ALeaseLostWhileAToolRuns(t *testing.T) {
 			before := tk.first.state(tk.run.ID)
 
 			// No time passes, so no heartbeat has told the first worker.
+			asked := tk.first.wire.total()
 			close(tk.release1)
 			got := <-tk.outcome
 
 			require.ErrorIs(t, got.err, agent.ErrLeaseLost)
+			assert.Equal(t, 2, tk.first.wire.total()-asked,
+				"the write the store refused and Execute's read of the run: once told, the worker tries nothing more")
 			assert.Equal(t, before, tk.first.state(tk.run.ID))
 			assert.Empty(t, tk.first.steps(tk.run.ID)[1].Result, "the first worker's result is on no record")
 
@@ -3866,7 +4198,25 @@ func TestExecute_AStoreThatFailsAndGoesOnWorking(t *testing.T) {
 }
 
 func TestExecute_ACallersContextThatEnds(t *testing.T) {
-	t.Run("before the execution: the run is given back untouched, with no failure", func(t *testing.T) {
+	t.Run("before the claim: nothing is claimed", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := newExecFixture(t, execConfig{
+				defs:   []agent.Definition{execClerk()},
+				script: agenttest.Replies(agenttest.Say("done")),
+			})
+			started := f.start("clerk", "hello")
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			got, err := f.engine.Execute(ctx, started.ID)
+
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Zero(t, got)
+			assert.Equal(t, started, f.run(started.ID))
+		})
+	})
+
+	t.Run("as the run is claimed: it is given back untouched, with no failure", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			f := newExecFixture(t, execConfig{
 				defs:   []agent.Definition{execClerk()},
@@ -3875,7 +4225,7 @@ func TestExecute_ACallersContextThatEnds(t *testing.T) {
 			started := f.start("clerk", "hello")
 			why := errors.New("the service is stopping")
 			ctx, cancel := context.WithCancelCause(t.Context())
-			cancel(why)
+			f.wire.then("Claim", func() { cancel(why) })
 
 			got, err := f.engine.Execute(ctx, started.ID)
 
@@ -4398,13 +4748,11 @@ func (seen crashSeen) check(t *testing.T) {
 
 // crashUninterrupted plays the batch with nothing going wrong, and returns
 // what it came to and how many store calls its process made.
-func crashUninterrupted(t *testing.T, over func(agent.Store) agent.Store, calls func(*execFixture) int) (want crashOutcome, total int) {
+func crashUninterrupted(t *testing.T, calls func(*execFixture) int) (want crashOutcome, total int) {
 	t.Helper()
 	synctest.Test(t, func(t *testing.T) {
 		recorded := &execCalls{}
-		cfg := crashConfig(recorded)
-		cfg.over = over
-		f := newExecFixture(t, cfg)
+		f := newExecFixture(t, crashConfig(recorded))
 		require.NoError(t, crashDrive(f))
 		want = f.crashOutcome(recorded)
 		total = calls(f)
@@ -4425,7 +4773,7 @@ func crashUninterrupted(t *testing.T, over func(agent.Store) agent.Store, calls 
 }
 
 func TestExecute_CrashAtEveryStoreCall(t *testing.T) {
-	want, total := crashUninterrupted(t, nil, func(f *execFixture) int { return f.faults.Calls() })
+	want, total := crashUninterrupted(t, func(f *execFixture) int { return f.faults.Calls() })
 	require.Greater(t, total, 50, "the batch makes enough store calls for the sweep to mean something")
 
 	points := 0
@@ -4467,153 +4815,9 @@ func TestExecute_CrashAtEveryStoreCall(t *testing.T) {
 	seen.check(t)
 }
 
-// errNth is what an execNth returns for the one call it fails.
-var errNth = errors.New("the store failed this one call")
-
-// execNth is a store that fails exactly one call, the nth to arrive, before
-// it reaches the store or after the store has answered it, and goes on
-// working: a failure the process outlives, at any call a test chooses.
-type execNth struct {
-	inner agent.Store
-
-	mu    sync.Mutex
-	calls int
-	at    int
-	after bool
-	// spawns counts the child runs the store was asked to create.
-	spawns int
-}
-
-func (s *execNth) count() (calls, spawns int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.calls, s.spawns
-}
-
-func nth[T any](s *execNth, call func() (T, error)) (T, error) {
-	var zero T
-	s.mu.Lock()
-	s.calls++
-	due := s.calls == s.at
-	after := s.after
-	s.mu.Unlock()
-	if due && !after {
-		return zero, errNth
-	}
-	got, err := call()
-	if due {
-		return zero, errNth
-	}
-	return got, err
-}
-
-func nthErr(s *execNth, call func() error) error {
-	_, err := nth(s, func() (struct{}, error) { return struct{}{}, call() })
-	return err
-}
-
-func (s *execNth) CreateRun(ctx context.Context, run agent.Run) (agent.Run, bool, error) {
-	type result struct {
-		run     agent.Run
-		created bool
-	}
-	if run.ParentID != "" {
-		s.mu.Lock()
-		s.spawns++
-		s.mu.Unlock()
-	}
-	got, err := nth(s, func() (result, error) {
-		stored, created, err := s.inner.CreateRun(ctx, run)
-		return result{stored, created}, err
-	})
-	return got.run, got.created, err
-}
-
-func (s *execNth) GetRun(ctx context.Context, id string) (agent.Run, error) {
-	return nth(s, func() (agent.Run, error) { return s.inner.GetRun(ctx, id) })
-}
-
-func (s *execNth) ListRuns(ctx context.Context, f agent.RunFilter) ([]agent.Run, error) {
-	return nth(s, func() ([]agent.Run, error) { return s.inner.ListRuns(ctx, f) })
-}
-
-func (s *execNth) Claim(ctx context.Context, req agent.ClaimRequest) (*agent.Run, error) {
-	return nth(s, func() (*agent.Run, error) { return s.inner.Claim(ctx, req) })
-}
-
-func (s *execNth) Heartbeat(ctx context.Context, lease agent.Lease, now time.Time, ttl time.Duration) (bool, error) {
-	return nth(s, func() (bool, error) { return s.inner.Heartbeat(ctx, lease, now, ttl) })
-}
-
-func (s *execNth) Yield(ctx context.Context, lease agent.Lease, req agent.YieldRequest) error {
-	return nthErr(s, func() error { return s.inner.Yield(ctx, lease, req) })
-}
-
-func (s *execNth) Park(ctx context.Context, lease agent.Lease, req agent.ParkRequest) (bool, error) {
-	return nth(s, func() (bool, error) { return s.inner.Park(ctx, lease, req) })
-}
-
-func (s *execNth) Finish(ctx context.Context, lease agent.Lease, req agent.FinishRequest) error {
-	return nthErr(s, func() error { return s.inner.Finish(ctx, lease, req) })
-}
-
-func (s *execNth) Steps(ctx context.Context, runID string) ([]agent.Step, error) {
-	return nth(s, func() ([]agent.Step, error) { return s.inner.Steps(ctx, runID) })
-}
-
-func (s *execNth) BeginModel(ctx context.Context, lease agent.Lease, seq int, now time.Time) error {
-	return nthErr(s, func() error { return s.inner.BeginModel(ctx, lease, seq, now) })
-}
-
-func (s *execNth) CompleteModel(ctx context.Context, lease agent.Lease, req agent.CompleteModelRequest) error {
-	return nthErr(s, func() error { return s.inner.CompleteModel(ctx, lease, req) })
-}
-
-func (s *execNth) UpdateStep(ctx context.Context, lease agent.Lease, req agent.StepUpdate) error {
-	return nthErr(s, func() error { return s.inner.UpdateStep(ctx, lease, req) })
-}
-
-func (s *execNth) RequestApproval(ctx context.Context, lease agent.Lease, req agent.ApprovalRequest) (agent.Approval, error) {
-	return nth(s, func() (agent.Approval, error) { return s.inner.RequestApproval(ctx, lease, req) })
-}
-
-func (s *execNth) GetApproval(ctx context.Context, id string) (agent.Approval, error) {
-	return nth(s, func() (agent.Approval, error) { return s.inner.GetApproval(ctx, id) })
-}
-
-func (s *execNth) ListApprovals(ctx context.Context, f agent.ApprovalFilter) ([]agent.Approval, error) {
-	return nth(s, func() ([]agent.Approval, error) { return s.inner.ListApprovals(ctx, f) })
-}
-
-func (s *execNth) DecideApproval(ctx context.Context, req agent.DecideRequest) (agent.Approval, error) {
-	return nth(s, func() (agent.Approval, error) { return s.inner.DecideApproval(ctx, req) })
-}
-
-func (s *execNth) ExpireApprovals(ctx context.Context, now time.Time) (int, error) {
-	return nth(s, func() (int, error) { return s.inner.ExpireApprovals(ctx, now) })
-}
-
-func (s *execNth) RequestCancel(ctx context.Context, req agent.CancelRequest) error {
-	return nthErr(s, func() error { return s.inner.RequestCancel(ctx, req) })
-}
-
-func (s *execNth) Changes(ctx context.Context, runID string, since int64) (agent.Changes, error) {
-	return nth(s, func() (agent.Changes, error) { return s.inner.Changes(ctx, runID, since) })
-}
-
-var _ agent.Store = (*execNth)(nil)
-
 func TestExecute_AStoreFailureAtEveryStoreCall(t *testing.T) {
-	// failing builds the wrapper that fails call at, or none for zero.
-	failing := func(into **execNth, at int, after bool) func(agent.Store) agent.Store {
-		return func(inner agent.Store) agent.Store {
-			*into = &execNth{inner: inner, at: at, after: after}
-			return *into
-		}
-	}
-	var counted *execNth
-	want, total := crashUninterrupted(t, failing(&counted, 0, false), func(*execFixture) int {
-		calls, _ := counted.count()
+	want, total := crashUninterrupted(t, func(f *execFixture) int {
+		calls, _ := f.wire.count()
 		return calls
 	})
 	require.Greater(t, total, 50)
@@ -4626,10 +4830,8 @@ func TestExecute_AStoreFailureAtEveryStoreCall(t *testing.T) {
 			t.Run(fmt.Sprintf("failed %s call %d", flavour, n), func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					calls := &execCalls{}
-					cfg := crashConfig(calls)
-					var store *execNth
-					cfg.over = failing(&store, n, flavour == "after")
-					f := newExecFixture(t, cfg)
+					f := newExecFixture(t, crashConfig(calls))
+					f.wire.failAt(n, flavour == "after")
 
 					// The same process goes on. What it cannot claim yet it
 					// waits for: a back-off, or a lease it left to lapse.
@@ -4640,7 +4842,7 @@ func TestExecute_AStoreFailureAtEveryStoreCall(t *testing.T) {
 						ended, acted, err = crashRound(f)
 						switch {
 						case err != nil:
-							require.ErrorIs(t, err, errNth, "the one failure is the store's")
+							require.ErrorIs(t, err, errWire, "the one failure is the store's")
 							failures++
 						case !ended && !acted:
 							f.clock.Advance(time.Minute)
@@ -4650,7 +4852,7 @@ func TestExecute_AStoreFailureAtEveryStoreCall(t *testing.T) {
 					require.LessOrEqual(t, failures, 1, "one store failure fails one call of the engine at most")
 
 					assert.Empty(t, f.crashReport(calls, want, nil, 1))
-					_, spawns := store.count()
+					_, spawns := f.wire.count()
 					seen.note(f, calls, spawns > 1)
 				})
 			})
@@ -4658,4 +4860,627 @@ func TestExecute_AStoreFailureAtEveryStoreCall(t *testing.T) {
 	}
 	t.Logf("failed the store at %d points: before and after each of the %d store calls of the uninterrupted batch", points, total)
 	seen.check(t)
+}
+
+func TestExecute_APanicThatEscapesTheExecutionStillStopsItsKeeper(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var store *execHooked
+		f := newExecFixture(t, execConfig{
+			defs: []agent.Definition{execClerk()},
+			model: execModelFunc(func(context.Context, agent.Request) (agent.Response, error) {
+				panic("model exploded")
+			}),
+			over: hooked(&store),
+		})
+		started := f.start("clerk", "hello")
+		// The store panics too, as the failure is being recorded.
+		f.wire.hold("GetRun", func(context.Context) { panic("store exploded") })
+
+		assert.PanicsWithValue(t, "store exploded", func() { _, _ = f.engine.Execute(t.Context(), started.ID) })
+
+		f.wire.hold("GetRun", nil)
+		f.pass(3 * execHeartbeat)
+		_, beats, _ := store.count()
+		assert.Zero(t, beats, "no keeper is left extending the lease of a run nobody is executing")
+		got := f.run(started.ID)
+		assert.Equal(t, "worker-1", got.LeaseOwner)
+		assert.Equal(t, execStart.Add(execTTL), *got.LeaseExpiresAt, "the lease lapses, and another worker takes the run")
+	})
+}
+
+func TestExecute_AnExecutionThatLearnsBetweenTwoActionsThatItsLeaseIsGoneBeginsNoOther(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := &execCalls{}
+		guard := &execGuard{}
+		f := newExecFixture(t, execConfig{
+			defs:  []agent.Definition{execClerk(calls.tool("lookup", nil), calls.tool("refund", nil))},
+			guard: guard,
+			script: agenttest.Replies(
+				agenttest.Use(agenttest.Call("call-1", "lookup", `{}`), agenttest.Call("call-2", "refund", `{}`)),
+				agenttest.Say("never said by this worker"),
+			),
+		})
+		started := f.start("clerk", "refund order 7")
+		// As the first call's result is recorded, the process is paused past
+		// its lease, another takes the run, and the heartbeat says so.
+		taken, asked := false, 0
+		f.wire.then("UpdateStep", func() {
+			if taken || f.steps(started.ID)[1].Status != agent.StepCompleted {
+				return
+			}
+			taken = true
+			f.clock.Advance(execTTL)
+			_, err := f.memory.Claim(t.Context(), agent.ClaimRequest{
+				Owner: "worker-9", Agents: []string{"clerk"}, RunID: started.ID, Now: f.clock.Now(), TTL: execTTL,
+			})
+			assert.NoError(t, err)
+			time.Sleep(execHeartbeat)
+			synctest.Wait()
+			asked = f.wire.total()
+		})
+
+		_, err := f.engine.Execute(t.Context(), started.ID)
+
+		require.ErrorIs(t, err, agent.ErrLeaseLost)
+		require.True(t, taken)
+		assert.Len(t, guard.questions(), 1, "the guard is not asked about the next call by a worker that knows the run is not its own")
+		assert.Equal(t, 1, f.wire.total()-asked, "Execute's read of the run, and no other call so much as tried")
+		assert.Equal(t, []string{"1 model completed", "2 lookup completed", "3 refund proposed"}, f.journal(started.ID))
+		assert.Equal(t, "worker-9", f.run(started.ID).LeaseOwner)
+		assert.Empty(t, calls.of("refund"))
+	})
+}
+
+func TestExecute_ACallInFlightWhenTheLeaseIsLostIsCutOff(t *testing.T) {
+	// Each of these is something an execution does while it works: a call to
+	// the store, the model or the guard. Whichever is in flight when another
+	// process takes the run is cut off by its context, with the lost lease as
+	// the cause, and the execution writes nothing more. The last two are made
+	// only by an execution that ends a run with children, which the second
+	// execution of the batch does.
+	for _, tc := range []struct {
+		op     string
+		second bool
+		// forever gives the run no time limit, so that its model call has no
+		// deadline of the budget's.
+		forever bool
+	}{
+		{op: "Changes"}, {op: "BeginModel"}, {op: "Generate"}, {op: "Generate", forever: true},
+		{op: "CompleteModel"}, {op: "Decide"},
+		{op: "UpdateStep"}, {op: "RequestApproval"}, {op: "CreateRun"}, {op: "GetRun"},
+		{op: "ListRuns", second: true}, {op: "RequestCancel", second: true},
+	} {
+		name := tc.op
+		if tc.forever {
+			name += ", for a run with no time limit"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var f *execFixture
+				var started agent.Run
+				cut := make(chan error, 1)
+				armed, after := false, 0
+				// inFlight is the call, held up until its context ends or an
+				// hour has passed. Meanwhile the process is as one paused
+				// past its lease: another takes the run, and the heartbeat
+				// says so.
+				inFlight := func(ctx context.Context) {
+					if !armed {
+						return
+					}
+					armed = false
+					f.clock.Advance(execTTL)
+					_, err := f.memory.Claim(t.Context(), agent.ClaimRequest{
+						Owner: "worker-9", Agents: []string{"lead"}, RunID: started.ID, Now: f.clock.Now(), TTL: execTTL,
+					})
+					assert.NoError(t, err)
+					select {
+					case <-ctx.Done():
+						cut <- context.Cause(ctx)
+					case <-time.After(time.Hour):
+						cut <- nil
+					}
+					after = f.wire.total()
+				}
+
+				calls := &execCalls{}
+				lead := execLead()
+				lead.Tools = append(lead.Tools, calls.tool("lookup", nil), calls.tool("send", nil))
+				if tc.forever {
+					lead.Limits = agent.Limits{MaxDuration: -1}
+				}
+				script := agenttest.NewModel(agenttest.ByAgent(map[string]agenttest.Script{
+					"lead": agenttest.Replies(agenttest.Use(
+						agenttest.Call("call-1", "lookup", `{}`),
+						agenttest.Call("call-2", "send", `{}`),
+						agenttest.Call("call-3", "review", `{"doc":1}`),
+					)),
+				}))
+				answers := &execGuard{answers: map[string]agent.Decision{"send": {Effect: agent.Ask, Rule: "ask-first"}}}
+				f = newExecFixture(t, execConfig{
+					defs: []agent.Definition{lead, execReviewer()},
+					model: execModelFunc(func(ctx context.Context, req agent.Request) (agent.Response, error) {
+						if tc.op == "Generate" {
+							inFlight(ctx)
+						}
+						return script.Generate(ctx, req)
+					}),
+					guard: agenttest.GuardFunc(func(ctx context.Context, a agent.Action) (agent.Decision, error) {
+						if tc.op == "Decide" {
+							inFlight(ctx)
+						}
+						return answers.Decide(ctx, a)
+					}),
+				})
+				started = f.start("lead", "run the batch")
+				f.wire.hold(tc.op, inFlight)
+				if tc.second {
+					require.Equal(t, agent.StatusWaiting, f.execute(started.ID).Status)
+					require.NoError(t, f.engine.Cancel(t.Context(), started.ID, "ops@example.test", "wrong batch"))
+				}
+				armed = true
+
+				_, err := f.engine.Execute(t.Context(), started.ID)
+
+				require.False(t, armed, "the execution made the call")
+				assert.Same(t, agent.ErrLeaseLost, <-cut, "the call's context ends when the lease is lost, and says so")
+				require.ErrorIs(t, err, agent.ErrLeaseLost)
+				got := f.run(started.ID)
+				assert.Equal(t, "worker-9", got.LeaseOwner, "the run is not given back by a worker that lost it")
+				assert.Equal(t, 1, got.Failures, "and no failure is recorded but the takeover's")
+				for _, child := range f.children(started.ID) {
+					assert.False(t, child.CancelRequested)
+				}
+				assert.Equal(t, 1, f.wire.total()-after,
+					"once the call is cut off the worker asks the store for nothing but the run Execute returns")
+			})
+		})
+	}
+}
+
+func TestExecute_AWaitingStepWhoseChildIsNotThereGivesTheRunUp(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var store *execHooked
+		f := newExecFixture(t, execConfig{
+			defs: []agent.Definition{execLead(), execReviewer()},
+			script: agenttest.ByAgent(map[string]agenttest.Script{
+				"lead":     agenttest.Replies(agenttest.Use(agenttest.Call("call-1", "review", `{"doc":1}`))),
+				"reviewer": execSummaries,
+			}),
+			over: hooked(&store),
+		})
+		started := f.start("lead", "review the batch")
+		f.execute(started.ID)
+		f.execute(f.steps(started.ID)[1].ChildRunID)
+		// The step names a run no store has.
+		missing := execID(9, 9)
+		store.changes = func(c *agent.Changes) {
+			for i := range c.Steps {
+				if c.Steps[i].ChildRunID != "" {
+					c.Steps[i].ChildRunID = missing
+				}
+			}
+		}
+
+		got, err := f.engine.Execute(t.Context(), started.ID)
+
+		require.ErrorContains(t, err, "step 2 waits on child run "+missing+", which is not among the run's children")
+		assert.Equal(t, agent.StatusRunnable, got.Status, "a run that parked on a child nobody can find would never be woken")
+		assert.Equal(t, 1, got.Failures)
+		require.NotNil(t, got.NextAttemptAt)
+		assert.Equal(t, execStart.Add(time.Minute), *got.NextAttemptAt, "the planner's give-up, with the longest wait")
+		assert.Equal(t, []string{"1 model completed", "2 review waiting"}, f.journal(started.ID))
+	})
+}
+
+func TestExecute_ARunThatCannotBeReadBackIsAnError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newExecFixture(t, execConfig{
+			defs:   []agent.Definition{execClerk()},
+			script: agenttest.Replies(agenttest.Say("done")),
+		})
+		started := f.start("clerk", "hello")
+		// The one read of the run this execution makes is Execute's, of the
+		// run it returns.
+		f.faults.FailBefore("GetRun", 1)
+
+		got, err := f.engine.Execute(t.Context(), started.ID)
+
+		require.ErrorIs(t, err, agenttest.ErrFault)
+		require.ErrorContains(t, err, "read it back")
+		assert.Zero(t, got)
+		assert.Equal(t, agent.StatusCompleted, f.run(started.ID).Status, "the execution itself went well")
+	})
+}
+
+func TestExecute_TheDrainRunsOut(t *testing.T) {
+	const drain = 3 * time.Second
+
+	t.Run("while a result is being recorded: once it is, the run is given back", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			calls := &execCalls{}
+			f := newExecFixture(t, execConfig{
+				defs: []agent.Definition{execClerk(calls.tool("lookup", nil))},
+				script: agenttest.Replies(
+					agenttest.Use(agenttest.Call("call-1", "lookup", `{}`)),
+					agenttest.Say("never said by this execution"),
+				),
+				tune: func(o *agent.Options) { o.DrainTimeout = drain },
+			})
+			started := f.start("clerk", "hello")
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			// The caller stops as the result is written, and the store takes
+			// longer than the drain to say that it was.
+			f.wire.then("UpdateStep", func() {
+				if f.steps(started.ID)[1].Status == agent.StepCompleted {
+					cancel()
+					time.Sleep(drain + time.Second)
+				}
+			})
+
+			got, err := f.engine.Execute(ctx, started.ID)
+
+			require.ErrorIs(t, err, agent.ErrDrained)
+			assert.Equal(t, []string{"1 model completed", "2 lookup completed"}, f.journal(started.ID))
+			assert.Empty(t, got.LeaseOwner, "no tool is running, so the run is given back")
+			assert.Zero(t, got.Failures)
+			assert.Nil(t, got.NextAttemptAt)
+		})
+	})
+
+	t.Run("while a store call is in flight: the run is given back", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := newExecFixture(t, execConfig{
+				defs:   []agent.Definition{execClerk()},
+				script: agenttest.Replies(agenttest.Say("never said by this execution")),
+				tune:   func(o *agent.Options) { o.DrainTimeout = drain },
+			})
+			started := f.start("clerk", "hello")
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			// The store does not answer until the call's context ends.
+			f.wire.hold("BeginModel", func(held context.Context) {
+				cancel()
+				<-held.Done()
+			})
+			at := time.Now()
+
+			got, err := f.engine.Execute(ctx, started.ID)
+
+			require.ErrorIs(t, err, agent.ErrDrained)
+			assert.Equal(t, drain, time.Since(at))
+			assert.Empty(t, got.LeaseOwner)
+			assert.Zero(t, got.Failures, "a call the shutdown cut off is not the run's failure")
+			assert.Empty(t, f.journal(started.ID))
+		})
+	})
+
+	t.Run("while the guard is asked: the run is given back, and the step stays proposed", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			calls := &execCalls{}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			f := newExecFixture(t, execConfig{
+				defs: []agent.Definition{execClerk(calls.tool("refund", nil))},
+				guard: agenttest.GuardFunc(func(asked context.Context, _ agent.Action) (agent.Decision, error) {
+					cancel()
+					<-asked.Done()
+					return agent.Decision{}, asked.Err()
+				}),
+				script: agenttest.Replies(agenttest.Use(agenttest.Call("call-1", "refund", `{}`))),
+				tune:   func(o *agent.Options) { o.DrainTimeout = drain },
+			})
+			started := f.start("clerk", "refund order 7")
+
+			got, err := f.engine.Execute(ctx, started.ID)
+
+			require.ErrorIs(t, err, agent.ErrDrained)
+			assert.Equal(t, []string{"1 model completed", "2 refund proposed"}, f.journal(started.ID))
+			assert.Empty(t, got.LeaseOwner)
+			assert.Zero(t, got.Failures)
+			assert.Empty(t, calls.of("refund"))
+		})
+	})
+}
+
+func TestExecute_ParkRefusedAtOneRevisionAndThenAtAnotherIsNotASpin(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := &execCalls{}
+		var store *execHooked
+		f := newExecFixture(t, execConfig{
+			defs:  []agent.Definition{execClerk(calls.tool("refund", nil))},
+			guard: &execGuard{answers: map[string]agent.Decision{"refund": {Effect: agent.Ask, Rule: "ask-first"}}},
+			script: agenttest.Replies(agenttest.Use(
+				agenttest.Call("call-1", "refund", `{"order":7}`),
+				agenttest.Call("call-2", "refund", `{"order":8}`),
+				agenttest.Call("call-3", "refund", `{"order":9}`),
+			)),
+			over: hooked(&store),
+		})
+		started := f.start("clerk", "refund three orders")
+		// Twice the run is about to park and a person declines one of the
+		// calls first, which the store answers by refusing the park. The
+		// third time nothing has changed, and the run parks.
+		store.refusePark(true)
+		parks := 0
+		store.on("Park", func() {
+			parks++
+			if parks > 2 {
+				return
+			}
+			_, err := f.engine.Decline(t.Context(), f.approvals(started.ID)[parks-1].ID, "ops@example.test", "not this one")
+			assert.NoError(t, err)
+			store.refusePark(parks < 2)
+		})
+
+		got := f.execute(started.ID)
+
+		assert.Equal(t, agent.StatusWaiting, got.Status, "each refusal came with a change, so none of them is a spin")
+		assert.Zero(t, got.Failures)
+		assert.Equal(t, 3, parks)
+		assert.Equal(t, []string{"1 model completed", "2 refund declined", "3 refund declined", "4 refund waiting"},
+			f.journal(started.ID))
+	})
+}
+
+func TestExecute_ACallInFlightWhenCancellationIsRequestedIsCutOffAndTheRunIsCancelled(t *testing.T) {
+	// The same calls as when a lease is lost. A request to cancel ends the
+	// call's context too, with its own cause, and then the run is the
+	// execution's to finish.
+	for _, op := range []string{
+		"Changes", "BeginModel", "Generate", "CompleteModel", "Decide",
+		"UpdateStep", "RequestApproval", "CreateRun", "GetRun",
+	} {
+		t.Run(op, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var f *execFixture
+				var started agent.Run
+				cut := make(chan error, 1)
+				armed := false
+				inFlight := func(ctx context.Context) {
+					if !armed {
+						return
+					}
+					armed = false
+					assert.NoError(t, f.engine.Cancel(t.Context(), started.ID, "ops@example.test", "wrong batch"))
+					select {
+					case <-ctx.Done():
+						cut <- context.Cause(ctx)
+					case <-time.After(time.Hour):
+						cut <- nil
+					}
+				}
+
+				calls := &execCalls{}
+				lead := execLead()
+				lead.Tools = append(lead.Tools, calls.tool("lookup", nil), calls.tool("send", nil))
+				script := agenttest.NewModel(agenttest.ByAgent(map[string]agenttest.Script{
+					"lead": agenttest.Replies(agenttest.Use(
+						agenttest.Call("call-1", "lookup", `{}`),
+						agenttest.Call("call-2", "send", `{}`),
+						agenttest.Call("call-3", "review", `{"doc":1}`),
+					)),
+				}))
+				answers := &execGuard{answers: map[string]agent.Decision{"send": {Effect: agent.Ask, Rule: "ask-first"}}}
+				f = newExecFixture(t, execConfig{
+					defs: []agent.Definition{lead, execReviewer()},
+					model: execModelFunc(func(ctx context.Context, req agent.Request) (agent.Response, error) {
+						if op == "Generate" {
+							inFlight(ctx)
+						}
+						return script.Generate(ctx, req)
+					}),
+					guard: agenttest.GuardFunc(func(ctx context.Context, a agent.Action) (agent.Decision, error) {
+						if op == "Decide" {
+							inFlight(ctx)
+						}
+						return answers.Decide(ctx, a)
+					}),
+				})
+				started = f.start("lead", "run the batch")
+				f.wire.hold(op, inFlight)
+				armed = true
+
+				got, err := f.engine.Execute(t.Context(), started.ID)
+
+				require.False(t, armed, "the execution made the call")
+				assert.Same(t, agent.ErrCancelRequested, <-cut, "the call's context ends when cancellation is requested, and says so")
+				require.NoError(t, err)
+				assert.Equal(t, agent.StatusCancelled, got.Status, "the execution that was told finishes the run")
+				assert.Empty(t, got.LeaseOwner)
+				assert.Zero(t, got.Failures)
+				for _, child := range f.children(started.ID) {
+					assert.True(t, child.CancelRequested, "a child already started is asked to stop")
+				}
+			})
+		})
+	}
+}
+
+func TestExecute_ALastWriteRefusedForALostLeaseIsALostLeaseAndNoMoreIsTried(t *testing.T) {
+	for _, tc := range []struct {
+		op    string
+		reply agent.Response
+		err   error
+	}{
+		{op: "Finish", reply: agenttest.Say("done")},
+		{op: "Park", reply: agenttest.Use(agenttest.Call("call-1", "send", `{}`))},
+		{op: "Yield", err: errors.New("rate limited")},
+	} {
+		t.Run(tc.op, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				calls := &execCalls{}
+				send := calls.tool("send", nil)
+				send.Approval = true
+				f := newExecFixture(t, execConfig{
+					defs: []agent.Definition{execClerk(send)},
+					model: execModelFunc(func(context.Context, agent.Request) (agent.Response, error) {
+						return tc.reply, tc.err
+					}),
+				})
+				started := f.start("clerk", "hello")
+				// Another process takes the run as the write is on its way. The
+				// keeper has been stopped by then, so only the store can say.
+				asked := 0
+				f.wire.hold(tc.op, func(context.Context) {
+					f.clock.Advance(execTTL)
+					_, err := f.memory.Claim(t.Context(), agent.ClaimRequest{
+						Owner: "worker-9", Agents: []string{"clerk"}, RunID: started.ID, Now: f.clock.Now(), TTL: execTTL,
+					})
+					assert.NoError(t, err)
+					asked = f.wire.total()
+				})
+
+				got, err := f.engine.Execute(t.Context(), started.ID)
+
+				require.ErrorIs(t, err, agent.ErrLeaseLost)
+				assert.Equal(t, "worker-9", got.LeaseOwner)
+				assert.Equal(t, agent.StatusRunnable, got.Status)
+				assert.Equal(t, 1, f.wire.total()-asked, "Execute's read of the run, and no other call")
+				warned := f.logs.at(slog.LevelWarn)
+				require.NotEmpty(t, warned)
+				assert.Contains(t, warned[len(warned)-1], "agent: the run was lost to another worker; nothing more is written")
+			})
+		})
+	}
+}
+
+func TestExecute_OverAStoreThatIgnoresItsContext(t *testing.T) {
+	// MemoryStore takes a call whatever has become of its context. Over such
+	// a store nothing stops an execution that has been told to stop but its
+	// own look at its hold.
+
+	t.Run("a worker that lost the run while reading it does not go looking for its children", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := newExecFixture(t, execConfig{
+				defs:   []agent.Definition{execLead(), execReviewer()},
+				script: execLeadScript(execSummaries),
+				lax:    true,
+			})
+			started := f.start("lead", "review the batch")
+			require.Equal(t, agent.StatusWaiting, f.execute(started.ID).Status)
+			require.NoError(t, f.engine.Cancel(t.Context(), started.ID, "ops@example.test", "wrong batch"))
+			taken := false
+			f.wire.hold("Changes", func(context.Context) {
+				if taken {
+					return
+				}
+				taken = true
+				f.clock.Advance(execTTL)
+				_, err := f.memory.Claim(t.Context(), agent.ClaimRequest{
+					Owner: "worker-9", Agents: []string{"lead"}, RunID: started.ID, Now: f.clock.Now(), TTL: execTTL,
+				})
+				assert.NoError(t, err)
+				time.Sleep(execHeartbeat)
+				synctest.Wait()
+			})
+			listed := f.wire.made("ListRuns")
+
+			_, err := f.engine.Execute(t.Context(), started.ID)
+
+			require.ErrorIs(t, err, agent.ErrLeaseLost)
+			assert.Equal(t, listed, f.wire.made("ListRuns"), "the children are not so much as listed")
+			for _, child := range f.children(started.ID) {
+				assert.False(t, child.CancelRequested, "child %s", child.ID)
+			}
+			assert.Equal(t, "worker-9", f.run(started.ID).LeaseOwner)
+		})
+	})
+
+	t.Run("a worker that loses the run between two children asks nothing of the second", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			f := newExecFixture(t, execConfig{
+				defs:   []agent.Definition{execLead(), execReviewer()},
+				script: execLeadScript(execSummaries),
+				lax:    true,
+			})
+			started := f.start("lead", "review the batch")
+			require.Equal(t, agent.StatusWaiting, f.execute(started.ID).Status)
+			require.NoError(t, f.engine.Cancel(t.Context(), started.ID, "ops@example.test", "wrong batch"))
+			f.wire.then("RequestCancel", func() {
+				f.wire.then("RequestCancel", nil)
+				f.clock.Advance(execTTL)
+				_, err := f.memory.Claim(t.Context(), agent.ClaimRequest{
+					Owner: "worker-9", Agents: []string{"lead"}, RunID: started.ID, Now: f.clock.Now(), TTL: execTTL,
+				})
+				assert.NoError(t, err)
+				time.Sleep(execHeartbeat)
+				synctest.Wait()
+			})
+			asked := f.wire.made("RequestCancel")
+
+			_, err := f.engine.Execute(t.Context(), started.ID)
+
+			require.ErrorIs(t, err, agent.ErrLeaseLost)
+			assert.Equal(t, 1, f.wire.made("RequestCancel")-asked)
+			marked := 0
+			for _, child := range f.children(started.ID) {
+				if child.CancelRequested {
+					marked++
+				}
+			}
+			assert.Equal(t, 1, marked, "the child asked before the run was lost, and no other")
+			assert.Equal(t, agent.StatusRunnable, f.run(started.ID).Status)
+		})
+	})
+
+	t.Run("a reply that arrives after cancellation was requested is not recorded", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			began, release := make(chan struct{}), make(chan struct{})
+			f := newExecFixture(t, execConfig{
+				defs: []agent.Definition{execClerk()},
+				model: execModelFunc(func(context.Context, agent.Request) (agent.Response, error) {
+					close(began)
+					<-release
+					return agenttest.Say("too late"), nil
+				}),
+				lax: true,
+			})
+			started := f.start("clerk", "hello")
+			outcome := f.begin(t.Context(), started.ID)
+			<-began
+			require.NoError(t, f.engine.Cancel(t.Context(), started.ID, "ops@example.test", "enough"))
+			f.pass(execHeartbeat)
+
+			close(release)
+			got := <-outcome
+
+			require.NoError(t, got.err)
+			assert.Equal(t, agent.StatusCancelled, got.run.Status)
+			assert.Equal(t, []string{"1 model started"}, f.journal(started.ID))
+			assert.Zero(t, got.run.ModelCalls)
+		})
+	})
+
+	t.Run("a decision that arrives after cancellation was requested starts nothing", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			calls := &execCalls{}
+			began, release := make(chan struct{}), make(chan struct{})
+			f := newExecFixture(t, execConfig{
+				defs: []agent.Definition{execClerk(calls.tool("refund", nil))},
+				guard: agenttest.GuardFunc(func(context.Context, agent.Action) (agent.Decision, error) {
+					close(began)
+					<-release
+					return agent.Decision{Effect: agent.Allow, Rule: "allow-all"}, nil
+				}),
+				script: agenttest.Replies(agenttest.Use(agenttest.Call("call-1", "refund", `{}`))),
+				lax:    true,
+			})
+			started := f.start("clerk", "refund order 7")
+			outcome := f.begin(t.Context(), started.ID)
+			<-began
+			require.NoError(t, f.engine.Cancel(t.Context(), started.ID, "ops@example.test", "enough"))
+			f.pass(execHeartbeat)
+
+			close(release)
+			got := <-outcome
+
+			require.NoError(t, got.err)
+			assert.Equal(t, agent.StatusCancelled, got.run.Status)
+			assert.Equal(t, []string{"1 model completed", "2 refund proposed"}, f.journal(started.ID),
+				"the call is not started for a run that is being cancelled")
+			assert.Empty(t, calls.of("refund"))
+		})
+	})
 }
