@@ -943,3 +943,100 @@ func TestValidate_RefusesANULThatNoRecordCouldHold(t *testing.T) {
 		assert.NoError(t, p.Validate())
 	})
 }
+
+// A rule's name and the version are written to text columns, an attribute name
+// is written into the record's list of attributes that could not be told, and a
+// name is indexed: so a policy whose name or version is not valid UTF-8, or is
+// longer than a record is allowed to hold, would load and then fail to record,
+// or record something other than what decided. They are refused at load.
+func TestValidate_RefusesATextNoRecordCouldHoldAsItIs(t *testing.T) {
+	const bad = "a\xffb"
+	long := func(n int) string { return strings.Repeat("n", n) }
+	withName := func(name string) policy.Policy {
+		return policy.Policy{Rules: []policy.Rule{{Name: "first", Effect: policy.Allow}, {Name: name, Effect: policy.Block}}}
+	}
+	withAttr := func(attr string) policy.Policy {
+		return policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: policy.Match{
+			Attrs: []policy.Cond{{Attr: "ok", Op: policy.OpExists, Value: true}, {Attr: attr, Op: policy.OpEq, Value: "x"}},
+		}}}}
+	}
+	withVersion := func(v string) policy.Policy {
+		return policy.Policy{Version: v, Rules: []policy.Rule{{Name: "r", Effect: policy.Allow}}}
+	}
+
+	refused := []struct {
+		name string
+		p    policy.Policy
+		want []string
+	}{
+		{"a rule name that is not UTF-8", withName(bad), []string{`rule 1 ("a\xffb")`, "name", "UTF-8"}},
+		{"a rule name that is a lone continuation byte", withName("\x80"), []string{"rule 1", "UTF-8"}},
+		{"a rule name that is a truncated character", withName("caf\xc3"), []string{"rule 1", "UTF-8"}},
+		{"an attribute name that is not UTF-8", withAttr(bad), []string{`rule 0 ("r")`, "condition 1", "attribute", "UTF-8"}},
+		{"a version that is not UTF-8", withVersion(bad), []string{"version", "UTF-8"}},
+		{"a rule name of 257 bytes", withName(long(257)), []string{"rule 1", "name", "257 bytes", "256"}},
+		{"a rule name of 257 bytes that is fewer characters", withName(strings.Repeat("\u00e9", 129)), []string{"rule 1", "name", "258 bytes", "256"}},
+		{"a rule name of a thousand bytes", withName(long(1000)), []string{"rule 1", "1000 bytes"}},
+		{"a version of 257 bytes", withVersion(long(257)), []string{"version", "257 bytes", "256"}},
+	}
+	for _, tt := range refused {
+		t.Run("refuses "+tt.name, func(t *testing.T) {
+			err := tt.p.Validate()
+			require.Error(t, err)
+			for _, want := range tt.want {
+				assert.Contains(t, err.Error(), want)
+			}
+			assert.Less(t, len(err.Error()), 200, "a long name is not printed whole")
+			d, err := policy.NewDecider(tt.p, policy.Options{})
+			require.Error(t, err)
+			assert.Nil(t, d)
+		})
+	}
+
+	accepted := []struct {
+		name string
+		p    policy.Policy
+	}{
+		{"a rule name of 256 bytes", withName(long(256))},
+		{"a rule name of 256 bytes of two-byte characters", withName(strings.Repeat("\u00e9", 128))},
+		{"a rule name that is not ASCII", withName("Ausgaben \u00fcber 200 \u20ac \U0001F600")},
+		{"a version of 256 bytes", withVersion(long(256))},
+		{"an attribute name of 300 bytes, which is only ever written to a list", withAttr(long(300))},
+		{"a kind that is not UTF-8, which only an action no record could hold carries", policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: policy.Match{Kinds: []string{bad}}}}}},
+		{"a target pattern that is not UTF-8, likewise", policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: policy.Match{Target: bad}}}}},
+	}
+	for _, tt := range accepted {
+		t.Run("accepts "+tt.name, func(t *testing.T) {
+			assert.NoError(t, tt.p.Validate())
+		})
+	}
+
+	t.Run("Parse refuses a name or version past the length", func(t *testing.T) {
+		_, err := policy.Parse([]byte(`{"rules": [{"name": "` + long(257) + `", "effect": "block"}]}`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "257 bytes")
+		_, err = policy.Parse([]byte(`{"version": "` + long(257) + `", "rules": [{"name": "r", "effect": "block"}]}`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "version")
+	})
+}
+
+// A kind and a target pattern are never written to a record, so what is wrong
+// with a NUL in one is that it can only match an action that could never be
+// recorded; the message says that, and does not say a record cannot hold the
+// kind, which it never does.
+func TestValidate_SaysWhyAKindOrAPatternMayNotHoldANUL(t *testing.T) {
+	err := policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: policy.Match{Kinds: []string{"a\x00b"}}}}}.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "could never be recorded")
+	assert.NotContains(t, err.Error(), "a decision record cannot store")
+
+	err = policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: policy.Match{Target: "a\x00b"}}}}.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "could never be recorded")
+
+	// A name, an attribute name and the version are recorded.
+	err = policy.Policy{Rules: []policy.Rule{{Name: "a\x00b", Effect: policy.Block}}}.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decision record cannot store")
+}

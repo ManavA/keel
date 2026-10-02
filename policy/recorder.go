@@ -97,6 +97,7 @@ func (m *MemoryRecorder) Record(_ context.Context, rec Record) error {
 	if err != nil {
 		return fmt.Errorf("policy: record: %w", unrecordable(err))
 	}
+	rec.ID = 0 // it numbers nothing, and keeps nothing a caller made up
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if bound := m.bound(); len(m.recs) >= bound {

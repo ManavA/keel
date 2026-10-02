@@ -363,12 +363,18 @@ func TestRecord_JSON(t *testing.T) {
 }
 
 func TestMemoryRecorder_KeepsNoIDOfItsOwn(t *testing.T) {
-	// A record is handed to a recorder without an id, and the in-memory one has
-	// none to give: what it returns carries the id it was handed, zero.
+	// A record is handed to a recorder without an id that means anything, and the
+	// in-memory one has none to give: what it returns carries none, whatever it
+	// was handed.
 	m := policy.NewMemoryRecorder()
-	require.NoError(t, m.Record(t.Context(), record("send")))
-	require.NoError(t, m.Record(t.Context(), record("read")))
-	for _, rec := range m.Records() {
+	for _, id := range []int64{0, 9999, -3} {
+		rec := record("send")
+		rec.ID = id
+		require.NoError(t, m.Record(t.Context(), rec))
+	}
+	got := m.Records()
+	require.Len(t, got, 3)
+	for _, rec := range got {
 		assert.Zero(t, rec.ID)
 	}
 }
