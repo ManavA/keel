@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"os"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -426,12 +427,6 @@ func TestNext_ToolSteps(t *testing.T) {
 			want:  action{kind: actAsk, seq: 2},
 		},
 		{
-			name:      "a started step for an at-most-once tool with an approved approval for its attempt: run",
-			steps:     planJournal(planTool(2, 1, "charge", StepStarted, planAttempts(2))),
-			approvals: []Approval{planApproval(2, 1, ApprovalApproved), planApproval(2, 2, ApprovalApproved)},
-			want:      action{kind: actRun, seq: 2},
-		},
-		{
 			name:      "a started step for an at-most-once tool approved for an earlier attempt only: a person is asked again",
 			steps:     planJournal(planTool(2, 1, "charge", StepStarted, planAttempts(2))),
 			approvals: []Approval{planApproval(2, 1, ApprovalApproved)},
@@ -441,12 +436,6 @@ func TestNext_ToolSteps(t *testing.T) {
 			name:      "a started step for an at-most-once tool approved before it first started: a person is asked",
 			steps:     planJournal(planTool(2, 1, "charge", StepStarted, planAttempts(1))),
 			approvals: []Approval{planApproval(2, 0, ApprovalApproved)},
-			want:      action{kind: actAsk, seq: 2},
-		},
-		{
-			name:      "a started step for an at-most-once tool whose approval for its attempt was declined: a person is asked",
-			steps:     planJournal(planTool(2, 1, "charge", StepStarted, planAttempts(1))),
-			approvals: []Approval{planApproval(2, 1, ApprovalDeclined)},
 			want:      action{kind: actAsk, seq: 2},
 		},
 		{
@@ -467,6 +456,12 @@ func TestNext_ToolSteps(t *testing.T) {
 				return a
 			}()},
 			want: action{kind: actAsk, seq: 2},
+		},
+		{
+			name:      "a started step for a plain tool is run again whatever approvals it has",
+			steps:     planJournal(planTool(2, 1, "lookup", StepStarted, planAttempts(1))),
+			approvals: []Approval{planApproval(2, 0, ApprovalApproved), planApproval(2, 1, ApprovalPending)},
+			want:      action{kind: actRun, seq: 2},
 		},
 		{
 			name:  "a started step for a tool this build does not have: run, for the executor to answer",
@@ -504,19 +499,19 @@ func TestNext_ToolSteps(t *testing.T) {
 			want:      action{kind: actRun, seq: 2},
 		},
 		{
-			name:      "the approval with the highest attempt decides: an old yes and a new question",
+			name:      "the approval for the step's current attempt decides: an old yes and a new question",
 			steps:     planJournal(planTool(2, 1, "charge", StepWaiting, planAttempts(2))),
 			approvals: []Approval{planApproval(2, 1, ApprovalApproved), planApproval(2, 2, ApprovalPending)},
 			want:      action{kind: actPark, reason: ReasonApproval},
 		},
 		{
-			name:      "the approval with the highest attempt decides: an old no and a new yes",
+			name:      "the approval for the step's current attempt decides: an old no and a new yes",
 			steps:     planJournal(planTool(2, 1, "charge", StepWaiting, planAttempts(2))),
 			approvals: []Approval{planApproval(2, 1, ApprovalDeclined), planApproval(2, 2, ApprovalApproved)},
 			want:      action{kind: actRun, seq: 2},
 		},
 		{
-			name:      "the approval with the highest attempt decides, whatever order they come in",
+			name:      "the approval for the step's current attempt decides, whatever order they come in",
 			steps:     planJournal(planTool(2, 1, "charge", StepWaiting, planAttempts(2))),
 			approvals: []Approval{planApproval(2, 2, ApprovalDeclined), planApproval(2, 1, ApprovalApproved)},
 			want:      action{kind: actResolve, seq: 2},
@@ -534,14 +529,20 @@ func TestNext_ToolSteps(t *testing.T) {
 			name:  "a waiting step: another run's approval is not its own",
 			steps: planJournal(planTool(2, 1, "lookup", StepWaiting)),
 			approvals: []Approval{
-				planApproval(2, 0, ApprovalPending),
 				func() Approval {
-					a := planApproval(2, 1, ApprovalApproved)
+					a := planApproval(2, 0, ApprovalApproved)
 					a.RunID = planOtherRunID
 					return a
 				}(),
+				planApproval(2, 0, ApprovalPending),
 			},
 			want: action{kind: actPark, reason: ReasonApproval},
+		},
+		{
+			name:      "a waiting step: a newer attempt's approval is not the one that decides",
+			steps:     planJournal(planTool(2, 1, "charge", StepWaiting, planAttempts(1))),
+			approvals: []Approval{planApproval(2, 2, ApprovalApproved), planApproval(2, 1, ApprovalPending)},
+			want:      action{kind: actPark, reason: ReasonApproval},
 		},
 		{
 			name: "two waiting steps, one pending and one approved: the approved one runs",
@@ -609,6 +610,13 @@ func TestNext_ToolSteps(t *testing.T) {
 			name:      "a delegating step that was approved and now waits on its child is not run again",
 			steps:     planJournal(planTool(2, 1, "helper", StepWaiting, planAttempts(1), planChildOf(planChildID))),
 			approvals: []Approval{planApproval(2, 0, ApprovalApproved)},
+			children:  planChildren(planChild(planChildID, StatusRunnable)),
+			want:      action{kind: actPark, reason: ReasonChildren},
+		},
+		{
+			name:      "a waiting step with a child goes by its child, whatever approvals it has",
+			steps:     planJournal(planTool(2, 1, "helper", StepWaiting, planAttempts(1), planChildOf(planChildID))),
+			approvals: []Approval{planApproval(2, 0, ApprovalApproved), planApproval(2, 1, ApprovalApproved)},
 			children:  planChildren(planChild(planChildID, StatusRunnable)),
 			want:      action{kind: actPark, reason: ReasonChildren},
 		},
@@ -742,7 +750,7 @@ func TestNext_LastModelStep(t *testing.T) {
 			},
 		},
 		{
-			name: "a reply that made calls is a turn whatever its stop: ended",
+			name: "a reply that made calls is a turn when it ended",
 			steps: []Step{
 				planReply(1, StopEnd, "one moment", Call{ID: "call-2", Name: "lookup", Input: json.RawMessage(`{}`)}),
 				planTool(2, 1, "lookup", StepCompleted),
@@ -750,21 +758,20 @@ func TestNext_LastModelStep(t *testing.T) {
 			want: action{kind: actModel, seq: 3},
 		},
 		{
-			name: "a reply that made calls is a turn whatever its stop: cut off",
+			name: "a reply that made calls is a turn when it paused",
 			steps: []Step{
-				planReply(1, StopMaxTokens, "", Call{ID: "call-2", Name: "lookup", Input: json.RawMessage(`{}`)}),
+				planReply(1, StopPause, "", Call{ID: "call-2", Name: "lookup", Input: json.RawMessage(`{}`)}),
 				planTool(2, 1, "lookup", StepProposed),
 			},
 			want: action{kind: actJudge, seq: 2},
 		},
 		{
-			name: "a reply stored without its message: the run completes with no output",
-			steps: []Step{func() Step {
-				st := planReply(1, StopEnd, "")
-				st.Message = nil
-				return st
-			}()},
-			want: action{kind: actFinish, status: StatusCompleted},
+			name: "a reply that made calls and paused, its calls all final: the model is called",
+			steps: []Step{
+				planReply(1, StopPause, "", Call{ID: "call-2", Name: "lookup", Input: json.RawMessage(`{}`)}),
+				planTool(2, 1, "lookup", StepCompleted),
+			},
+			want: action{kind: actModel, seq: 3},
 		},
 	})
 }
@@ -850,13 +857,6 @@ func TestNext_Budgets(t *testing.T) {
 			want:      failed(ReasonTimeBudget),
 		},
 		{
-			name:      "time spent, an at-most-once tool approved for its attempt to run: fails",
-			run:       planRun(timeSpent),
-			steps:     planJournal(planTool(2, 1, "charge", StepStarted, planAttempts(1))),
-			approvals: []Approval{planApproval(2, 1, ApprovalApproved)},
-			want:      failed(ReasonTimeBudget),
-		},
-		{
 			name:  "time spent, a child to start: fails",
 			run:   planRun(timeSpent),
 			steps: planJournal(planTool(2, 1, "helper", StepStarted, planAttempts(1))),
@@ -906,10 +906,103 @@ func TestNext_Budgets(t *testing.T) {
 			want:      action{kind: actResolve, seq: 2},
 		},
 		{
-			name:  "time spent, an interrupted at-most-once call: asks",
+			name:  "time spent, an interrupted at-most-once call: fails, and nobody is asked about a call that will not run",
 			run:   planRun(timeSpent),
 			steps: planJournal(planTool(2, 1, "charge", StepStarted, planAttempts(1))),
-			want:  action{kind: actAsk, seq: 2},
+			want:  failed(ReasonTimeBudget),
+		},
+
+		// With a budget spent, what does no work is still done before the run
+		// fails: a child's outcome and usage are collected and a person's no
+		// is recorded, wherever in the walk they stand.
+		{
+			name: "time spent, a call to judge and then an ended child: the child is collected first",
+			run:  planRun(timeSpent),
+			steps: planJournal(
+				planTool(2, 1, "lookup", StepProposed),
+				planTool(3, 1, "helper", StepWaiting, planAttempts(1), planChildOf(planChildID)),
+			),
+			children: planChildren(planChild(planChildID, StatusCompleted)),
+			want:     action{kind: actCollect, seq: 3},
+		},
+		{
+			name: "time spent, a call to judge and then a no to record: the no is recorded first",
+			run:  planRun(timeSpent),
+			steps: planJournal(
+				planTool(2, 1, "lookup", StepProposed),
+				planTool(3, 1, "lookup", StepWaiting),
+			),
+			approvals: []Approval{planApproval(3, 0, ApprovalExpired)},
+			want:      action{kind: actResolve, seq: 3},
+		},
+		{
+			name: "time spent, a started tool, an approved one, a child to start and a call to ask about, and then an ended child: the child is collected first",
+			run:  planRun(timeSpent),
+			steps: planJournal(
+				planTool(2, 1, "lookup", StepStarted, planAttempts(1)),
+				planTool(3, 1, "lookup", StepWaiting),
+				planTool(4, 1, "helper", StepStarted, planAttempts(1)),
+				planTool(5, 1, "charge", StepStarted, planAttempts(1)),
+				planTool(6, 1, "helper", StepWaiting, planAttempts(1), planChildOf(planChildID)),
+			),
+			approvals: []Approval{planApproval(3, 0, ApprovalApproved)},
+			children:  planChildren(planChild(planChildID, StatusFailed)),
+			want:      action{kind: actCollect, seq: 6},
+		},
+		{
+			name: "time spent, two that do no work after a call to judge: taken in order",
+			run:  planRun(timeSpent),
+			steps: planJournal(
+				planTool(2, 1, "lookup", StepProposed),
+				planTool(3, 1, "lookup", StepWaiting),
+				planTool(4, 1, "helper", StepWaiting, planAttempts(1), planChildOf(planChildID)),
+			),
+			approvals: []Approval{planApproval(3, 0, ApprovalDeclined)},
+			children:  planChildren(planChild(planChildID, StatusCompleted)),
+			want:      action{kind: actResolve, seq: 3},
+		},
+		{
+			name: "time spent, a call to judge and nothing else to record: fails",
+			run:  planRun(timeSpent),
+			steps: planJournal(
+				planTool(2, 1, "lookup", StepCompleted),
+				planTool(3, 1, "lookup", StepProposed),
+				planTool(4, 1, "lookup", StepDeclined),
+			),
+			want: failed(ReasonTimeBudget),
+		},
+		{
+			name: "time spent, a call to judge and a child still running: fails rather than parks",
+			run:  planRun(timeSpent),
+			steps: planJournal(
+				planTool(2, 1, "lookup", StepProposed),
+				planTool(3, 1, "helper", StepWaiting, planAttempts(1), planChildOf(planChildID)),
+			),
+			children: planChildren(planChild(planChildID, StatusRunnable)),
+			want:     failed(ReasonTimeBudget),
+		},
+		{
+			name: "cost spent, an approved tool and then an ended child: the child is collected first",
+			run: planRun(planLimits(Limits{MaxCostMicros: 1000}), func(run *Run) {
+				run.Usage.CostMicros = 1000
+			}),
+			steps: planJournal(
+				planTool(2, 1, "lookup", StepWaiting),
+				planTool(3, 1, "helper", StepWaiting, planAttempts(1), planChildOf(planChildID)),
+			),
+			approvals: []Approval{planApproval(2, 0, ApprovalApproved)},
+			children:  planChildren(planChild(planChildID, StatusCancelled)),
+			want:      action{kind: actCollect, seq: 3},
+		},
+		{
+			name: "model calls spent does not hold up the walk: the first call is judged",
+			run:  planRun(func(run *Run) { run.ModelCalls = 50 }),
+			steps: planJournal(
+				planTool(2, 1, "lookup", StepProposed),
+				planTool(3, 1, "helper", StepWaiting, planAttempts(1), planChildOf(planChildID)),
+			),
+			children: planChildren(planChild(planChildID, StatusCompleted)),
+			want:     action{kind: actJudge, seq: 2},
 		},
 		{
 			name:  "time spent, a truncated reply: fails as truncated",
@@ -1141,12 +1234,73 @@ func TestNext_AJournalThatDoesNotAddUp(t *testing.T) {
 	broken := func(errmsg string) action {
 		return action{kind: actYield, errmsg: errmsg}
 	}
+	note := func(seq int, status StepStatus) Step {
+		return Step{RunID: planRunID, Seq: seq, Kind: StepKind("summary"), Status: status}
+	}
+	modelIn := func(seq int, status StepStatus, stop Stop) Step {
+		st := planReply(seq, stop, "the total is 42")
+		st.Status = status
+		return st
+	}
+	call := Call{ID: "call-2", Name: "lookup", Input: json.RawMessage(`{}`)}
+
 	checkPlan(t, []planCase{
+		// A step this build cannot read, anywhere in the journal.
 		{
-			name: "a step kind this build does not know: yield, not fail",
-			steps: append(planJournal(planTool(2, 1, "lookup", StepCompleted)),
-				Step{RunID: planRunID, Seq: 3, Kind: StepKind("summary"), Status: StepCompleted}),
-			want: broken(`step 3 has the kind "summary"`),
+			name:  "a step kind this build does not know: yield, not fail",
+			steps: append(planJournal(planTool(2, 1, "lookup", StepCompleted)), note(3, StepCompleted)),
+			want:  broken(`step 3 has the kind "summary"`),
+		},
+		{
+			name:  "a last step of a kind this build does not know, still started",
+			steps: append(planJournal(planTool(2, 1, "lookup", StepCompleted)), note(3, StepStarted)),
+			want:  broken(`step 3 has the kind "summary"`),
+		},
+		{
+			name:  "a step of a kind this build does not know, then a final answer: yield, not complete",
+			steps: []Step{note(1, StepCompleted), planReply(2, StopEnd, "the total is 42")},
+			want:  broken(`step 1 has the kind "summary"`),
+		},
+		{
+			name: "a step of a kind this build does not know between a reply and its result: yield, and the model is not called without it",
+			steps: []Step{
+				planReply(1, StopToolUse, "", Call{ID: "call-3", Name: "lookup", Input: json.RawMessage(`{}`)}),
+				note(2, StepStarted),
+				planTool(3, 1, "lookup", StepCompleted),
+			},
+			want: broken(`step 2 has the kind "summary"`),
+		},
+		{
+			name:  "a last model step in a status this build does not know, with an end stop: yield, not complete",
+			steps: []Step{modelIn(1, StepStatus("streaming"), StopEnd)},
+			want:  broken(`step 1, a model step, has the status "streaming"`),
+		},
+		{
+			name:  "a model step in a tool step's status: yield",
+			steps: []Step{modelIn(1, StepWaiting, StopEnd)},
+			want:  broken(`step 1, a model step, has the status "waiting"`),
+		},
+		{
+			name: "an earlier model step in a status this build does not know: yield",
+			steps: []Step{
+				modelIn(1, StepStatus("streaming"), StopPause),
+				planReply(2, StopEnd, "the total is 42"),
+			},
+			want: broken(`step 1, a model step, has the status "streaming"`),
+		},
+		{
+			name: "a reply stored without its message: yield, not complete with no output",
+			steps: []Step{func() Step {
+				st := planReply(1, StopEnd, "")
+				st.Message = nil
+				return st
+			}()},
+			want: broken("step 1 is a completed model step with no message"),
+		},
+		{
+			name:  "a model step that has only started has no message, and is read",
+			steps: []Step{planModelStarted(1)},
+			want:  action{kind: actModel, seq: 1},
 		},
 		{
 			name:  "a step status this build does not know: yield, not fail",
@@ -1154,15 +1308,22 @@ func TestNext_AJournalThatDoesNotAddUp(t *testing.T) {
 			want:  broken(`step 2 has the status "paused"`),
 		},
 		{
-			name:      "an approval status this build does not know: yield, and not a no",
-			steps:     planJournal(planTool(2, 1, "lookup", StepWaiting)),
-			approvals: []Approval{planApproval(2, 0, ApprovalStatus("escalated"))},
-			want:      broken(`step 2's approval has the status "escalated"`),
+			name: "the first step that cannot be read is the one named",
+			steps: []Step{
+				planReply(1, StopToolUse, "", call),
+				planTool(2, 1, "lookup", StepStatus("paused")),
+				note(3, StepCompleted),
+			},
+			want: broken(`step 2 has the status "paused"`),
 		},
 		{
-			name:  "a stop this build does not know: yield, not fail",
-			steps: []Step{planReply(1, Stop("length"), "the total is")},
-			want:  broken(`model reply at step 1 ended with stop "length" and made no calls`),
+			name: "a step that cannot be read comes before a refusal",
+			steps: []Step{
+				planReply(1, StopToolUse, "", call),
+				planTool(2, 1, "lookup", StepStatus("paused")),
+				planReply(3, StopRefusal, ""),
+			},
+			want: broken(`step 2 has the status "paused"`),
 		},
 		{
 			name: "a spent budget does not turn giving up into failing",
@@ -1179,10 +1340,65 @@ func TestNext_AJournalThatDoesNotAddUp(t *testing.T) {
 			steps: planJournal(planTool(2, 1, "lookup", StepStatus("paused"))),
 			want:  action{kind: actFinish, status: StatusCancelled, reason: ReasonCancelled},
 		},
+
+		// A stop this build cannot read, on the last reply.
+		{
+			name:  "a stop this build does not know: yield, not fail",
+			steps: []Step{planReply(1, Stop("length"), "the total is")},
+			want:  broken(`model reply at step 1 has the stop "length"`),
+		},
+		{
+			name:  "a stop this build does not know, on a reply that made calls: yield, and nothing is judged",
+			steps: []Step{planReply(1, Stop("length"), "", call), planTool(2, 1, "lookup", StepProposed)},
+			want:  broken(`model reply at step 1 has the stop "length"`),
+		},
+		{
+			name:  "no stop at all, on a reply that made calls: yield, and nothing is judged",
+			steps: []Step{planReply(1, Stop(""), "", call), planTool(2, 1, "lookup", StepProposed)},
+			want:  broken(`model reply at step 1 has the stop ""`),
+		},
+		{
+			name:  "no stop at all, its calls all answered: yield, and the model is not called",
+			steps: []Step{planReply(1, Stop(""), "", call), planTool(2, 1, "lookup", StepCompleted)},
+			want:  broken(`model reply at step 1 has the stop ""`),
+		},
+		{
+			name: "an earlier reply's unknown stop is not looked at once a later reply is stored",
+			steps: []Step{
+				planReply(1, Stop("length"), "", call),
+				planTool(2, 1, "lookup", StepCompleted),
+				planReply(3, StopEnd, "the total is 42"),
+			},
+			want: action{kind: actFinish, status: StatusCompleted, output: "the total is 42"},
+		},
+
+		// A waiting step with nothing it can be waiting for.
 		{
 			name:  "a waiting step with no approval and no child",
 			steps: planJournal(planTool(2, 1, "lookup", StepWaiting)),
-			want:  broken("step 2 is waiting with no approval and no child run"),
+			want:  broken("step 2 is waiting with no approval for attempt 0 and no child run"),
+		},
+		{
+			name:      "an approvals list missing the current attempt's: yield, and the interrupted call nobody approved is not run",
+			steps:     planJournal(planTool(2, 1, "charge", StepWaiting, planAttempts(1))),
+			approvals: []Approval{planApproval(2, 0, ApprovalApproved)},
+			want:      broken("step 2 is waiting with no approval for attempt 1 and no child run"),
+		},
+		{
+			name:  "a waiting step whose only approval for its attempt is another run's",
+			steps: planJournal(planTool(2, 1, "lookup", StepWaiting)),
+			approvals: []Approval{func() Approval {
+				a := planApproval(2, 0, ApprovalApproved)
+				a.RunID = planOtherRunID
+				return a
+			}()},
+			want: broken("step 2 is waiting with no approval for attempt 0 and no child run"),
+		},
+		{
+			name:      "an approval status this build does not know: yield, and not a no",
+			steps:     planJournal(planTool(2, 1, "lookup", StepWaiting)),
+			approvals: []Approval{planApproval(2, 0, ApprovalStatus("escalated"))},
+			want:      broken(`step 2's approval has the status "escalated"`),
 		},
 		{
 			name:     "a waiting step whose child is not among the run's children",
@@ -1196,34 +1412,136 @@ func TestNext_AJournalThatDoesNotAddUp(t *testing.T) {
 			want:  broken("step 2 waits on child run " + planChildID + ", which is not among the run's children"),
 		},
 		{
-			name: "a last step of a kind this build does not know, still started",
-			steps: append(planJournal(planTool(2, 1, "lookup", StepCompleted)),
-				Step{RunID: planRunID, Seq: 3, Kind: StepKind("summary"), Status: StepStarted}),
-			want: broken(`step 3 has the kind "summary"`),
-		},
-		{
 			name: "it does not hide behind a step that is pending",
 			steps: planJournal(
 				planTool(2, 1, "lookup", StepWaiting),
 				planTool(3, 1, "lookup", StepWaiting),
 			),
 			approvals: []Approval{planApproval(2, 0, ApprovalPending)},
-			want:      broken("step 3 is waiting with no approval and no child run"),
+			want:      broken("step 3 is waiting with no approval for attempt 0 and no child run"),
+		},
+		{
+			name: "it does not hide behind a spent budget either",
+			run:  planRun(func(run *Run) { run.ActiveMillis = (15 * time.Minute).Milliseconds() }),
+			steps: planJournal(
+				planTool(2, 1, "lookup", StepProposed),
+				planTool(3, 1, "lookup", StepWaiting),
+			),
+			want: broken("step 3 is waiting with no approval for attempt 0 and no child run"),
+		},
+
+		// An interrupted at-most-once call already asked about for this
+		// attempt: asking again returns the approval that exists and moves
+		// nothing, so the same action would come back for ever.
+		{
+			name:      "a started step for an at-most-once tool with a pending approval for its attempt: yield, not ask again",
+			steps:     planJournal(planTool(2, 1, "charge", StepStarted, planAttempts(1))),
+			approvals: []Approval{planApproval(2, 1, ApprovalPending)},
+			want:      broken("step 2 is started and already has an approval for attempt 1"),
+		},
+		{
+			name:      "a started step for an at-most-once tool with an approved approval for its attempt: yield, not run",
+			steps:     planJournal(planTool(2, 1, "charge", StepStarted, planAttempts(2))),
+			approvals: []Approval{planApproval(2, 1, ApprovalApproved), planApproval(2, 2, ApprovalApproved)},
+			want:      broken("step 2 is started and already has an approval for attempt 2"),
+		},
+		{
+			name:      "a started step for an at-most-once tool with a declined approval for its attempt, and a budget spent: yield",
+			run:       planRun(func(run *Run) { run.ActiveMillis = (15 * time.Minute).Milliseconds() }),
+			steps:     planJournal(planTool(2, 1, "charge", StepStarted, planAttempts(1))),
+			approvals: []Approval{planApproval(2, 1, ApprovalDeclined)},
+			want:      broken("step 2 is started and already has an approval for attempt 1"),
+		},
+	})
+}
+
+// A reply the model did not finish is the run's last word whatever came with
+// it, as a refusal is. The last call of a reply cut at its token limit can
+// be incomplete and still valid JSON, so a call from one is never judged.
+func TestNext_AReplyCutShort(t *testing.T) {
+	call := Call{ID: "call-2", Name: "lookup", Input: json.RawMessage(`{"order":` + "7}")}
+	truncated := action{kind: actFinish, status: StatusFailed, reason: ReasonTruncated}
+	full := action{kind: actFinish, status: StatusFailed, reason: ReasonContextWindow}
+	checkPlan(t, []planCase{
+		{
+			name:  "cut at its token limit, with a proposed call: the run fails as truncated and nothing is judged",
+			steps: []Step{planReply(1, StopMaxTokens, "", call), planTool(2, 1, "lookup", StepProposed)},
+			want:  truncated,
+		},
+		{
+			name:  "cut at its token limit, with a call left started: nothing is run",
+			steps: []Step{planReply(1, StopMaxTokens, "", call), planTool(2, 1, "lookup", StepStarted, planAttempts(1))},
+			want:  truncated,
+		},
+		{
+			name:      "cut at its token limit, with a call a person approved: nothing is run",
+			steps:     []Step{planReply(1, StopMaxTokens, "", call), planTool(2, 1, "lookup", StepWaiting)},
+			approvals: []Approval{planApproval(2, 0, ApprovalApproved)},
+			want:      truncated,
+		},
+		{
+			name:  "cut at its token limit, its calls all answered: the model is not asked again",
+			steps: []Step{planReply(1, StopMaxTokens, "", call), planTool(2, 1, "lookup", StepCompleted)},
+			want:  truncated,
+		},
+		{
+			name:  "out of context window, with a proposed call: the run fails and nothing is judged",
+			steps: []Step{planReply(1, StopContextWindow, "", call), planTool(2, 1, "lookup", StepProposed)},
+			want:  full,
+		},
+		{
+			name:  "out of context window, its calls all answered: the model is not asked again",
+			steps: []Step{planReply(1, StopContextWindow, "", call), planTool(2, 1, "lookup", StepCompleted)},
+			want:  full,
+		},
+		{
+			name: "cut at its token limit after earlier turns",
+			steps: append(planJournal(planTool(2, 1, "lookup", StepCompleted)),
+				planReply(3, StopMaxTokens, "", Call{ID: "call-4", Name: "lookup", Input: json.RawMessage(`{}`)}),
+				planTool(4, 3, "lookup", StepProposed)),
+			want: truncated,
+		},
+		{
+			name:  "cancellation comes first",
+			run:   planRun(planCancelRequested),
+			steps: []Step{planReply(1, StopMaxTokens, "", call), planTool(2, 1, "lookup", StepProposed)},
+			want:  action{kind: actFinish, status: StatusCancelled, reason: ReasonCancelled},
+		},
+		{
+			name:  "a spent budget does not change the reason",
+			run:   planRun(func(run *Run) { run.ActiveMillis = (15 * time.Minute).Milliseconds() }),
+			steps: []Step{planReply(1, StopMaxTokens, "", call), planTool(2, 1, "lookup", StepProposed)},
+			want:  truncated,
+		},
+		{
+			name: "an earlier turn cut short is not the last word once a later reply is stored",
+			steps: []Step{
+				planReply(1, StopMaxTokens, "", call),
+				planTool(2, 1, "lookup", StepCompleted),
+				planReply(3, StopEnd, "the total is 42"),
+			},
+			want: action{kind: actFinish, status: StatusCompleted, output: "the total is 42"},
+		},
+		{
+			name:  "a model call still in flight has no stop, and is made again",
+			steps: append(planJournal(planTool(2, 1, "lookup", StepCompleted)), planModelStarted(3)),
+			want:  action{kind: actModel, seq: 3},
 		},
 	})
 }
 
 // Whatever a journal holds, next answers with an action an executor can
-// carry out or with the run's end, and neither it nor conversation panics: a
-// planner that panicked on a journal it did not expect would take its worker
-// down with it, and every worker after that one.
+// carry out, with the run's end, or by giving the run up, and neither it nor
+// conversation panics: a planner that panicked on a journal it did not
+// expect would take its worker down with it, and every worker after that
+// one. And it never ends a run, or goes on with one, whose journal holds a
+// step it cannot read.
 func TestNext_AnyJournalGetsAnAction(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 2026))
 	pick := func(n int) int { return rng.IntN(n) }
-	kinds := []StepKind{StepModel, StepTool, StepKind("note")}
-	statuses := []StepStatus{
-		StepProposed, StepWaiting, StepStarted, StepCompleted, StepBlocked, StepDeclined, StepStatus("paused"),
-	}
+	modelStatuses := []StepStatus{StepStarted, StepCompleted, StepCompleted, StepCompleted}
+	toolStatuses := []StepStatus{StepProposed, StepWaiting, StepStarted, StepCompleted, StepBlocked, StepDeclined}
+	oddStatuses := []StepStatus{StepStatus("paused"), StepProposed, StepWaiting, StepBlocked, StepStarted}
 	stops := []Stop{"", StopEnd, StopToolUse, StopMaxTokens, StopRefusal, StopPause, StopContextWindow, Stop("length")}
 	answers := []ApprovalStatus{
 		ApprovalPending, ApprovalApproved, ApprovalDeclined, ApprovalExpired, ApprovalCancelled, ApprovalStatus("escalated"),
@@ -1232,25 +1550,49 @@ func TestNext_AnyJournalGetsAnAction(t *testing.T) {
 	tools := []string{"lookup", "charge", "helper", "courier", "gone", ""}
 	childIDs := []string{"", planChildID, planChildID2}
 
-	for range 5000 {
+	// unreadable is this test's own account of a step no build of today
+	// writes, kept apart from the planner's.
+	unreadable := func(st Step) bool {
+		switch st.Kind {
+		case StepModel:
+			return (st.Status != StepStarted && st.Status != StepCompleted) ||
+				(st.Status == StepCompleted && st.Message == nil)
+		case StepTool:
+			return !slices.Contains(toolStatuses, st.Status)
+		}
+		return true
+	}
+
+	seen := map[actionKind]int{}
+	readable := 0
+	for range 20000 {
 		steps := make([]Step, pick(7))
 		for i := range steps {
 			st := Step{
 				RunID:      planRunID,
 				Seq:        i + 1,
-				Kind:       kinds[pick(len(kinds))],
-				Status:     statuses[pick(len(statuses))],
 				Name:       tools[pick(len(tools))],
-				Stop:       stops[pick(len(stops))],
 				Turn:       pick(i + 1),
 				Attempts:   pick(3),
 				ChildRunID: childIDs[pick(len(childIDs))],
 			}
-			if pick(4) > 0 {
-				st.Message = &Message{Role: RoleAssistant, Text: "text"}
+			switch roll := pick(100); {
+			case roll < 40:
+				st.Kind, st.Status = StepModel, modelStatuses[pick(len(modelStatuses))]
+				st.Stop = stops[pick(len(stops))]
+				if st.Status == StepCompleted && pick(40) > 0 {
+					st.Message = &Message{Role: RoleAssistant, Text: "text"}
+				}
+			case roll < 97:
+				st.Kind, st.Status = StepTool, toolStatuses[pick(len(toolStatuses))]
+				if pick(8) > 0 {
+					st.Call = &Call{ID: "call-" + strconv.Itoa(i+1), Name: st.Name}
+				}
+			default:
+				st.Kind, st.Status = StepKind("summary"), StepCompleted
 			}
-			if pick(4) > 0 {
-				st.Call = &Call{ID: "call-" + strconv.Itoa(i+1), Name: st.Name}
+			if pick(40) == 0 {
+				st.Status = oddStatuses[pick(len(oddStatuses))]
 			}
 			steps[i] = st
 		}
@@ -1272,8 +1614,18 @@ func TestNext_AnyJournalGetsAnAction(t *testing.T) {
 
 		a := next(run, planDefinition(), steps, approvals, children)
 
+		seen[a.kind]++
 		open := func(seq int) bool {
 			return seq >= 1 && seq <= len(steps) && steps[seq-1].Kind == StepTool && !steps[seq-1].Status.Done()
+		}
+		switch {
+		case run.CancelRequested:
+			require.Equal(t, action{kind: actFinish, status: StatusCancelled, reason: ReasonCancelled}, a)
+		case slices.ContainsFunc(steps, unreadable):
+			require.Equal(t, actYield, a.kind,
+				"next did not give up a run with a step it cannot read: %+v for %+v", a, steps)
+		default:
+			readable++
 		}
 		switch a.kind {
 		case actFinish:
@@ -1294,6 +1646,12 @@ func TestNext_AnyJournalGetsAnAction(t *testing.T) {
 		}
 		require.NotEmpty(t, conversation(run, steps))
 	}
+
+	for kind := actFinish; kind <= actYield; kind++ {
+		assert.Positive(t, seen[kind], "no journal gave action kind %d", kind)
+	}
+	assert.Greater(t, readable, 5000, "too few of the journals were ones next could read")
+	t.Logf("journals next could read: %d of 20000; actions by kind: %v", readable, seen)
 }
 
 // The golden of the design's 6.15: a blocked, a declined and a completed call
@@ -1588,9 +1946,10 @@ type planSeen struct {
 	ends      map[string]int
 	// growths counts the journal writes after which the property was checked.
 	growths int
-	// refusedWithCalls counts refusals that came with calls, and childEnded
+	// refusedWithCalls and cutShortWithCalls count the refusals and the
+	// replies cut at their token limit that came with calls, and childEnded
 	// and childOpen the children next was shown in each state.
-	refusedWithCalls, childEnded, childOpen int
+	refusedWithCalls, cutShortWithCalls, childEnded, childOpen int
 	// eagerBroke counts the writes after which planEagerConversation did not
 	// start with what it gave before.
 	eagerBroke int
@@ -1736,7 +2095,12 @@ func (w *planWorld) reply(run Run, seq int) (Message, Stop) {
 		w.seen.refusedWithCalls++
 		return msg, StopRefusal
 	case roll < 97:
+		// A reply cut at its token limit, sometimes in the middle of its calls.
 		msg.Text = "the total is"
+		if w.chance(50) {
+			msg.Calls = calls()
+			w.seen.cutShortWithCalls++
+		}
 		return msg, StopMaxTokens
 	}
 	return msg, StopContextWindow
@@ -2084,6 +2448,7 @@ func TestConversation_OnlyEverGrows(t *testing.T) {
 		assert.Zero(t, seen.kinds[actYield], "next gave up on a journal the store wrote")
 		assert.Zero(t, seen.ends["failed "+ReasonError], "a run was ended for what next could not read")
 		assert.Positive(t, seen.refusedWithCalls, "no refusal came with calls")
+		assert.Positive(t, seen.cutShortWithCalls, "no reply cut at its token limit came with calls")
 		assert.Positive(t, seen.childEnded, "no child run had ended when next was asked")
 		assert.Positive(t, seen.childOpen, "no child run was still going when next was asked")
 		assert.Greater(t, seen.growths, 8_000, "the journals were not grown far")
@@ -2196,6 +2561,12 @@ func TestNew_Defaults(t *testing.T) {
 		e, err := New(Options{Model: planNoModel{}, LeaseTTL: 90 * time.Second})
 		require.NoError(t, err)
 		assert.Equal(t, 30*time.Second, e.opts.HeartbeatInterval)
+	})
+
+	t.Run("the heartbeat of a lease too short to have a third is still more than zero", func(t *testing.T) {
+		e, err := New(Options{Model: planNoModel{}, LeaseTTL: 2 * time.Nanosecond})
+		require.NoError(t, err)
+		assert.Equal(t, time.Nanosecond, e.opts.HeartbeatInterval)
 	})
 
 	t.Run("a value below zero takes the default, as zero does", func(t *testing.T) {

@@ -9,10 +9,13 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -109,7 +112,9 @@ func withDefaults(opts Options) Options {
 		opts.LeaseTTL = defaultLeaseTTL
 	}
 	if opts.HeartbeatInterval <= 0 {
-		opts.HeartbeatInterval = opts.LeaseTTL / 3
+		// Never zero, which no ticker takes: a lease too short to have a
+		// third is refused by New for the heartbeat it gets here.
+		opts.HeartbeatInterval = max(opts.LeaseTTL/3, 1)
 	}
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = defaultPollInterval
@@ -194,12 +199,19 @@ type Engine struct {
 	defs map[string]Definition
 }
 
-// New builds an Engine. It returns an error when Model is nil.
+// New builds an Engine. It returns an error when Model is nil, and when
+// HeartbeatInterval is not below LeaseTTL once both have their defaults: a
+// lease that is not extended before it lapses is taken over while its
+// holder still works.
 func New(opts Options) (*Engine, error) {
 	if opts.Model == nil {
 		return nil, errors.New("agent: Options.Model is required")
 	}
 	opts = withDefaults(opts)
+	if opts.HeartbeatInterval >= opts.LeaseTTL {
+		return nil, fmt.Errorf("agent: Options.HeartbeatInterval is %s, which is not below Options.LeaseTTL of %s",
+			opts.HeartbeatInterval, opts.LeaseTTL)
+	}
 	return &Engine{
 		opts:  opts,
 		store: opts.Store,
@@ -427,8 +439,9 @@ func (e *Engine) Decline(ctx context.Context, approvalID, by, reason string) (Ap
 // decide records a person's answer. It writes nothing to the journal: the
 // run's next execution reads the answer and acts on it.
 func (e *Engine) decide(ctx context.Context, op, approvalID, by, reason string, approved bool) (Approval, error) {
-	if by == "" {
-		return Approval{}, fmt.Errorf("agent: %s %s: by is empty", op, approvalID)
+	by, err := recordable(by, reason)
+	if err != nil {
+		return Approval{}, fmt.Errorf("agent: %s %s: %w", op, approvalID, err)
 	}
 	now := e.clock.Now()
 	approval, err := e.store.DecideApproval(ctx, DecideRequest{
@@ -462,8 +475,9 @@ func (e *Engine) decide(ctx context.Context, op, approvalID, by, reason string, 
 // ended and finishes the run cancelled, which is when EventRunCancelled is
 // published.
 func (e *Engine) Cancel(ctx context.Context, runID, by, reason string) error {
-	if by == "" {
-		return fmt.Errorf("agent: cancel %s: by is empty", runID)
+	by, err := recordable(by, reason)
+	if err != nil {
+		return fmt.Errorf("agent: cancel %s: %w", runID, err)
 	}
 	// Read first: the event carries the run's agent, and only the request
 	// that sets the mark is a change to announce.
@@ -482,15 +496,46 @@ func (e *Engine) Cancel(ctx context.Context, runID, by, reason string) error {
 	return nil
 }
 
+// recordable checks who and why before they are written to a run's record,
+// and returns the name without the space around it. The name must be one: a
+// database keeps neither text that is not UTF-8 nor a NUL, and a name of
+// spaces alone names nobody. The reason is the person's own text and is kept
+// as given, so long as it can be kept.
+func recordable(by, reason string) (string, error) {
+	by = strings.TrimSpace(by)
+	switch {
+	case by == "":
+		return "", errors.New("by is empty")
+	case !utf8.ValidString(by):
+		return "", errors.New("by is not valid UTF-8")
+	case strings.ContainsRune(by, 0):
+		return "", errors.New("by holds a NUL")
+	case !utf8.ValidString(reason):
+		return "", errors.New("reason is not valid UTF-8")
+	case strings.ContainsRune(reason, 0):
+		return "", errors.New("reason holds a NUL")
+	}
+	return by, nil
+}
+
 // publish tells Options.Events that run changed: typ is the Event's type,
 // seq the step it is about or zero, and at the time of the change, which is
 // the time given to the store call that made it. It is called after that
 // call has returned, and is best effort: with no publisher it does nothing,
-// and a publisher's error is logged at Debug and goes no further.
+// and a publisher's error is logged at Debug and goes no further. Nor does a
+// publisher's panic, which is logged at Error: every event of an execution
+// comes through here from a worker's goroutine, where a panic would take
+// the process down for the sake of a hint.
 func (e *Engine) publish(ctx context.Context, typ string, run Run, seq int, at time.Time) {
 	if e.opts.Events == nil {
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			e.log.ErrorContext(ctx, "agent: publisher panicked",
+				"type", typ, "run", run.ID, "seq", seq, "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
 	event := Event{Type: typ, RunID: run.ID, Agent: run.Agent, Seq: seq, At: at}
 	if err := e.opts.Events.Publish(ctx, TopicRuns, event); err != nil {
 		e.log.DebugContext(ctx, "agent: event not published",

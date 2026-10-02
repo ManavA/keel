@@ -3084,62 +3084,89 @@ func next(run Run, def Definition, steps []Step, approvals []Approval, children 
 ```
 
 `next` applies these rules in order and returns at the first that gives an
-action. One rule sits over the others: when the action chosen would do work
-(`actModel`, `actJudge`, `actRun`, `actSpawn`) and a budget is spent (6.9),
-the action is instead finish, `StatusFailed`, with the budget's reason. A
-run whose work is done is never failed for its budget.
+action. One rule sits over the others, for a budget that is spent (6.9).
+No step is then judged, run, spawned or asked about, and the model is not
+called: the limit on model calls stops a model call and nothing else, and
+the other three stop all four. What does no work is still done first: the
+walk of rule 2 goes on past the steps it may not work on and gives the
+`actCollect` and `actResolve` that remain, in order, so an ended child's
+usage reaches the run's totals and a person's no is recorded, and only
+when it has none left is the action finish, `StatusFailed`, with the
+budget's reason. `actAsk` counts as work here: a person is not asked about
+a call that will not run. A run whose work is done is never failed for its
+budget, and a run with nothing but pending steps still parks.
 
 1. `run.CancelRequested`: finish, `StatusCancelled`.
-2. Walk the tool steps that are not final, in `seq` order. A refusal comes
-   first: when the last model step's `Stop` is `StopRefusal` the walk is
-   not made and the run finishes as rule 3 says, since a refusal is never a
-   turn, whatever calls came with it. For each:
+
+   Then, before anything else is decided, every step is looked at, and a
+   step this build cannot read gives `actYield`: a kind that is neither
+   model nor tool; a model step that is neither `started` nor `completed`;
+   a tool step whose status is none of the six; a completed model step
+   with no message. And the last model step's `Stop` is looked at, as rule
+   3 says, since some stops end the run whatever its tool steps hold.
+2. Walk the tool steps that are not final, in `seq` order. For each:
    - `proposed`: `actJudge`.
    - `started`, the tool delegates: `actSpawn`.
-   - `started`, the tool is `AtMostOnce` and the step has no approved
-     approval for its current `Attempts`: `actAsk`.
+   - `started`, the tool is `AtMostOnce`: `actAsk`. If an approval for the
+     step's current `Attempts` already exists, `actYield` instead: asking
+     again would be handed that approval and change nothing, and the same
+     action would come back for ever. No store leaves a step so.
    - `started` otherwise: `actRun`.
 
      A `started` step seen here was interrupted: an execution that starts
      a step always finishes it, or ends, before `next` is asked again.
    - `waiting` with a `ChildRunID`: `actCollect` if the child has ended;
-     otherwise the step is pending.
-   - `waiting` without one: look at the approval with the highest `Attempt`
-     for the step. Approved: `actRun`. Declined, expired or cancelled:
-     `actResolve`. Pending: the step is pending.
+     otherwise the step is pending. A child that is not in `children` is
+     `actYield`.
+   - `waiting` without one: look at the approval for the step's current
+     `Attempts`, which is the one that was asked when the step began to
+     wait. Approved: `actRun`. Declined, expired or cancelled:
+     `actResolve`. Pending: the step is pending. None, or one in a status
+     this build does not know: `actYield`. An approval for an earlier
+     attempt decides nothing: read from a list that was cut short, it
+     would run an interrupted call that nobody has approved.
    If the walk ends with pending steps and no action: `actPark`, with
    `ReasonApproval` when any pending step waits on a person and
    `ReasonChildren` otherwise.
-3. No tool step is open. Look at the last model step:
-   - None, or the last one is completed and made calls: `actModel` at
+3. Look at the last model step.
+   - Completed, and its `Stop` is `StopRefusal`, `StopMaxTokens` or
+     `StopContextWindow`: finish, `StatusFailed`, with `ReasonRefusal`,
+     `ReasonTruncated`, `ReasonContextWindow`. Such a reply is final
+     whatever came with it, so this is decided before the walk of rule 2
+     and its calls are never judged or run: a refusal is not a turn, and
+     the last call of a reply cut at its token limit can be incomplete and
+     still valid JSON.
+   - Completed, and its `Stop` is none this build knows, the empty one
+     included: `actYield`, also before the walk, whether or not it made
+     calls.
+
+   The rest applies once no tool step is open.
+   - None, or the last one is completed and made calls (its `Stop` is
+     `StopEnd`, `StopPause` or `StopToolUse`): `actModel` at
      `len(steps)+1`, unless `Run.ModelCalls` has reached the limit, in
      which case finish, `StatusFailed`, `ReasonModelCalls`.
    - `started`: `actModel` at its `seq`. The call was interrupted.
    - Completed with no calls: by its `Stop`. `StopEnd`: finish,
      `StatusCompleted`, output its text. `StopPause`: `actModel` at
-     `len(steps)+1`. `StopRefusal`, `StopMaxTokens`, `StopContextWindow`:
-     finish, `StatusFailed`, with `ReasonRefusal`, `ReasonTruncated`,
-     `ReasonContextWindow`.
+     `len(steps)+1`. `StopToolUse`: `actYield`, since a reply that says it
+     used tools and made no calls is not one the rules can place.
 
 Calls of one reply are executed one at a time in the order the model wrote
 them. A step waiting on a person does not hold up the steps after it:
 `next` passes over a pending step and acts on the next one, and the run
 parks only when everything left is pending.
 
-A journal `next` cannot make sense of gives `actYield`, with what was found
-in `errmsg`, at the point in the rules where it is met: a `waiting` step
-with no approval and no `ChildRunID`; a `waiting` step whose child is not
-in `children`; a tool step, an approval or a last step whose status, kind
-or `Stop` is none this build knows; a reply that made no calls and whose
-`Stop` rule 3 does not list. The run is given up as a failed attempt and
-not ended, because ending a run cannot be undone and neither cause is the
-run's own: a value this build does not know is what an older worker reads
-during a deploy once a newer build has written to the journal, and a child
-that was not passed in is the executor's mistake. Given up, the run waits
-out its back-off and is claimed again, by a worker that can read it or
-after a fix, and if none can, the limit on failed executions ends it with
-the same message; parking it instead would leave nothing to wake it. A
-budget does not replace `actYield`, and cancellation still comes first.
+`actYield` carries what was found in `errmsg`, and is given at the point in
+the rules where it is met, as they say above. The run is given up as a
+failed attempt and not ended, because ending a run cannot be undone and
+neither cause is the run's own: a value this build does not know is what an
+older worker reads during a deploy once a newer build has written to the
+journal, and a child or an approval that was not passed in is the
+executor's mistake. Given up, the run waits out its back-off and is claimed
+again, by a worker that can read it or after a fix, and if none can, the
+limit on failed executions ends it with the same message; parking it
+instead would leave nothing to wake it. A budget does not replace
+`actYield`, and cancellation still comes first.
 
 How each action is performed:
 
@@ -4453,17 +4480,32 @@ lead confirmed its choices, and the table now states each of them.
     What a NUL character inside a string of either does is left to the
     Postgres store to settle with its column types in front of it.
 
-**A journal the planner cannot read gives the run up, and a request to
-cancel has its own event.** `next` has a tenth action, `actYield`, for a
-journal that does not add up: a waiting step with nothing to wait for, a
-child that was not passed in, a kind, a status or a `Stop` this build does
-not know. The execution ends as a failed attempt with what was found as
-the error, and the run stays claimable (rejected: finishing the run as
-failed, `ReasonError`, which cannot be undone, for what may be a newer
-build's writing during a deploy or the executor's own mistake; and
-parking it, which leaves a run nothing will wake). A refusal, a spent
-budget and cancellation still end a run. `Cancel` publishes
-`EventRunCancelRequested`, and `EventRunCancelled` is kept for the run
-that has ended cancelled (rejected: `EventRunCancelled` for both, which
-makes one type mean two things, and nothing at all, which leaves a
-subscriber no hint that a run is about to stop).
+**A journal the planner cannot read gives the run up, a reply the model
+did not finish is final, and a request to cancel has its own event.**
+`next` has a tenth action, `actYield`, for a journal that does not add up:
+a step whose kind or status this build does not know, a completed model
+step with no message, a `Stop` it does not know, a waiting step with no
+approval for its current attempt or whose child was not passed in, an
+interrupted at-most-once step already asked about. The execution ends as a
+failed attempt with what was found as the error, and the run stays
+claimable (rejected: finishing the run as failed, `ReasonError`, which
+cannot be undone, for what may be a newer build's writing during a deploy
+or the executor's own mistake; and parking it, which leaves a run nothing
+will wake). A refusal, a spent budget and cancellation still end a run,
+and so does a reply cut at its token limit or out of context window,
+whatever calls came with it (rejected: judging and running those calls as
+a turn, when the last of them may be cut short and still parse, so that a
+guard keyed on an argument that is missing would let it through). A
+waiting step is decided by the approval for its current attempt and no
+other (rejected: the approval with the highest attempt, which, read from
+a list that was cut short, is an older yes that runs an interrupted call
+nobody approved). An interrupted at-most-once step is always asked about
+(the clause "and has no approved approval for its current attempts" could
+not fire against a store that keeps the contract, and is gone). A spent
+budget stops work and asking, and lets what does no work finish first
+(rejected: failing at the first working step, which left a decline
+unrecorded and an ended child's usage out of the failed run's totals).
+`Cancel` publishes `EventRunCancelRequested`, and `EventRunCancelled` is
+kept for the run that has ended cancelled (rejected: `EventRunCancelled`
+for both, which makes one type mean two things, and nothing at all, which
+leaves a subscriber no hint that a run is about to stop).

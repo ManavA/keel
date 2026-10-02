@@ -89,51 +89,85 @@ func turnResults(turn int, after []Step) []Result {
 // first that gives an action gives next's:
 //
 //  1. Cancellation was requested: the run finishes cancelled.
-//  2. The last reply is a refusal: the run fails. A refusal is the model's
-//     last word and never a turn, so calls that came with one are not judged.
-//  3. The tool steps that are not final, in order. A proposed step is judged.
+//  2. A step this build cannot read, anywhere in the journal: the run is
+//     given up. That is a kind that is neither model nor tool, a status its
+//     kind does not have, and a completed model step with no message.
+//  3. The last reply's stop says it is no turn, whatever came with it: a
+//     refusal, a reply cut at its token limit and one that ran out of
+//     context window fail the run, and their calls are never judged or run;
+//     a stop this build does not know gives the run up.
+//  4. The tool steps that are not final, in order. A proposed step is judged.
 //     A started step was interrupted: its child is started when its tool
-//     delegates; a person is asked when its tool is at-most-once and nobody
-//     has approved this attempt; otherwise it is run again. A waiting step
-//     with a child is collected once the child has ended. Any other waiting
-//     step goes by the approval with the highest attempt: approved, it is
-//     run; pending, it is passed over; declined, expired or cancelled, the
-//     no is recorded.
-//  4. Steps were passed over and nothing else could be done: the run parks,
+//     delegates; a person is asked when its tool is at-most-once; otherwise
+//     it is run again. A waiting step with a child is collected once the
+//     child has ended. Any other waiting step goes by the approval for its
+//     current attempt: approved, it is run; pending, it is passed over;
+//     declined, expired or cancelled, the no is recorded.
+//  5. Steps were passed over and nothing else could be done: the run parks,
 //     for a person when any step waits on one, and else for its children.
-//  5. No tool step is open: the model is called, or called again where its
-//     call was interrupted, or the run ends as the last reply's stop says.
+//  6. No tool step is open: the model is called, or called again where its
+//     call was interrupted, or the run completes with the last reply's text.
 //
-// Over them all sits work: an action that would do work is replaced by the
-// run's failure when a budget is spent.
+// Over them sits the budget. Once one is spent, no step is judged, run,
+// spawned or asked about, and the model is not called. The walk still gives
+// what does no work, collecting an ended child (whose usage belongs in the
+// run's totals) and recording a person's no, and the run fails for its
+// budget only when the walk has none of those left. A run whose work is done
+// is never failed for its budget.
 //
-// A journal this build cannot make sense of (a waiting step with nothing to
-// wait for, a child that was not given, a kind, a status or a stop it does
-// not know) gives the run up, with actYield and what was found, wherever in
-// that order it is met. The run is not ended for it: ending cannot be
-// undone, and what this build cannot read may be a newer build's writing
-// during a deploy, or the executor's mistake. Given up as a failed attempt,
-// the run waits out its back-off and is claimed again, by a worker that can
-// read it or after a fix; if none can, the limit on failed attempts ends it,
-// with the same message. Parking it instead would leave nothing to wake it.
+// A journal this build cannot make sense of gives the run up, with actYield
+// and what was found, at the point in that order where it is met: rule 2's
+// steps and rule 3's stop; a waiting step whose child was not given, or
+// that has no approval for its current attempt, or whose approval has a
+// status this build does not know; a started at-most-once step that already
+// has an approval for its current attempt, which asking again would only
+// hand back; a last reply that made no calls and did not end or pause. The
+// run is not ended for it: ending cannot be undone, and what this build
+// cannot read may be a newer build's writing during a deploy, or the
+// executor's mistake. Given up as a failed attempt, the run waits out its
+// back-off and is claimed again, by a worker that can read it or after a
+// fix; if none can, the limit on failed attempts ends it, with the same
+// message. Parking it instead would leave nothing to wake it.
 func next(run Run, def Definition, steps []Step, approvals []Approval, children map[string]Run) action {
 	if run.CancelRequested {
 		return action{kind: actFinish, status: StatusCancelled, reason: ReasonCancelled}
 	}
-	if last := lastModelStep(steps); last != nil && last.Stop == StopRefusal {
-		return failRun(ReasonRefusal)
+
+	for _, st := range steps {
+		if a, unread := unreadable(st); unread {
+			return a
+		}
 	}
 
-	// onPerson and onChild record the steps passed over because nothing can
-	// be done for them yet.
-	onPerson, onChild := false, false
+	if last := lastModelStep(steps); last != nil && last.Status == StepCompleted {
+		switch last.Stop {
+		case StopRefusal:
+			return failRun(ReasonRefusal)
+		case StopMaxTokens:
+			return failRun(ReasonTruncated)
+		case StopContextWindow:
+			return failRun(ReasonContextWindow)
+		case StopEnd, StopPause, StopToolUse:
+		default:
+			return giveUp("model reply at step %d has the stop %q", last.Seq, last.Stop)
+		}
+	}
+
+	// over is the budget that is spent, if one is. held records that it kept
+	// a step from being worked on, and onPerson and onChild the steps passed
+	// over because nothing can be done for them yet.
+	over := spent(run, false)
+	held, onPerson, onChild := false, false, false
 	for _, st := range steps {
 		if st.Kind != StepTool || st.Status.Done() {
 			continue
 		}
+		// a is the work this step calls for. A case that finds none returns
+		// what does no work, or goes on to the next step.
+		a := action{seq: st.Seq}
 		switch st.Status {
 		case StepProposed:
-			return work(run, action{kind: actJudge, seq: st.Seq})
+			a.kind = actJudge
 
 		case StepStarted:
 			// A step seen here as started was interrupted: an execution that
@@ -141,13 +175,19 @@ func next(run Run, def Definition, steps []Step, approvals []Approval, children 
 			// A tool this build does not have is run, for the executor to
 			// answer as it answers any call to one.
 			tool, _ := toolOf(def, st.Name)
+			_, asked := approvalFor(approvals, run.ID, st)
 			switch {
 			case tool.Delegate != "":
-				return work(run, action{kind: actSpawn, seq: st.Seq})
-			case tool.AtMostOnce && !approvedFor(approvals, run.ID, st):
-				return action{kind: actAsk, seq: st.Seq}
+				a.kind = actSpawn
+			case !tool.AtMostOnce:
+				a.kind = actRun
+			case asked:
+				// Asking again would be handed the approval that exists and
+				// move nothing, and this action would come back for ever.
+				return giveUp("step %d is started and already has an approval for attempt %d", st.Seq, st.Attempts)
+			default:
+				a.kind = actAsk
 			}
-			return work(run, action{kind: actRun, seq: st.Seq})
 
 		case StepWaiting:
 			if st.ChildRunID != "" {
@@ -162,26 +202,35 @@ func next(run Run, def Definition, steps []Step, approvals []Approval, children 
 				onChild = true
 				continue
 			}
-			asked, ok := latestApproval(approvals, run.ID, st.Seq)
+			// A step waiting on a person was asked about at its current
+			// attempt, so that approval is the one that decides. An older
+			// one must not: given a list cut short, it would run an
+			// interrupted call that nobody has approved.
+			asked, ok := approvalFor(approvals, run.ID, st)
 			if !ok {
-				return giveUp("step %d is waiting with no approval and no child run", st.Seq)
+				return giveUp("step %d is waiting with no approval for attempt %d and no child run", st.Seq, st.Attempts)
 			}
 			switch asked.Status {
 			case ApprovalApproved:
-				return work(run, action{kind: actRun, seq: st.Seq})
+				a.kind = actRun
 			case ApprovalPending:
 				onPerson = true
+				continue
 			case ApprovalDeclined, ApprovalExpired, ApprovalCancelled:
 				return action{kind: actResolve, seq: st.Seq}
 			default:
 				return giveUp("step %d's approval has the status %q", st.Seq, asked.Status)
 			}
-
-		default:
-			return giveUp("step %d has the status %q", st.Seq, st.Status)
 		}
+		if over != "" {
+			held = true
+			continue
+		}
+		return a
 	}
 	switch {
+	case held:
+		return failRun(over)
 	case onPerson:
 		return action{kind: actPark, reason: ReasonApproval}
 	case onChild:
@@ -193,68 +242,62 @@ func next(run Run, def Definition, steps []Step, approvals []Approval, children 
 	// still started, and its call is made again; a reply that made no calls,
 	// and its stop decides.
 	if len(steps) == 0 || steps[len(steps)-1].Kind == StepTool {
-		return work(run, action{kind: actModel, seq: len(steps) + 1})
+		return callModel(run, len(steps)+1)
 	}
 	last := steps[len(steps)-1]
-	switch {
-	case last.Kind != StepModel:
-		return giveUp("step %d has the kind %q", last.Seq, last.Kind)
-	case last.Status == StepStarted:
-		return work(run, action{kind: actModel, seq: last.Seq})
+	if last.Status == StepStarted {
+		return callModel(run, last.Seq)
 	}
 	switch last.Stop {
 	case StopEnd:
-		a := action{kind: actFinish, status: StatusCompleted}
-		if last.Message != nil {
-			a.output = last.Message.Text
-		}
-		return a
+		return action{kind: actFinish, status: StatusCompleted, output: last.Message.Text}
 	case StopPause:
-		return work(run, action{kind: actModel, seq: len(steps) + 1})
-	case StopMaxTokens:
-		return failRun(ReasonTruncated)
-	case StopContextWindow:
-		return failRun(ReasonContextWindow)
+		return callModel(run, len(steps)+1)
 	}
 	return giveUp("model reply at step %d ended with stop %q and made no calls", last.Seq, last.Stop)
 }
 
-// approvedFor reports whether a person has said yes to st's current attempt.
-func approvedFor(approvals []Approval, runID string, st Step) bool {
-	for _, a := range approvals {
-		if a.RunID == runID && a.Seq == st.Seq && a.Attempt == st.Attempts && a.Status == ApprovalApproved {
-			return true
+// unreadable reports whether st is a step this build cannot read, and gives
+// the action that says so: a kind that is neither model nor tool, a status
+// its kind does not have, or a completed model step with no message.
+func unreadable(st Step) (action, bool) {
+	switch st.Kind {
+	case StepModel:
+		switch {
+		case st.Status != StepStarted && st.Status != StepCompleted:
+			return giveUp("step %d, a model step, has the status %q", st.Seq, st.Status), true
+		case st.Status == StepCompleted && st.Message == nil:
+			return giveUp("step %d is a completed model step with no message", st.Seq), true
 		}
+	case StepTool:
+		if !isStepStatus(st.Status) {
+			return giveUp("step %d has the status %q", st.Seq, st.Status), true
+		}
+	default:
+		return giveUp("step %d has the kind %q", st.Seq, st.Kind), true
 	}
-	return false
+	return action{}, false
 }
 
-// latestApproval returns the approval with the highest Attempt for the step
-// at seq of run runID.
-func latestApproval(approvals []Approval, runID string, seq int) (Approval, bool) {
-	var latest Approval
-	found := false
+// approvalFor returns the approval of run runID for st's current attempt.
+// The store records at most one.
+func approvalFor(approvals []Approval, runID string, st Step) (Approval, bool) {
 	for _, a := range approvals {
-		if a.RunID != runID || a.Seq != seq {
-			continue
-		}
-		if !found || a.Attempt > latest.Attempt {
-			latest, found = a, true
+		if a.RunID == runID && a.Seq == st.Seq && a.Attempt == st.Attempts {
+			return a, true
 		}
 	}
-	return latest, found
+	return Approval{}, false
 }
 
-// work returns a, an action that does work, or in its place the run's
-// failure when a budget is spent. The rule sits over the others: every
-// action that calls the model, judges or runs a tool, or starts a child goes
-// through here, and no other does, so a run whose work is done is never
-// failed for its budget.
-func work(run Run, a action) action {
-	if reason := spent(run, a.kind == actModel); reason != "" {
+// callModel is the call of the model for step seq, or the run's failure when
+// a budget is spent. The limit on model calls is checked here and nowhere
+// else, since it bounds model calls and nothing more.
+func callModel(run Run, seq int) action {
+	if reason := spent(run, true); reason != "" {
 		return failRun(reason)
 	}
-	return a
+	return action{kind: actModel, seq: seq}
 }
 
 // spent names the budget run has used up, or is empty when it has none. A

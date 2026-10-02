@@ -38,10 +38,12 @@ var _ interface {
 // engineID is the nth id of a test: a UUID, since a store keeps nothing else.
 func engineID(n int) string { return fmt.Sprintf("00000000-0000-4000-8000-%012d", n) }
 
-// engineBus records what an engine publishes, and fails while err is set.
+// engineBus records what an engine publishes, fails while err is set, and
+// panics while panics is.
 type engineBus struct {
 	mu     sync.Mutex
 	err    error
+	panics any
 	topics []string
 	events []any
 }
@@ -49,6 +51,9 @@ type engineBus struct {
 func (b *engineBus) Publish(_ context.Context, topic string, event any) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.panics != nil {
+		panic(b.panics)
+	}
 	if b.err != nil {
 		return b.err
 	}
@@ -73,6 +78,12 @@ func (b *engineBus) fail(err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.err = err
+}
+
+func (b *engineBus) panicWith(v any) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.panics = v
 }
 
 // engineLogs is a slog.Handler that keeps every record at every level.
@@ -214,6 +225,38 @@ func TestNew(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "Model")
 		assert.Nil(t, engine)
+	})
+
+	refused := []struct {
+		name string
+		opts agent.Options
+	}{
+		{"a heartbeat as long as the default lease", agent.Options{HeartbeatInterval: 30 * time.Second}},
+		{"a heartbeat longer than the default lease", agent.Options{HeartbeatInterval: time.Minute}},
+		{"a heartbeat as long as the lease given", agent.Options{LeaseTTL: 10 * time.Second, HeartbeatInterval: 10 * time.Second}},
+		{"a heartbeat longer than the lease given", agent.Options{LeaseTTL: 10 * time.Second, HeartbeatInterval: 11 * time.Second}},
+		{"a lease so short that no heartbeat fits inside it", agent.Options{LeaseTTL: time.Nanosecond}},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name+" is refused: the lease would lapse between two heartbeats", func(t *testing.T) {
+			tc.opts.Model = agenttest.NewModel(nil)
+
+			engine, err := agent.New(tc.opts)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "HeartbeatInterval")
+			assert.Contains(t, err.Error(), "LeaseTTL")
+			assert.Nil(t, engine)
+		})
+	}
+
+	t.Run("a heartbeat just below the lease is accepted", func(t *testing.T) {
+		_, err := agent.New(agent.Options{
+			Model:             agenttest.NewModel(nil),
+			LeaseTTL:          10 * time.Second,
+			HeartbeatInterval: 10*time.Second - time.Nanosecond,
+		})
+		require.NoError(t, err)
 	})
 
 	t.Run("a Model is all it needs", func(t *testing.T) {
@@ -709,8 +752,40 @@ func TestEngine_Start_Publishes(t *testing.T) {
 		assert.Empty(t, f.logs.at(slog.LevelError))
 	})
 
-	t.Run("no publisher: the run is started", func(t *testing.T) {
-		engine, err := agent.New(agent.Options{Model: agenttest.NewModel(nil)})
+	t.Run("a publisher that panics: the run is started all the same, and the panic is logged at Error", func(t *testing.T) {
+		f := newEngineFixture(t, engineDefinition("clerk"))
+		f.bus.panicWith("bus fell over")
+
+		run, err := f.engine.Start(t.Context(), agent.StartRequest{Agent: "clerk"})
+
+		require.NoError(t, err)
+		stored, err := f.store.GetRun(t.Context(), run.ID)
+		require.NoError(t, err)
+		assert.Equal(t, stored, run)
+
+		logged := f.logs.at(slog.LevelError)
+		require.Len(t, logged, 1)
+		assert.Contains(t, logged[0], "bus fell over")
+		assert.Contains(t, logged[0], run.ID)
+		assert.Contains(t, logged[0], agent.EventRunStarted)
+		assert.Empty(t, f.logs.at(slog.LevelDebug))
+	})
+
+	t.Run("a publisher that panics with an error: logged at Error with the error", func(t *testing.T) {
+		f := newEngineFixture(t, engineDefinition("clerk"))
+		f.bus.panicWith(errors.New("bus fell over"))
+
+		_, err := f.engine.Start(t.Context(), agent.StartRequest{Agent: "clerk"})
+
+		require.NoError(t, err)
+		logged := f.logs.at(slog.LevelError)
+		require.Len(t, logged, 1)
+		assert.Contains(t, logged[0], "bus fell over")
+	})
+
+	t.Run("no publisher: the run is started, and nothing is logged about an event nobody was to get", func(t *testing.T) {
+		logs := &engineLogs{}
+		engine, err := agent.New(agent.Options{Model: agenttest.NewModel(nil), Logger: slog.New(logs)})
 		require.NoError(t, err)
 		require.NoError(t, engine.Register(engineDefinition("clerk")))
 
@@ -718,6 +793,9 @@ func TestEngine_Start_Publishes(t *testing.T) {
 
 		require.NoError(t, err)
 		assert.Equal(t, agent.StatusRunnable, run.Status)
+		for _, level := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
+			assert.Empty(t, logs.at(level))
+		}
 	})
 }
 
@@ -904,6 +982,57 @@ func TestEngine_ApproveAndDecline(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, answer.status, got.Status)
 			assert.Empty(t, got.Reason)
+		})
+
+		names := []struct {
+			name, by, reason, want string
+		}{
+			{"a by of spaces alone", " \t\n ", "checked the order", "by is empty"},
+			{"a by that holds a NUL", "ops\x00@example.test", "checked the order", "by holds a NUL"},
+			{"a by that is not valid UTF-8", "ops\xff@example.test", "checked the order", "by is not valid UTF-8"},
+			{"a reason that holds a NUL", "ops@example.test", "checked\x00 the order", "reason holds a NUL"},
+			{"a reason that is not valid UTF-8", "ops@example.test", "checked the \xffrder", "reason is not valid UTF-8"},
+		}
+		for _, tc := range names {
+			t.Run(answer.name+": "+tc.name+" is refused before the store is reached", func(t *testing.T) {
+				f := newEngineFixture(t, engineDefinition("clerk"))
+				_, approval := f.parked(t)
+				calls := f.store.Calls()
+
+				got, err := answer.decide(f.engine, t.Context(), approval.ID, tc.by, tc.reason)
+
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.want)
+				assert.Zero(t, got)
+				assert.Equal(t, calls, f.store.Calls(), "the store was reached")
+				assert.Empty(t, f.bus.published())
+			})
+		}
+
+		t.Run(answer.name+": the name recorded is the one given, without the space around it", func(t *testing.T) {
+			f := newEngineFixture(t, engineDefinition("clerk"))
+			_, approval := f.parked(t)
+
+			got, err := answer.decide(f.engine, t.Context(), approval.ID, "  ops@example.test\n", "  checked the order ")
+
+			require.NoError(t, err)
+			assert.Equal(t, "ops@example.test", got.DecidedBy)
+			assert.Equal(t, "  checked the order ", got.Reason, "the reason is the person's own text")
+		})
+
+		t.Run(answer.name+": a publisher that panics does not undo the answer", func(t *testing.T) {
+			f := newEngineFixture(t, engineDefinition("clerk"))
+			_, approval := f.parked(t)
+			f.bus.panicWith("bus fell over")
+
+			got, err := answer.decide(f.engine, t.Context(), approval.ID, "ops@example.test", "")
+
+			require.NoError(t, err)
+			assert.Equal(t, answer.status, got.Status)
+			logged := f.logs.at(slog.LevelError)
+			require.Len(t, logged, 1)
+			assert.Contains(t, logged[0], "bus fell over")
+			assert.Contains(t, logged[0], agent.EventApprovalDecided)
 		})
 
 		t.Run(answer.name+": an empty by is refused before the store is reached", func(t *testing.T) {
@@ -1096,6 +1225,59 @@ func TestEngine_Cancel(t *testing.T) {
 		got, err := f.store.GetRun(t.Context(), run.ID)
 		require.NoError(t, err)
 		assert.False(t, got.CancelRequested)
+	})
+
+	names := []struct {
+		name, by, reason, want string
+	}{
+		{"a by of spaces alone", " \t\n ", "customer withdrew", "by is empty"},
+		{"a by that holds a NUL", "ops\x00@example.test", "customer withdrew", "by holds a NUL"},
+		{"a by that is not valid UTF-8", "ops\xff@example.test", "customer withdrew", "by is not valid UTF-8"},
+		{"a reason that holds a NUL", "ops@example.test", "customer\x00 withdrew", "reason holds a NUL"},
+		{"a reason that is not valid UTF-8", "ops@example.test", "customer \xffithdrew", "reason is not valid UTF-8"},
+	}
+	for _, tc := range names {
+		t.Run(tc.name+" is refused before the store is reached", func(t *testing.T) {
+			f := newEngineFixture(t, engineDefinition("clerk"))
+			run, _ := f.parked(t)
+			calls := f.store.Calls()
+
+			err := f.engine.Cancel(t.Context(), run.ID, tc.by, tc.reason)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+			assert.Equal(t, calls, f.store.Calls(), "the store was reached")
+			assert.Empty(t, f.bus.published())
+		})
+	}
+
+	t.Run("the name recorded is the one given, without the space around it", func(t *testing.T) {
+		f := newEngineFixture(t, engineDefinition("clerk"))
+		run, _ := f.parked(t)
+
+		require.NoError(t, f.engine.Cancel(t.Context(), run.ID, "\tops@example.test  ", " customer withdrew "))
+
+		got, err := f.store.GetRun(t.Context(), run.ID)
+		require.NoError(t, err)
+		assert.Equal(t, "ops@example.test", got.CancelBy)
+		assert.Equal(t, " customer withdrew ", got.CancelReason, "the reason is the person's own text")
+	})
+
+	t.Run("a publisher that panics does not undo the request", func(t *testing.T) {
+		f := newEngineFixture(t, engineDefinition("clerk"))
+		run, _ := f.parked(t)
+		f.bus.panicWith("bus fell over")
+
+		err := f.engine.Cancel(t.Context(), run.ID, "ops@example.test", "")
+
+		require.NoError(t, err)
+		got, err := f.store.GetRun(t.Context(), run.ID)
+		require.NoError(t, err)
+		assert.True(t, got.CancelRequested)
+		logged := f.logs.at(slog.LevelError)
+		require.Len(t, logged, 1)
+		assert.Contains(t, logged[0], "bus fell over")
+		assert.Contains(t, logged[0], agent.EventRunCancelRequested)
 	})
 
 	t.Run("asked twice: the first request stands, and it is published once", func(t *testing.T) {
