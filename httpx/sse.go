@@ -1,0 +1,278 @@
+package httpx
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// ErrStreamUnsupported is returned by NewEventStream when the response
+// cannot be flushed, so events would sit in a buffer.
+var ErrStreamUnsupported = errors.New("httpx: response cannot be streamed")
+
+// ServerEvent is one server-sent event.
+type ServerEvent struct {
+	// ID is sent as the event's id, which a reconnecting client returns in
+	// Last-Event-ID. Empty sends none.
+	ID string
+	// Type is the event name. Empty sends none, which a client reads as
+	// "message".
+	Type string
+	Data []byte
+}
+
+// EventStreamOptions configures NewEventStream. The zero value works.
+type EventStreamOptions struct {
+	// Retry is sent once as the delay a client should wait before
+	// reconnecting. Zero sends none.
+	Retry time.Duration
+
+	// SendTimeout bounds each write the stream makes, the opening and every
+	// Send, SendJSON and Comment, so that a client that stays connected and
+	// stops reading cannot hold the handler in a write for ever. It takes
+	// the place of the server's WriteTimeout, which no longer applies to the
+	// stream once it is open. Zero means 30 seconds. A negative value means
+	// no bound, and so does a writer that cannot carry deadlines; writes are
+	// then unbounded. A send that passes the limit returns an error, and the
+	// stream is unusable afterwards. Time between sends does not count.
+	SendTimeout time.Duration
+}
+
+// defaultSendTimeout is what a zero EventStreamOptions.SendTimeout means.
+const defaultSendTimeout = 30 * time.Second
+
+// EventStream writes server-sent events to one response. It is for the one
+// goroutine that owns the response, and is not safe for concurrent use: a
+// handler that sends from several goroutines serializes them itself.
+//
+// It does not outlive the request: once the request's context ends, Send,
+// SendJSON and Comment write nothing and return an error wrapping the
+// context's, and the handler should return. A write to a connection the client
+// has closed often succeeds, and middleware that wraps the writer may discard
+// a flush error, so the context is the one dependable sign that the client is
+// gone.
+//
+// A send that fails ends the stream: the failed write may have left part of an
+// event on the wire, so every later call returns that same error.
+type EventStream struct {
+	w     http.ResponseWriter
+	rc    *http.ResponseController
+	ctx   context.Context // the request's, checked before every write
+	limit time.Duration   // the bound on each send; zero for none
+	err   error           // the error that ended the stream, if one did
+	buf   []byte
+}
+
+// NewEventStream starts an event stream on w: it sets the headers, lifts
+// the server's write deadline for this response, and flushes.
+//
+// Once the stream is open the server's own WriteTimeout no longer applies to
+// it. The write deadline is lifted, and what bounds a write is
+// EventStreamOptions.SendTimeout, set for the length of that write and lifted
+// again after it, the opening included. Writes are unbounded when SendTimeout
+// is negative or w cannot carry deadlines.
+//
+// The router's timeout is not lifted: it ends the request's context, and the
+// stream with it. A service that wants one long connection builds its router
+// with RouterOptions.Timeout set to -1.
+//
+// It returns ErrStreamUnsupported, before writing anything, when the writer
+// at the end of the Unwrap chain cannot flush, so the handler can still answer
+// with an error. A wrapper's flush passes down the chain, so one that stops
+// short would leave events in a buffer whatever the wrappers above it offer.
+// Any other error means the client has gone.
+func NewEventStream(w http.ResponseWriter, r *http.Request, opts EventStreamOptions) (*EventStream, error) {
+	if !canFlush(w) {
+		return nil, ErrStreamUnsupported
+	}
+	rc := http.NewResponseController(w)
+	limit := opts.SendTimeout
+	switch {
+	case limit == 0:
+		limit = defaultSendTimeout
+	case limit < 0:
+		limit = 0
+	}
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		if !errors.Is(err, http.ErrNotSupported) {
+			return nil, fmt.Errorf("httpx: lift write deadline: %w", err)
+		}
+		// Nothing here can carry a deadline, so there is nothing to bound a
+		// send with.
+		limit = 0
+	}
+
+	// Set before the status is written: a compressing middleware reads the
+	// content type there, and a header set later never reaches the client.
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	s := &EventStream{w: w, rc: rc, ctx: r.Context(), limit: limit}
+	if opts.Retry > 0 {
+		// Under a millisecond it would read as zero, a reconnect with no wait.
+		s.buf = fmt.Appendf(nil, "retry: %d\n\n", max(opts.Retry.Milliseconds(), 1))
+	}
+	if err := s.writeBounded(); err != nil {
+		return nil, fmt.Errorf("httpx: start event stream: %w", err)
+	}
+	return s, nil
+}
+
+// canFlush reports whether a flush on w ends at a writer that does it. It walks
+// the chain http.ResponseController walks, to its last writer, since a flush a
+// wrapper passes down only reaches the client if the writer it ends at can,
+// and the answer is known before anything is written.
+func canFlush(w http.ResponseWriter) bool {
+	for {
+		if u, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
+			w = u.Unwrap()
+			continue
+		}
+		switch w.(type) {
+		case interface{ FlushError() error }, http.Flusher:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+// Send writes one event and flushes it. It refuses, and writes nothing for, an
+// ID containing a line break or a NUL character, which a browser's EventSource
+// ignores along with the resume point it carries, and a Type containing a line
+// break.
+func (s *EventStream) Send(ev ServerEvent) error {
+	if strings.ContainsAny(ev.ID, "\r\n\x00") {
+		return errors.New("httpx: event id contains a line break or a NUL")
+	}
+	if strings.ContainsAny(ev.Type, "\r\n") {
+		return errors.New("httpx: event type contains a line break")
+	}
+	if err := s.usable(); err != nil {
+		return err
+	}
+
+	buf := s.buf[:0]
+	if ev.ID != "" {
+		buf = appendField(buf, "id", ev.ID)
+	}
+	if ev.Type != "" {
+		buf = appendField(buf, "event", ev.Type)
+	}
+	buf = appendData(buf, ev.Data)
+	buf = append(buf, '\n')
+	s.buf = buf
+	return s.write()
+}
+
+// SendJSON writes v as the data of one event.
+func (s *EventStream) SendJSON(id, typ string, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("httpx: encode event: %w", err)
+	}
+	return s.Send(ServerEvent{ID: id, Type: typ, Data: data})
+}
+
+// Comment writes a comment line, which clients ignore. It is how an idle
+// stream keeps a proxy from closing it. The text may not contain a line break.
+func (s *EventStream) Comment(text string) error {
+	if strings.ContainsAny(text, "\r\n") {
+		return errors.New("httpx: comment contains a line break")
+	}
+	if err := s.usable(); err != nil {
+		return err
+	}
+	s.buf = append(appendField(s.buf[:0], "", text), '\n')
+	return s.write()
+}
+
+// usable is the reason a send would be pointless, if there is one: the stream
+// has failed, or the request is over.
+func (s *EventStream) usable() error {
+	if s.err != nil {
+		return s.err
+	}
+	if err := s.ctx.Err(); err != nil {
+		return fmt.Errorf("httpx: send: %w", err)
+	}
+	return nil
+}
+
+// write sends s.buf and ends the stream if that fails.
+func (s *EventStream) write() error {
+	if err := s.writeBounded(); err != nil {
+		s.err = fmt.Errorf("httpx: send event: %w", err)
+	}
+	return s.err
+}
+
+// writeBounded sends s.buf as one Write, so a failure never leaves half an
+// event on the wire without the stream knowing, and flushes it, all under the
+// write's own deadline. With nothing in s.buf, as at the start of a stream with
+// no retry line, it only flushes.
+func (s *EventStream) writeBounded() error {
+	if s.limit > 0 {
+		if err := s.rc.SetWriteDeadline(time.Now().Add(s.limit)); err != nil {
+			return fmt.Errorf("bound write: %w", err)
+		}
+		// Lifted again after the write. Left to run out, the deadline would
+		// expire while the stream sat idle, and the write that ends the
+		// response would be the one to fail.
+		defer func() { _ = s.rc.SetWriteDeadline(time.Time{}) }()
+	}
+	if len(s.buf) > 0 {
+		if _, err := s.w.Write(s.buf); err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+	}
+	if err := s.rc.Flush(); err != nil {
+		return fmt.Errorf("flush: %w", err)
+	}
+	return nil
+}
+
+// LastEventID is the id of the last event a reconnecting client received,
+// or "".
+func LastEventID(r *http.Request) string {
+	return r.Header.Get("Last-Event-ID")
+}
+
+// appendField appends one "name: value" line. An empty name makes a comment
+// line, and an empty value drops the space after the colon.
+func appendField[V string | []byte](buf []byte, name string, value V) []byte {
+	buf = append(buf, name...)
+	buf = append(buf, ':')
+	if len(value) > 0 {
+		buf = append(buf, ' ')
+		buf = append(buf, value...)
+	}
+	return append(buf, '\n')
+}
+
+// appendData appends one data line for each line of data, with at least one
+// for empty data, which a client still dispatches. A line ends at LF, CR or
+// CRLF, the three a client accepts, so no byte of data can begin a field of
+// its own.
+func appendData(buf, data []byte) []byte {
+	for {
+		end := bytes.IndexAny(data, "\r\n")
+		if end < 0 {
+			return appendField(buf, "data", data)
+		}
+		buf = appendField(buf, "data", data[:end])
+		next := end + 1
+		if data[end] == '\r' && next < len(data) && data[next] == '\n' {
+			next++
+		}
+		data = data[next:]
+	}
+}

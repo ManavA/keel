@@ -5,16 +5,22 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	stdlog "log"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"net/textproto"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ManavA/keel/httpx/middleware"
 	"github.com/ManavA/keel/log"
+	"github.com/ManavA/keel/metrics"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -516,4 +522,309 @@ func TestRecorderKeepsTheResponseWriterUsable(t *testing.T) {
 	assert.True(t, sawFlusher, "Flush delegation is gone, which breaks streaming responses")
 	assert.True(t, sawHijacker, "Hijack delegation is gone, which breaks websocket upgrades")
 	assert.NoError(t, deadlineErr, "Unwrap is gone, so http.ResponseController cannot reach the real writer")
+}
+
+// syncBuffer is a buffer the server's goroutines and the test can share.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestRecorderForwardsOnlyTheFirstStatus(t *testing.T) {
+	// chi's Timeout writes a 504 once its deadline has passed, after the
+	// handler has returned. For a response already on the wire, such as a
+	// stream, forwarding that second status makes net/http log a warning.
+	wrappers := []struct {
+		name string
+		wrap func(http.Handler) http.Handler
+	}{
+		{"RequestLog", middleware.RequestLog(middleware.RequestLogOptions{Logger: log.New(log.Options{Output: io.Discard})})},
+		{"Recoverer", middleware.Recoverer(middleware.RecovererOptions{Logger: log.New(log.Options{Output: io.Discard})})},
+		{"Observe", middleware.Observe(metrics.New(metrics.Instruments{}))},
+	}
+	handlers := []struct {
+		name       string
+		handle     http.HandlerFunc
+		wantStatus int
+	}{
+		{"an explicit status, then another", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte("body"))
+			w.WriteHeader(http.StatusGatewayTimeout)
+		}, http.StatusCreated},
+		{"the status a write implies, then an explicit one", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("body"))
+			w.WriteHeader(http.StatusGatewayTimeout)
+		}, http.StatusOK},
+		{"the status a flush implies, then an explicit one", func(w http.ResponseWriter, _ *http.Request) {
+			_ = http.NewResponseController(w).Flush() // only the status it implies matters here
+			w.WriteHeader(http.StatusGatewayTimeout)
+		}, http.StatusOK},
+		{"an informational status after the final one", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte("body"))
+			w.WriteHeader(http.StatusEarlyHints)
+		}, http.StatusCreated},
+	}
+	for _, wrapper := range wrappers {
+		for _, handler := range handlers {
+			t.Run(wrapper.name+"/"+handler.name, func(t *testing.T) {
+				serverLog := &syncBuffer{}
+				srv := httptest.NewUnstartedServer(wrapper.wrap(handler.handle))
+				srv.Config.ErrorLog = stdlog.New(serverLog, "", 0)
+				srv.Start()
+				t.Cleanup(srv.Close)
+
+				resp, err := srv.Client().Get(srv.URL)
+				require.NoError(t, err)
+				_, err = io.Copy(io.Discard, resp.Body)
+				require.NoError(t, err)
+				require.NoError(t, resp.Body.Close())
+
+				assert.Equal(t, handler.wantStatus, resp.StatusCode)
+				assert.Empty(t, serverLog.String(), "the second status reached net/http, which logs it as superfluous")
+			})
+		}
+	}
+}
+
+func TestRequestLogRecordsTheFirstStatusOnly(t *testing.T) {
+	var logs syncBuffer
+	h := middleware.RequestLog(middleware.RequestLogOptions{
+		Logger: slog.New(slog.NewJSONHandler(&logs, nil)),
+	})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		w.WriteHeader(http.StatusGatewayTimeout)
+	}))
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+
+	var line map[string]any
+	require.NoError(t, json.Unmarshal([]byte(logs.String()), &line))
+	assert.EqualValues(t, http.StatusCreated, line["status"])
+}
+
+func TestRecorderPassesInformationalStatusesThroughAndKeepsTheFinalOne(t *testing.T) {
+	// A 1xx is not the response's status: net/http sends it as it is given and
+	// still expects the final one. Treating it as the first status would
+	// swallow the 404 below.
+	var logs syncBuffer
+	srv := httptest.NewServer(middleware.RequestLog(middleware.RequestLogOptions{
+		Logger: slog.New(slog.NewJSONHandler(&logs, nil)),
+	})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Add("Link", "</a.css>; rel=preload")
+		w.WriteHeader(http.StatusEarlyHints)
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("missing"))
+	})))
+	t.Cleanup(srv.Close)
+
+	var informational []int
+	trace := &httptrace.ClientTrace{Got1xxResponse: func(code int, _ textproto.MIMEHeader) error {
+		informational = append(informational, code)
+		return nil
+	}}
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(t.Context(), trace), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	assert.Equal(t, []int{http.StatusEarlyHints}, informational)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	assert.Equal(t, "missing", string(body))
+	var line map[string]any
+	require.NoError(t, json.Unmarshal([]byte(logs.String()), &line))
+	assert.EqualValues(t, http.StatusNotFound, line["status"], "the log records the final status, not the 103")
+}
+
+// failingFlushWriter reports a flush failure through FlushError, as net/http's
+// own writer does when the socket write behind the flush times out.
+type failingFlushWriter struct {
+	http.ResponseWriter
+	err error
+}
+
+func (w failingFlushWriter) FlushError() error { return w.err }
+
+func TestRecorderReportsWhatHappenedToAFlush(t *testing.T) {
+	// http.Flusher cannot return an error, so a recorder that offers only
+	// Flush hides a failed flush from http.ResponseController, and a stream
+	// that sends one event at a time never learns its client stopped reading.
+	boom := errors.New("write timed out")
+	tests := []struct {
+		name    string
+		inner   http.ResponseWriter
+		wantErr error
+	}{
+		{"a flush that fails", failingFlushWriter{httptest.NewRecorder(), boom}, boom},
+		{"a flush that works", httptest.NewRecorder(), nil},
+		{"nothing downstream that can flush", struct{ http.ResponseWriter }{httptest.NewRecorder()}, http.ErrNotSupported},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got error
+			h := middleware.RequestLog(middleware.RequestLogOptions{
+				Logger: log.New(log.Options{Output: io.Discard}),
+			})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				got = http.NewResponseController(w).Flush()
+				// The plain interface stays available, and quiet.
+				w.(http.Flusher).Flush()
+			}))
+
+			h.ServeHTTP(tc.inner, httptest.NewRequest(http.MethodGet, "/", nil))
+
+			if tc.wantErr == nil {
+				assert.NoError(t, got)
+				return
+			}
+			assert.ErrorIs(t, got, tc.wantErr)
+		})
+	}
+}
+
+// statusSpy records every status handed to it, for a recorder that has to
+// decide which ones to pass on. Embedding the interface keeps it from being an
+// io.ReaderFrom or anything else a test does not give it.
+type statusSpy struct {
+	http.ResponseWriter
+	statuses []int
+}
+
+func (w *statusSpy) WriteHeader(code int) {
+	w.statuses = append(w.statuses, code)
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// readerFromSpy is a statusSpy that can take a body from a reader itself, as
+// net/http's writer does.
+type readerFromSpy struct{ *statusSpy }
+
+func (w readerFromSpy) ReadFrom(src io.Reader) (int64, error) {
+	return io.Copy(struct{ io.Writer }{w.statusSpy}, src)
+}
+
+func TestRecorderMarksTheStatusWhenABodyIsCopiedIn(t *testing.T) {
+	// io.Copy into the recorder reaches ReadFrom, which either hands the reader
+	// to the writer below or copies it there itself. Either way a body that
+	// went out carries an implied 200, so a status written afterwards is the
+	// superfluous one; and a copy of nothing sends no status at all, so a
+	// status written afterwards is the real one.
+	tests := []struct {
+		name         string
+		fast         bool
+		body         string
+		late         int
+		wantForwards []int
+		wantLogged   int
+	}{
+		{"a copy that wrote bytes, through the writer's own ReadFrom", true, "body", http.StatusGatewayTimeout, nil, http.StatusOK},
+		{"a copy that wrote bytes, copied by the recorder", false, "body", http.StatusGatewayTimeout, nil, http.StatusOK},
+		{"a copy of nothing, through the writer's own ReadFrom", true, "", http.StatusNotFound, []int{http.StatusNotFound}, http.StatusNotFound},
+		{"a copy of nothing, copied by the recorder", false, "", http.StatusNotFound, []int{http.StatusNotFound}, http.StatusNotFound},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs syncBuffer
+			h := middleware.RequestLog(middleware.RequestLogOptions{
+				Logger: slog.New(slog.NewJSONHandler(&logs, nil)),
+			})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				// Only a bare Reader makes io.Copy use the recorder's ReadFrom.
+				_, err := io.Copy(w, struct{ io.Reader }{strings.NewReader(tc.body)})
+				assert.NoError(t, err)
+				w.WriteHeader(tc.late)
+			}))
+			spy := &statusSpy{ResponseWriter: httptest.NewRecorder()}
+			var inner http.ResponseWriter = spy
+			if tc.fast {
+				inner = readerFromSpy{spy}
+			}
+
+			h.ServeHTTP(inner, httptest.NewRequest(http.MethodGet, "/", nil))
+
+			assert.Equal(t, tc.wantForwards, spy.statuses)
+			var line map[string]any
+			require.NoError(t, json.Unmarshal([]byte(logs.String()), &line))
+			assert.EqualValues(t, tc.wantLogged, line["status"])
+		})
+	}
+}
+
+func TestRecorderTakesNoPartInAHijackedConnection(t *testing.T) {
+	// A library that hijacks the connection and writes its own 101 leaves
+	// nothing for the response to say, but chi's Timeout still writes a 504
+	// when its deadline passes. net/http logs that, and logs and refuses a
+	// write; a flush it would not even survive, since it drops the buffer on
+	// a hijack.
+	wrappers := []struct {
+		name string
+		wrap func(http.Handler) http.Handler
+	}{
+		{"RequestLog", middleware.RequestLog(middleware.RequestLogOptions{Logger: log.New(log.Options{Output: io.Discard})})},
+		{"Recoverer", middleware.Recoverer(middleware.RecovererOptions{Logger: log.New(log.Options{Output: io.Discard})})},
+		{"Observe", middleware.Observe(metrics.New(metrics.Instruments{}))},
+	}
+	type late struct {
+		wrote    int
+		writeErr error
+		flushErr error
+	}
+	for _, wrapper := range wrappers {
+		t.Run(wrapper.name, func(t *testing.T) {
+			serverLog := &syncBuffer{}
+			done := make(chan late, 1)
+			srv := httptest.NewUnstartedServer(wrapper.wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				defer close(done)
+				conn, _, err := http.NewResponseController(w).Hijack()
+				if !assert.NoError(t, err) {
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				_, err = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\n"))
+				assert.NoError(t, err)
+
+				// What the router's timeout does afterwards, and what a handler
+				// that did not notice might try.
+				w.WriteHeader(http.StatusGatewayTimeout)
+				var l late
+				l.wrote, l.writeErr = w.Write([]byte("late"))
+				l.flushErr = http.NewResponseController(w).Flush()
+				done <- l
+			})))
+			srv.Config.ErrorLog = stdlog.New(serverLog, "", 0)
+			srv.Start()
+			t.Cleanup(srv.Close)
+
+			conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+			require.NoError(t, err)
+			defer func() { _ = conn.Close() }()
+			require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+			_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"))
+			require.NoError(t, err)
+			reply, err := io.ReadAll(conn)
+			require.NoError(t, err)
+
+			l, ok := <-done
+			require.True(t, ok, "the handler did not finish its late calls")
+			assert.True(t, strings.HasPrefix(string(reply), "HTTP/1.1 101"), "the library's own response is what the client got: %q", reply)
+			assert.Zero(t, l.wrote)
+			assert.ErrorIs(t, l.writeErr, http.ErrHijacked)
+			assert.ErrorIs(t, l.flushErr, http.ErrHijacked)
+			assert.Empty(t, serverLog.String(), "net/http logged what the recorder passed on to a hijacked connection")
+		})
+	}
 }

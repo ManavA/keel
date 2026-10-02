@@ -3588,7 +3588,8 @@ middleware's response writers implement `Flush` and `Unwrap`, and
 Two things stand in a handler's way. The router's timeout ends the request
 context after 30 seconds, and the server's `WriteTimeout`, 60 seconds by
 default, closes the connection. One new file, `httpx/sse.go`, gives
-handlers the writer, and nothing existing changes:
+handlers the writer. The one existing file it touches is the response
+recorder in `httpx/middleware`, described after the code:
 
 *package httpx: httpx/sse.go*
 
@@ -3615,10 +3616,20 @@ type EventStreamOptions struct {
 	// Retry is sent once as the delay a client should wait before
 	// reconnecting. Zero sends none.
 	Retry time.Duration
+
+	// SendTimeout bounds each write the stream makes, the opening and every
+	// Send, SendJSON and Comment, so that a client that stays connected and
+	// stops reading cannot hold the handler in a write for ever. It takes
+	// the place of the server's WriteTimeout, which no longer applies to the
+	// stream once it is open. Zero means 30 seconds. A negative value means
+	// no bound, and so does a writer that cannot carry deadlines; writes are
+	// then unbounded. A send that passes the limit returns an error, and the
+	// stream is unusable afterwards. Time between sends does not count.
+	SendTimeout time.Duration
 }
 
-// EventStream writes server-sent events to one response. It is not safe
-// for concurrent use.
+// EventStream writes server-sent events to one response. It is for the one
+// goroutine that owns the response, and is not safe for concurrent use.
 type EventStream struct{ /* unexported fields */ }
 
 // NewEventStream starts an event stream on w: it sets the headers, lifts
@@ -3644,13 +3655,54 @@ func LastEventID(r *http.Request) string
 `http.NewResponseController(w).SetWriteDeadline(time.Time{})` to lift the
 write deadline for this response (ignoring `http.ErrNotSupported`), writes
 the `retry:` line when asked, and flushes. It returns
-`ErrStreamUnsupported` when no writer in the `Unwrap` chain can flush,
-which it finds out before writing any header, so the handler can still
-answer with an error. `Send` writes
-`id:` and `event:` when set and one `data:` line per line of `Data`, then a
-blank line, then flushes; it refuses an `ID` or `Type` containing a line
-break. The stream does not outlive the request context: the handler returns
-when `r.Context()` ends.
+`ErrStreamUnsupported` when the writer at the end of the `Unwrap` chain
+cannot flush, which it finds out before writing any header, so the handler
+can still answer with an error. It is the end of the chain that has to
+flush, not any writer in it: a wrapper's flush is passed down, so one that
+stops short would leave events in a buffer whatever the wrappers above it
+offer, and the router's recorders offer `Flush` over whatever they wrap.
+`Send` writes
+`id:` and `event:` when set and one `data:` line per line of `Data`, a line
+ending in a line feed, a carriage return or both, then a blank line, then
+flushes. It refuses, and writes nothing for, an `ID` containing a line break
+or a NUL character (a browser's `EventSource` ignores an id with a NUL, which
+would lose the resume point without a sign), a `Type` containing a line
+break, and `Comment` text containing one.
+
+The write deadline stays lifted between sends, which is what lets a stream
+outlive `WriteTimeout`: once a stream is open the server's own
+`WriteTimeout` no longer applies to it, and the per-send limit takes its
+place. Each write the stream makes, the opening and every send, sets the
+deadline to now plus `SendTimeout` before it writes and lifts it again
+after, so a client that stays connected and stops reading holds the
+handler's write for at most that long, and the time between writes does not
+count against the next one. Writes are unbounded when `SendTimeout` is
+negative, or when the writer cannot carry deadlines. A send that hits the
+deadline returns its error and ends the stream: the write may have left part
+of an event on the wire, so every later call returns the same error.
+
+The stream does not outlive the request context: once `r.Context()` ends,
+`Send`, `SendJSON` and `Comment` write nothing and return an error wrapping
+the context's, and the handler returns. The router's timeout ends that
+context, so under the default router a stream lasts 30 seconds, and a
+deployment that wants a longer one builds its router with `Timeout: -1`
+(6.13). Through a writer that discards flush errors, such as chi's
+compressor, the send that was held up reports success and the handler has
+been held for one limit; net/http closes the connection after the failed
+write, which ends the request's context, and the next send fails.
+
+Two defects in the recorder that `RequestLog`, `Observe` and `Recoverer`
+put round the writer (`httpx/middleware/responsewriter.go`) would have
+undone this. It offered only `Flush`, which cannot return an error, so a
+flush that timed out went unreported and a send could not tell; it now also
+offers `FlushError`, which `http.ResponseController` prefers. And it
+forwarded every `WriteHeader` it was given, so the 504 that chi's `Timeout`
+writes after a stream its deadline has ended made net/http log a superfluous
+call, a warning for every stream every 30 seconds; it now forwards only a
+response's first status, however that status was written or implied, and
+passes a 1xx through as the informational response it is, if no final status
+has gone out. After a hijack it forwards nothing and reports
+`http.ErrHijacked` for a write or a flush.
 
 It belongs in `httpx` and not in `agent/httpapi` because it is what any
 service streaming model output to a browser would otherwise write itself.
@@ -3658,7 +3710,12 @@ service streaming model output to a browser would otherwise write itself.
 Tests, without a database: the bytes written for each field combination and
 for multi-line data; the three headers; a writer that cannot flush; a line
 break in an id; `LastEventID`; and, against a real `httpx.Server` with a
-100 millisecond `WriteTimeout`, a stream that keeps delivering past it.
+100 millisecond `WriteTimeout`, a stream that keeps delivering past it,
+including past its own `SendTimeout`. Also against a real server: a client
+that stops reading, whose send returns an error within `SendTimeout`, and a
+stream ended by the router's timeout, which logs nothing at warning level.
+Without a server: a router mounted under a writer that cannot flush, which
+leaves the handler able to answer.
 
 ## 8. How the packages meet
 
@@ -3986,7 +4043,7 @@ rejected and why. The first nine are the ones worth a second opinion.
 8. **`httpx` gains a server-sent event writer.** Rejected: keeping it
    private to `agent/httpapi`. It is thirty lines any streaming handler
    needs, and the write-deadline detail is easy to get wrong. It is a new
-   file and changes nothing that exists.
+   file; what it changed in `httpx/middleware` is in 40.
 
 9. **Anthropic's server-side refusal fallback is an option, off by
    default, and on in the example.** Rejected: on by default, as
@@ -4151,53 +4208,67 @@ chose them.
     and checks after. The error is not exported, since no caller has a
     decision to make about it.
 
-The review of the wrappers task settled the points below. They refine 4.3 and
-4.7, which they take precedence over. They carry no numbers, so that
-decisions added by tasks running at the same time do not collide.
+40. **A send on an event stream is bounded, though the stream is not.**
+    `NewEventStream` lifts the write deadline so that a stream can outlive
+    the server's `WriteTimeout`. Leaving it lifted lets a client that stays
+    connected and stops reading hold the handler in `Write` once the socket
+    buffers fill, and neither the router's timeout nor the context check can
+    interrupt a blocked write. Each send therefore sets a deadline of its
+    own, `EventStreamOptions.SendTimeout` (30 seconds by default, none when
+    negative), and lifts it again after. Rejected: lifting the deadline
+    outright, as section 7 first said; and one deadline for the whole
+    stream, which is `WriteTimeout` again. A send that fails ends the stream,
+    since the write may have left half an event on the wire. The server's
+    `WriteTimeout` therefore no longer applies to a stream once it is open;
+    `SendTimeout` is what bounds it. The recorder in `httpx/middleware`
+    changed too, to forward only a response's first status, to report flush
+    errors, and to take no part in a hijacked connection, and
+    `NewEventStream` asks that a flush reach the end of the writer chain,
+    which the recorders cannot promise on their own.
 
-**The budget is outermost and the meter sits inside it.** `Budgeted`, then
-`Metered`, then `Fallback`. Rejected: the meter outermost, which records a
-call the budget refused as a failed call with no usage, and so counts as a
-call something that never reached a provider.
+41. **The budget is outermost and the meter sits inside it.** `Budgeted`, then
+    `Metered`, then `Fallback`. Rejected: the meter outermost, which records a
+    call the budget refused as a failed call with no usage, and so counts as a
+    call something that never reached a provider.
 
-**Only the caller's context ends a `Fallback` chain, and `Retryable` trusts
-the provider's mark.** Rejected: reading `context.DeadlineExceeded` or
-`context.Canceled` in the error chain as the caller's. An `http.Client`'s own
-timeout satisfies `errors.Is(err, context.DeadlineExceeded)` while the
-caller's context is live, so a provider that hangs, which is the case a
-fallback exists for, would end the chain and would not be retried. The
-default test for moving on is now `ErrBudgetExceeded` alone; `Retryable`
-decides by the `*Error` it finds, and a provider returns the context's own
-error and no `*Error` once the caller's context is done.
+42. **Only the caller's context ends a `Fallback` chain, and `Retryable` trusts
+    the provider's mark.** Rejected: reading `context.DeadlineExceeded` or
+    `context.Canceled` in the error chain as the caller's. An `http.Client`'s own
+    timeout satisfies `errors.Is(err, context.DeadlineExceeded)` while the
+    caller's context is live, so a provider that hangs, which is the case a
+    fallback exists for, would end the chain and would not be retried. The
+    default test for moving on is now `ErrBudgetExceeded` alone; `Retryable`
+    decides by the `*Error` it finds, and a provider returns the context's own
+    error and no `*Error` once the caller's context is done.
 
-**A refusal that was moved past is billed, and is the reply if no later model
-answers.** With `OnRefusal`, the last refusal comes back with a nil error and
-every refused attempt in `Attempts`, and the failures that followed are
-logged. Rejected: an error, which leaves what was paid for out of the budget
-and the meter, and bills another refusal each time the caller tries the step
-again.
+43. **A refusal that was moved past is billed, and is the reply if no later model
+    answers.** With `OnRefusal`, the last refusal comes back with a nil error and
+    every refused attempt in `Attempts`, and the failures that followed are
+    logged. Rejected: an error, which leaves what was paid for out of the budget
+    and the meter, and bills another refusal each time the caller tries the step
+    again.
 
-**A reply is priced at the model it names, then at the model the request asked
-for, then at the cost that was held for it.** One function does it, for the
-budget and the meter. Rejected: pricing only at the model the reply names. A
-provider commonly answers an alias with a dated id, so a table keyed by alias
-would fail on every call and the budget would refuse far too early.
+44. **A reply is priced at the model it names, then at the model the request asked
+    for, then at the cost that was held for it.** One function does it, for the
+    budget and the meter. Rejected: pricing only at the model the reply names. A
+    provider commonly answers an alias with a dated id, so a table keyed by alias
+    would fail on every call and the budget would refuse far too early.
 
-**A stream callback's own error comes back untouched, and a model's nil reply
-with a nil error is an error.** See 4.7. Rejected: letting the retry wrapper
-and the chain wrap the callback's error, which makes the caller's own signal
-to stop read as a model failure; and handling a nil reply differently in each
-wrapper.
+45. **A stream callback's own error comes back untouched, and a model's nil reply
+    with a nil error is an error.** See 4.7. Rejected: letting the retry wrapper
+    and the chain wrap the callback's error, which makes the caller's own signal
+    to stop read as a model failure; and handling a nil reply differently in each
+    wrapper.
 
-**A settle that passes its hold is added as it is and logged.** `Budgeted`
-adds a call's real cost and tokens, never clamped to what was held, and logs
-at warning level, through `BudgetOptions.Logger`, a call that settles for more
-than its hold in a dimension that has a limit. Rejected: clamping, which
-forgets real spend and lets the next call through on money already gone; and
-staying silent, which hides that the guarantee in 4.3 did not cover that call.
-The field is new, and its zero value works.
+46. **A settle that passes its hold is added as it is and logged.** `Budgeted`
+    adds a call's real cost and tokens, never clamped to what was held, and logs
+    at warning level, through `BudgetOptions.Logger`, a call that settles for more
+    than its hold in a dimension that has a limit. Rejected: clamping, which
+    forgets real spend and lets the next call through on money already gone; and
+    staying silent, which hides that the guarantee in 4.3 did not cover that call.
+    The field is new, and its zero value works.
 
-**A callback's error after a refusal that was moved past loses the refusal's
-billing, and is logged.** The error comes back with no reply for the usage to
-ride in. Rejected: returning a reply with the error, which breaks the rule that
-a callback's error comes back as the callback returned it.
+47. **A callback's error after a refusal that was moved past loses the refusal's
+    billing, and is logged.** The error comes back with no reply for the usage to
+    ride in. Rejected: returning a reply with the error, which breaks the rule that
+    a callback's error comes back as the callback returned it.
