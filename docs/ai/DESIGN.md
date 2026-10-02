@@ -469,6 +469,14 @@ func (p Prices) CostOf(resp *Response) (int64, error) {
 	}
 	return total, nil
 }
+
+// CostFor is the cost of a whole Response as Budgeted and Metered price it:
+// each attempt at the model it names or, when the table does not list that
+// one, at asked, the model the request asked for. A provider commonly answers
+// an alias with a dated id the table does not carry, which CostOf would
+// refuse. It returns an error wrapping ErrNoPrice when some attempt can be
+// priced at neither name, and never the sum of the attempts that could be.
+func (p Prices) CostFor(resp *Response, asked string) (int64, error)
 ```
 
 The rest of the package, as signatures:
@@ -3979,14 +3987,20 @@ package app
 // AgentModelOptions configures AgentModel. The zero value prices nothing.
 type AgentModelOptions struct {
 	// Prices turns each reply's tokens into the cost a run's budget is
-	// measured in. With Prices set, a reply from a model it does not list
-	// fails the run rather than being counted as free.
+	// measured in. With Prices set, a reply that neither the model it names
+	// nor the model the request asked for can price fails the run rather than
+	// being counted as free. AgentModel keeps a copy of the table.
 	Prices llm.Prices
 	// Effort is sent with every request.
 	Effort llm.Effort
 	// StrictTools asks the provider to guarantee tool arguments match their
 	// schemas.
 	StrictTools bool
+	// DefaultMaxTokens bounds the reply to a request that sets no MaxTokens.
+	// Zero is 16000, the number llm.Budgeted assumes for a request that sets
+	// none: the adapter always sends a bound, so that a budget's hold is a
+	// real upper bound on the call.
+	DefaultMaxTokens int
 }
 
 // AgentModel adapts an llm.Model to agent.Model.
@@ -4000,28 +4014,68 @@ func AgentGuard(d *policy.Decider) agent.Guard
 
 | `agent.Request` | `llm.Request` |
 |---|---|
-| `Model`, `System`, `MaxTokens` | The same fields |
-| `Messages`: `Role`, `Text`, `Calls`, `Results`, `Opaque` | `Role`, `Text`, `ToolCalls`, `ToolResults`, `Opaque`, field for field |
+| `Model`, `System` | The same fields |
+| `MaxTokens` | The same field; when it is zero or less, `DefaultMaxTokens`. A request the adapter sends always sets one |
+| `Messages`: `Role`, `Text`, `Calls`, `Results`, `Opaque` | `Role`, `Text`, `ToolCalls`, `ToolResults`, `Opaque`, field for field: a call's `ID`, `Name`, `Input` and `Malformed`, a result's `CallID`, `Content` and `IsError`, an opaque form's `Provider` and `Data` |
 | `Tools` | `Tools`, with `Strict` from `StrictTools` |
-| `Output` | `Output: &llm.Schema{Name: "answer", JSON: …}` when set |
+| `Output` | `Output: &llm.Schema{Name: "answer", JSON: …}` when it is not empty |
 | | `Effort` from the options |
+
+`RunID` and `Agent` are not sent: `llm.Request` has no place for them. Every
+slice and byte string is copied, a nil one stays nil and an empty one stays
+empty, and no JSON is decoded or encoded, so an assistant turn, its tool calls
+and its opaque provider form go back to the provider exactly as they came, key
+order and spacing included.
 
 | `llm.Response` | `agent.Response` |
 |---|---|
 | `Message` | `Message`, field for field |
-| `Stop` | The constant of the same name; `StopSequence` becomes `StopEnd` |
+| `Stop` | The constant of the same name; `StopSequence` becomes `StopEnd`. A reason `agent` has no name for is a permanent error |
 | `Model` | `Model` |
-| `Usage` | `InputTokens` is input plus cache reads plus cache writes; `OutputTokens`; `CostMicros` is `Prices.CostOf(resp)` |
+| `Usage`, and `Attempts` when there are some | `InputTokens` is input plus cache reads plus cache writes, and `OutputTokens`, summed over every attempt, or over the one `Model` and `Usage` when there are none; `CostMicros` is `Prices.CostFor(resp, asked)` with the request's `Model` as `asked`, and zero when no `Prices` are set |
 
-Errors: `ErrBudgetExceeded`, `ErrNoPrice`, and an `*llm.Error` that is not
-retryable are returned wrapped in `agent.ErrPermanent`. With `Prices` set, a
-reply from a model the table does not list is an `ErrNoPrice` and so
-permanent: a run with a cost budget must not treat an unpriced call as
-free. Everything else is returned as it is, and the engine tries again
-later.
+A refused reply carries no text and no tool calls. The adapter passes what it
+is given, invents and drops no content, and maps the stop reason: a refusal is
+a reply, not an error, including one `Fallback` returns after the models behind
+it failed. Its `Refusal` explanation has no place in `agent.Response` and is
+not carried.
+
+Errors are classified as `llm.Retryable` classifies them, which trusts an
+`*llm.Error` in the chain before it looks for a context error:
+
+- The caller's own cancellation or deadline, read from the context given to
+  `Generate`, is returned as it is: neither retryable nor permanent. A worker
+  that is shutting down must not fail a run for good.
+- `ErrBudgetExceeded`, `ErrNoPrice`, a reply that cannot be priced, and an
+  `*llm.Error` that is not retryable are returned wrapped in
+  `agent.ErrPermanent`, and still unwrap to themselves.
+- A retryable `*llm.Error`, a plain error, and anything else are returned as
+  they are, and the engine tries again later.
+- A nil reply with a nil error is an error, and not a permanent one.
+
+With `Prices` set, a reply that is priced at neither the model it names nor the
+model the request asked for is an `ErrNoPrice` and so permanent: a run with a
+cost budget must not treat an unpriced call as free. The reply is priced as
+`llm`'s budget and meter price it, so a provider that answers an alias with a
+dated id costs what the alias costs (decision 54).
 
 `AgentGuard` copies `Kind`, `Target` and `Attrs` into a `policy.Action`,
-calls `Decider.Decide`, and copies `Effect` and `Rule` back.
+calls `Decider.Decide`, and copies `Effect` and `Rule` back. The three are
+passed through unchanged: no trimming, no case folding, no cleaning of a
+target, and no attribute converted to another type, because `policy` matches
+names and strings exactly as written and reads an attribute it cannot compare
+as a reason to ask or block. When the policy's decision names something that
+could not be evaluated in `Decision.Uncertain`, `agent.Decision`, which carries
+only `Effect` and `Rule`, gets it in the rule: `<rule> (could not evaluate:
+<names joined by ", ">)`. The run's timeline and the approval a person is
+shown then say why a rule whose condition looks unmet decided; the structured
+field stays in the policy's own record. A decision that could not be recorded
+is an error and no decision.
+
+Composition is the caller's. The `llm` wrappers go outermost first as
+`Budgeted`, `Metered`, `Fallback`, then one `Retrying` per provider (4.7); the
+budget is outermost, so the meter records only the calls it let through, and a
+call it refuses reaches the adapter as a permanent error.
 
 Wiring, as the example does it:
 
@@ -4030,7 +4084,12 @@ client, err := anthropic.New(anthropic.Options{
 	APIKey:          cfg.AnthropicAPIKey,
 	RefusalFallback: "default",
 })
-model := llm.NewMetered(llm.NewRetrying(client, llm.RetryOptions{}), llm.MeterOptions{Prices: prices})
+metered := llm.NewMetered(llm.NewRetrying(client, llm.RetryOptions{}), llm.MeterOptions{Prices: prices})
+model, err := llm.NewBudgeted(metered, llm.BudgetOptions{
+	MaxCostMicros: 50_000_000, // $50, across every run this process makes
+	Prices:        prices,
+	Model:         anthropic.DefaultModel,
+})
 
 rules, err := policy.Parse(policyJSON)
 decider, err := policy.NewDecider(rules, policy.Options{Recorder: policypg.New(pool)})
@@ -4674,3 +4733,34 @@ lead confirmed its choices, and the table now states each of them.
     normalisation, so whatever builds an `Action` puts them in one canonical
     spelling: normalising inside `policy` would pick one spelling for every
     caller's idea of what a target is.
+
+54. **`AgentModel` prices a reply as the budget and meter do and always bounds
+    it; `AgentGuard` says what a policy could not evaluate.** Section 8 first
+    priced a reply with `Prices.CostOf` and made a model the table lacks a
+    permanent error. Now `Prices.CostFor`, which is decision 44's one function
+    under a name, prices each attempt at the model it names, then at the model
+    the request asked for; only a reply neither name prices fails the run,
+    permanently, and is never a reply that costs nothing. Rejected: `CostOf`,
+    under which a table keyed by alias fails every run whose provider answers
+    with a dated id; and a second pricing rule in `app`. The tokens a reply
+    reports are summed over its attempts as the cost is, so that a run's token
+    limit sees what its cost limit sees. Every request the adapter sends sets
+    `MaxTokens`, from the run's own or `DefaultMaxTokens` (16000, the budget's
+    number), because a budget's hold is an upper bound only when the request
+    bounds the reply. Rejected: leaving it to the provider's default, which the
+    hold would have to assume was no larger. Errors are classified as
+    `llm.Retryable` classifies them, and the caller's cancellation is read from
+    the context, as decision 42 reads it. A retryable `*llm.Error` and a plain
+    error are returned as they are, the caller's cancellation neither retryable
+    nor permanent. Rejected: `ErrPermanent` on every provider error, which
+    fails a run for a rate limit, and on a context error, which fails every run
+    a worker is stopped under. `agent.Decision` carries only `Effect` and
+    `Rule`, so a policy decision that rests on something it could not evaluate
+    comes back with the rule named as `<rule> (could not evaluate: <names>)`,
+    where the timeline and the approval read it, and the structured
+    `Uncertain` stays in the policy's own record. Rejected: dropping it, which
+    leaves a person asked about "Large payments ask" with no reason when the
+    amount arrived as the string "1250"; and a field on `agent.Decision`,
+    which changes the journal and every store. `AgentGuard` hands `Kind`,
+    `Target` and `Attrs` to `policy` as they are, as decision 53 asks of
+    whatever builds an `Action`.
