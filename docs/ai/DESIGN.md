@@ -866,7 +866,9 @@ type Options struct {
 	HTTPClient *http.Client
 	// IdleTimeout is how long a stream may go without a byte from the
 	// server before Stream gives it up as stalled. Zero means two minutes,
-	// and a negative value no limit.
+	// and a negative value no limit. A server that sends keep-alives and
+	// nothing else is not silent: only the caller's context bounds such a
+	// stream.
 	IdleTimeout time.Duration
 	// Betas are extra anthropic-beta values to send.
 	Betas []string
@@ -893,9 +895,15 @@ func (c *Client) Generate(ctx context.Context, req llm.Request) (*llm.Response, 
 
 // Stream implements llm.Model.
 //
-// A delta is delivered as it arrives and cannot be taken back. When a reply
-// is refused part way, fn has already been given the text and tool calls
-// that came before the refusal; the Response carries none of them.
+// A delta is delivered as it arrives and cannot be taken back, so fn can be
+// given more than the Response then holds. When a reply is refused part way,
+// fn has already been given the text and tool calls that came before the
+// refusal, and the Response carries none of them. When the API falls back to
+// another model part way (Options.RefusalFallback), fn has been given what
+// the first model wrote, a tool call included, and the Response leaves out
+// what the API will not take back; a ToolCallDelta's Index counts the calls
+// as they streamed and then no longer indexes the Response's ToolCalls.
+// The Response is what to act on.
 //
 // A stream is as long as its reply: it is ended by ctx, or by the server
 // sending nothing for Options.IdleTimeout, and not by the time an unstreamed
@@ -916,10 +924,10 @@ Request:
 | `Request.Model`, else `Options.Model`, else `DefaultModel` | `model` |
 | `Request.MaxTokens`, else `Options.MaxTokens`, else 16000 (`Generate`) or 64000 (`Stream`) | `max_tokens` |
 | `Request.System` | `system`, a string; omitted when empty |
-| `RoleUser` message | `{"role":"user","content":[{"type":"text","text":…}]}` |
-| `RoleAssistant` message whose `Opaque.Provider` is `"anthropic"` | `{"role":"assistant","content":` `Opaque.Data` `}`, unchanged |
-| Any other `RoleAssistant` message | A `text` block when `Text` is not empty, then one `{"type":"tool_use","id","name","input"}` block per `ToolCall`; a `Malformed` call is sent with `input` `{}` |
-| `RoleTool` message | One `user` message holding one `{"type":"tool_result","tool_use_id","content","is_error"}` block per `ToolResult`, in order, and nothing else; `is_error` is omitted when false |
+| `RoleUser` message | `{"role":"user","content":[{"type":"text","text":…}]}`; refused when `Text` is empty |
+| `RoleAssistant` message whose `Opaque.Provider` is `"anthropic"` | `{"role":"assistant","content":` `Opaque.Data` `}`, unchanged; refused when `Data` is not a JSON array; left out when it is an empty one |
+| Any other `RoleAssistant` message | A `text` block when `Text` is not empty, then one `{"type":"tool_use","id","name","input"}` block per `ToolCall`; a `Malformed` call is sent with `input` `{}`; left out when it has neither text nor calls |
+| `RoleTool` message | One `user` message holding one `{"type":"tool_result","tool_use_id","content","is_error"}` block per `ToolResult`, in order, and nothing else; `is_error` is omitted when false; refused when it has no results |
 | `Tools` | `tools`: `{"name","description","input_schema","strict"}`; `input_schema` is `{"type":"object"}` when `Schema` is nil; `strict` is omitted when false |
 | `ToolChoiceNone` | `tool_choice: {"type":"none"}`; `ToolChoiceAuto` omits the field |
 | `Output` | `output_config.format: {"type":"json_schema","schema":` `Output.JSON` `}` |
@@ -932,6 +940,18 @@ Request:
 `tools` is always sent in the order given. The provider never removes
 `tools` to turn tool use off: that would change the checked prefix.
 
+Turns the API would refuse are not sent. The API takes no message with empty
+content. An assistant turn with nothing in it, which is what a refused reply
+and a reply the model ended with no content come back as, is left out of the
+request; the turns on either side of it then follow each other, which the API
+reads as one turn. A user turn with no text, a tool turn with no results and
+a provider's form that is not an array cannot be left out without changing
+what the conversation says, so they are refused. Every request this package
+will not send, those and a request it cannot write (JSON that is not valid,
+a role or tool choice it does not know), is an `*llm.Error` with no status,
+a message that says which part is wrong, and `Retryable` false; no call is
+made.
+
 Response:
 
 | Messages API | `llm` |
@@ -940,7 +960,7 @@ Response:
 | `content`: `text` blocks | `Message.Text`, concatenated in order |
 | `content`: `tool_use` blocks | `Message.ToolCalls`: `id`, `name`, and `input` as the bytes received |
 | `content`, the whole array | `Message.Opaque{Provider: "anthropic", Data: …}`, the bytes received |
-| `stop_reason` | `end_turn` → `StopEnd`; `tool_use` → `StopToolUse`; `max_tokens` → `StopMaxTokens`; `stop_sequence` → `StopSequence`; `pause_turn` → `StopPause`; `refusal` → `StopRefusal`; `model_context_window_exceeded` → `StopContextWindow` |
+| `stop_reason` | `end_turn` → `StopEnd`; `tool_use` → `StopToolUse`; `max_tokens` → `StopMaxTokens`; `stop_sequence` → `StopSequence`; `pause_turn` → `StopPause`; `refusal` → `StopRefusal`; `model_context_window_exceeded` → `StopContextWindow`. A value this package does not know is passed through as it is. A reply with no stop reason is refused as not a message: the reference says the field is never null in a reply that is not streamed |
 | `stop_details.category`, `.explanation` | `Response.Refusal` |
 | `stop_reason: "refusal"` | `Message` holds its role and nothing else: no `Text`, no `ToolCalls`, no `Opaque`, whatever `content` held |
 | `usage.input_tokens`, `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`, `.output_tokens_details.thinking_tokens` | `Usage.InputTokens`, `.OutputTokens`, `.CacheReadTokens`, `.CacheWriteTokens`, `.ReasoningTokens`; all zero for a refusal the API does not bill |
@@ -956,6 +976,14 @@ that come before the final `fallback` block, `thinking`, `redacted_thinking`,
 else stays where it is. `Text` and `ToolCalls` are read after the rule, so a
 tool call it drops is not reported as a call to run.
 
+A second rule, for a `thinking` block that arrives with no signature: the
+reference says a thinking block sent back with an empty signature fails, and
+says nothing of what to do with one, so the block is left out of `Opaque`,
+with a line logged at Warn, and the turn can still be replayed. The thinking
+blocks after it in the same turn are left out too, because the reference also
+says that a gap in the run of thinking blocks invalidates the ones after the
+gap, while removing blocks from the end of the run is allowed.
+
 A refused reply hands nothing on. The reference says to treat any partial
 output as incomplete and discard it, and a refused request is retried on
 another model as it was sent, so the turn is never replayed and has no
@@ -964,10 +992,13 @@ runs tools.
 
 `Usage` and `Attempts` hold what was billed, which is less than what the API
 reports. The refusals reference: an attempt that produced output is billed;
-one that declined before any output is billed only when its refusal category
-is `bio`, `frontier_llm` or `reasoning_extraction` (as the page stood in
-September 2026), and in any other category, or with none, is not. So a reply
-refused before any output in an unbilled category has a zero `Usage`. With
+one that declined before any output is billed when its refusal category is
+`bio`, `frontier_llm` or `reasoning_extraction`, and not when it is `cyber`
+or `general_harms` or the refusal has no category (as the page stood in
+September 2026). The page says the billed set may change, so only those
+three are taken as free, and a category this package does not know is
+counted as billed. So a reply refused before any output in an unbilled
+category has a zero `Usage`. With
 `usage.iterations`, the entries are grouped into runs of one model: every
 run but the last is a model that declined, and the `trigger.category` of the
 `fallback` blocks, one per decline and in order, says why. An attempt that
@@ -976,7 +1007,15 @@ was not billed stays in `Attempts`, so the record shows it ran, with a zero
 `trigger`, a refusal with no `stop_details`, or blocks and runs that do not
 line up), the attempt is counted as billed, so a cost is never understated.
 Entries that are not a model's turn at the reply (`compaction`,
-`advisor_message`) are billed as given.
+`advisor_message`) are billed as given. At most 4096 entries are read; a
+record longer than that is an error, since an entry costs far more to hold
+than the JSON that makes one.
+
+An unstreamed reply's blocks are counted as a stream's are, each block its
+bytes and 512 more, against the same 32 MiB, so that a body of very many
+very small blocks is refused and not held as so many structs. A block is
+read for the handful of fields this package uses and its other fields are
+not held, so a block of many fields costs its bytes.
 
 Streaming. The body adds `"stream": true`. Events, read with
 `llm/internal/sse`:
@@ -989,15 +1028,17 @@ Streaming. The body adds `"stream": true`. Events, read with
 | `content_block_delta` `input_json_delta` | Append `partial_json`; `fn(Delta{ToolCall})`, with `ID` and `Name` on the first delta of the block |
 | `content_block_delta` `thinking_delta` | Append; `fn(Delta{Reasoning})` when not empty |
 | `content_block_delta` `signature_delta` | Set the block's `signature` |
-| `content_block_stop` | Close the block. A `tool_use` block's accumulated JSON becomes its `input`; empty accumulates to `{}` |
+| `content_block_stop` | Close the block. A `tool_use` block's accumulated JSON becomes its `input`; empty accumulates to `{}`. A stop, or a delta, for a block that never started or has already stopped is a malformed stream: an `*llm.Error`, not retryable |
 | `message_delta` | Take `delta.stop_reason`, `delta.stop_details`; `usage` here is cumulative, and each count it carries replaces the one held. The reference types its input and cache counts "number or null", and a count it omits or sends as null keeps the value `message_start` gave |
-| `message_stop` | End |
+| `message_stop` | End. The reference says `stop_reason` is not null by now, so a `message_stop` with no stop reason before it, or with no `message_start` before it, is a stream that lost its ending: a retryable transport failure, like one cut short. A stop reason this package does not know is passed through |
 | `ping`, and any event not listed | Ignored |
 | `error` | Return an `*llm.Error` of that type; `overloaded_error` and `api_error` are retryable |
 
 A block stays in the rebuilt content even when no delta carried text: a
 `thinking` block opens, takes its signature and closes. `Opaque` is the
-rebuilt content array. If a block receives a delta type this package does
+rebuilt content array: each block as `content_block_start` gave it, its
+fields in the order they came and those this package does not know among
+them, with the text, thinking, signature and input the deltas added. If a block receives a delta type this package does
 not know, the content cannot be rebuilt faithfully, so `Opaque` is left nil
 for that reply and a line is logged at Warn; the turn is then replayed from
 `Text` and `ToolCalls`, which the reference allows. `citations_delta` is
@@ -1018,11 +1059,18 @@ has no timeout. Four things end it early.
   both hold. The time the caller's `fn` takes over a delta is not counted:
   the wait starts afresh when `fn` returns.
 - The event reader's bound of 16 MiB on one event.
-- The 32 MiB bound of an unstreamed body, applied to everything the reply
-  keeps and not to the bytes on the wire: the message's id and model, each
-  block as it starts (a tool call's id and name with it), every delta folded
-  into a block, and how the reply ended. Keep-alives and events that are
-  ignored do not count.
+- The 32 MiB bound of an unstreamed body, applied to what the reply makes
+  the process hold and not to the bytes on the wire. Counted: each
+  `message_start` and `message_delta` event whole; each block as it starts
+  (a tool call's id and name with it) and a fixed 512 bytes for the block,
+  which is what its structs and map entry cost (the OpenAI provider counts
+  256 a call, and a block here is held twice, once while it streams and once
+  in the reply); and each delta at the length it is kept at, which is its
+  JSON-escaped length, since the provider's form of the turn holds it
+  escaped and a character can take six bytes there. The count never falls: a
+  later `message_delta` is added to the earlier ones, because what an
+  earlier one said stays unless the later one says it again. Keep-alives and
+  events that are ignored do not count.
 
 Passing either size bound is a plain error, not an `*llm.Error` and not
 retryable: the same request would pass it again. The idle limit is kept by
@@ -4205,9 +4253,11 @@ its review ruled on what that turned up. These change section 4.4.
     with its counts as given, which overstates the cost of every fallback
     after an unbilled refusal; and leaving such an attempt out, which loses
     the record that it ran. Where the API does not say why an attempt
-    declined, it is counted as billed. The three billed categories are
-    written into the package with the month they were read, since the
-    reference says the set may change.
+    declined, it is counted as billed, and so is one that declined in a
+    category the package does not know: the reference says the billed set
+    may change, and the package promises a cost is never too low. The
+    categories that are free (`cyber`, `general_harms`, and no category) are
+    written into the package with the month they were read.
 
 42. **The fallback echo rule also drops a server tool call that has no
     result.** The reference's table has that row and 4.4 did not.
@@ -4260,3 +4310,53 @@ its review ruled on what that turned up. These change section 4.4.
 51. **Citations are not mapped.** `citations_delta` is treated as any delta
     type the package does not know. It can only arrive when a caller turns
     citations or a server tool on through `Extra`.
+
+52. **The reply bound counts what the process holds.** Each content block
+    costs 512 bytes besides its own, streamed or not; a delta is counted at
+    the length it is kept at, escapes and all; and the count never falls.
+    Rejected: counting a block by its JSON, under which a million two-byte
+    blocks were counted as two megabytes and held four hundred; taking
+    bytes back when a later `message_delta` was smaller, while the fields
+    the earlier one set were still held; and counting a delta as decoded,
+    while the provider's form holds it escaped at up to six bytes a
+    character. For the same reason a block is read for the fields the
+    package uses and no map of its fields is built, and `usage.iterations`
+    is read up to 4096 entries.
+
+53. **A stream that reaches `message_stop` with no stop reason is a failed
+    call.** So is one whose `message_stop` has no `message_start` before
+    it. Both are retryable, as a cut stream is. Rejected: returning a reply
+    with an empty stop and a nil error, which an engine would take for a
+    turn that ended. An unstreamed reply with no stop reason is refused for
+    the same reason, as a body that is not a message; nothing was lost on
+    the way there, so that one is not retryable.
+
+54. **Events out of order are a malformed stream.** A delta or a stop for a
+    block that never started, or for one already stopped, and a block
+    started twice, are each an error that is not retryable. Rejected: the
+    first pass's mix, where one of these was an error, one was ignored and
+    one was appended to the block.
+
+55. **A turn the API would refuse is not sent.** An assistant turn with
+    nothing in it is left out of the request; a user turn with no text, a
+    tool turn with no results and a provider's form that is not an array are
+    refused before the call. Rejected: sending `"content":[]`, which turns
+    one refused or empty reply into a 400 on every later request of the
+    conversation. Every request the package will not send is an
+    `*llm.Error` that is not retryable.
+
+56. **A thinking block with no signature is left out of the provider's
+    form, with the thinking after it in the turn.** The reference says such
+    a block fails when sent back and does not say what to do with it.
+    Rejected: keeping it, which wedges a durable run on its next request;
+    dropping it alone, which leaves a gap the reference says invalidates the
+    thinking blocks after it; and dropping the whole provider's form, which
+    loses the thinking before it for nothing.
+
+57. **A rebuilt block keeps its fields in the order they came.** The first
+    pass wrote them sorted, out of a map of the block's fields; the map is
+    gone (decision 52), and the block is now copied through field by field.
+
+58. **The empty arguments of a tool call are a new slice each time.**
+    Rejected: one package-level `{}`, which a caller editing a call's input
+    in place would have changed for every later reply and request.
