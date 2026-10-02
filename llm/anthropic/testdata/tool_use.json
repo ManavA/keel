@@ -1,0 +1,24 @@
+{
+  "id": "msg_01Aq9w938a90dw8q",
+  "type": "message",
+  "model": "claude-opus-5-5",
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "I'll check the current weather in San Francisco for you."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_01A09q90qw90lq917835lq9",
+      "name": "get_weather",
+      "input": { "unit": "celsius", "location": "San Francisco, CA" }
+    }
+  ],
+  "usage": {
+    "input_tokens": 472,
+    "output_tokens": 89
+  }
+}

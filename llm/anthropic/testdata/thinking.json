@@ -1,0 +1,38 @@
+{
+  "id": "msg_01Aq9w938a90dw8q",
+  "type": "message",
+  "model": "claude-opus-5-5",
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "stop_details": null,
+  "role": "assistant",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "",
+      "signature": "EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds"
+    },
+    {
+      "type": "redacted_thinking",
+      "data": "EmwKAhgBEgy3va3pzix/LafPsn4aDFIT2Xlxh0L5L8rLVyIwxtE3rAFBa8cr3qpP"
+    },
+    {
+      "type": "text",
+      "text": "I'll check the current weather in San Francisco for you."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_01A09q90qw90lq917835lq9",
+      "name": "get_weather",
+      "input": { "unit": "celsius", "location": "San Francisco, CA" },
+      "caller": { "type": "direct" }
+    }
+  ],
+  "usage": {
+    "input_tokens": 472,
+    "output_tokens": 121,
+    "output_tokens_details": {
+      "thinking_tokens": 32
+    }
+  }
+}
