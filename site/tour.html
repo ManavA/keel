@@ -10,7 +10,7 @@
 <nav class="top"><a href="index.html">keel showcase</a> · <strong>Tour</strong> · <a href="gallery.html">Gallery</a> · <a href="tutorial.html">Tutorial</a></nav>
 <main>
 <h1>Package tour</h1>
-<p>Six stops across the tree. Every sample below is taken from the real packages and executed by
+<p>Seven stops across the tree. Every sample below is taken from the real packages and executed by
 <code>site/tour_test.go</code>, so the code you read is the code that runs.</p>
 
 <section class="tour-stop">
@@ -103,10 +103,35 @@ its password replaced.</p>
 config.RedactURL("") // "[unset]"</code></pre>
 </section>
 
+<section class="tour-stop">
+<h2>7. <code>policy</code> — allow, ask or block before an agent acts</h2>
+<p>A policy is an ordered list of rules, each giving an effect (allow, ask or block) to the
+actions it matches. Every matching rule counts and the strictest wins; an action no rule matches
+is blocked unless the policy's default says otherwise. A condition that cannot be evaluated
+counts toward the stricter outcome, and the decision lists it under <code>Uncertain</code>.</p>
+<pre><code>rules := policy.Policy{Rules: []policy.Rule{
+    {Name: "reads are fine", Effect: policy.Allow,
+        When: policy.Match{Kinds: []string{"read"}}},
+    {Name: "large payments need a person", Effect: policy.Ask,
+        When: policy.Match{Kinds: []string{"pay"}, Attrs: []policy.Cond{
+            {Attr: "amount", Op: policy.OpGt, Value: 500},
+        }}},
+    {Name: "nothing leaves unreviewed", Effect: policy.Block,
+        When: policy.Match{Kinds: []string{"send"}, Attrs: []policy.Cond{
+            {Attr: "external", Op: policy.OpEq, Value: true},
+        }}},
+}}
+rules.Decide(policy.Action{Kind: "pay", Target: "vendor:acme",
+    Attrs: map[string]any{"amount": 1200}})
+// Effect == policy.Ask, Rule == "large payments need a person"
+rules.Decide(policy.Action{Kind: "delete", Target: "note:42"})
+// Effect == policy.Block, Rule == policy.RuleDefault, Index == -1</code></pre>
+</section>
+
 <p><a href="gallery.html">See the UI these packages serve in the gallery →</a></p>
 </main>
 <footer>Sources: <code>retry/retry.go</code>, <code>textpolicy/policy.go</code>,
 <code>flags/flags.go</code>, <code>jobs/outcome.go</code>, <code>httpx/respond.go</code>,
-<code>config/redact.go</code>, all at <code>github.com/ManavA/keel/tree/main</code>.</footer>
+<code>config/redact.go</code>, <code>policy/policy.go</code>, all at <code>github.com/ManavA/keel/tree/main</code>.</footer>
 </body>
 </html>

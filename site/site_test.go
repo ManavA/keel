@@ -64,6 +64,7 @@ func TestTourQuotesKeptInSync(t *testing.T) {
 		"jobs.Outcome",
 		"httpx.JSON",
 		"config.RedactURL",
+		"policy.Policy",
 	} {
 		require.Contains(t, string(tour), marker, "tour.html no longer quotes %s", marker)
 	}
