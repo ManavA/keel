@@ -99,6 +99,21 @@ var profiles = []profile{
 			"001_webhook_deliveries",
 		},
 	},
+	{
+		name:    "agent",
+		example: "agentdemo",
+		root:    "testdata/agent",
+		blurb:   "durable agents on Postgres: a journaled run that survives a kill, waits for approval, and is held to rules",
+		packages: []string{
+			"agent", "app", "config", "events", "httpx", "llm", "log", "pg", "policy", "textpolicy",
+		},
+		migrations: []string{
+			"agent: 001_agent_journal",
+			"policy: 001_policy_decisions",
+			"001_agent_example",
+		},
+		bootEnvs: []string{"OPERATOR_TOKEN"},
+	},
 }
 
 // defaultProfile is the template keel new copies when no profile is named.
@@ -107,7 +122,7 @@ const defaultProfile = "minimal"
 // templateFS holds every profile's example. Each subtree mirrors
 // examples/<example> file for file; see profile and cmd/new_test.go.
 //
-//go:embed all:testdata/minimal all:testdata/standard all:testdata/apionly all:testdata/worker all:testdata/webhook
+//go:embed all:testdata/minimal all:testdata/standard all:testdata/apionly all:testdata/worker all:testdata/webhook all:testdata/agent
 var templateFS embed.FS
 
 // keelModule and keelVersion are the require line a new project starts with.

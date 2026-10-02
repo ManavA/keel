@@ -165,6 +165,15 @@ func TestProfilesDescribePackagesAndMigrations(t *testing.T) {
 	}
 	assert.Contains(t, strings.Join(worker.migrations, " "), "001_worker_heartbeats")
 
+	agent := byName["agent"]
+	for _, want := range []string{"agent", "llm", "policy", "textpolicy", "events"} {
+		assert.Contains(t, agent.packages, want, "agent must list %s", want)
+	}
+	for _, want := range []string{"001_agent_journal", "001_policy_decisions", "001_agent_example"} {
+		assert.Contains(t, strings.Join(agent.migrations, " "), want, "agent must list %s", want)
+	}
+	assert.Equal(t, []string{"OPERATOR_TOKEN"}, agent.bootEnvs)
+
 	webhook := byName["webhook"]
 	for _, want := range []string{"app", "httpx", "pg", "webhooks"} {
 		assert.Contains(t, webhook.packages, want, "webhook must list %s", want)
@@ -271,6 +280,26 @@ func TestNewWorkerProfileGeneratesJobsOnlyShape(t *testing.T) {
 	assert.Contains(t, string(raw), "require "+keelModule+" "+keelVersion+"\n")
 }
 
+func TestNewAgentProfileGeneratesAgentShape(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "reviewer")
+	require.NoError(t, createProject(dir, "example.com/reviewer", "agent"))
+
+	for _, name := range []string{
+		"main.go", "config.go", "agents.go", "policy.go", "policy.json", "handlers.go",
+		"main_test.go", "README.md",
+		filepath.Join("migrations", "001_agent_example.up.sql"),
+		filepath.Join("migrations", "001_agent_example.down.sql"),
+	} {
+		assert.FileExists(t, filepath.Join(dir, name))
+	}
+	assert.NoFileExists(t, filepath.Join(dir, "notes.go"), "agent must not carry the notes table")
+
+	raw, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "module example.com/reviewer\n")
+	assert.Contains(t, string(raw), "require "+keelModule+" "+keelVersion+"\n")
+}
+
 func TestNewWebhookProfileGeneratesReceiverShape(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "hook")
 	require.NoError(t, createProject(dir, "example.com/hook", "webhook"))
@@ -367,6 +396,20 @@ func TestRunNewUsage(t *testing.T) {
 	assert.Equal(t, 2, run([]string{"bogus"}))
 	assert.Equal(t, 2, run([]string{"new"}))
 	assert.Equal(t, 0, run([]string{"help"}))
+
+	// usage writes to stderr.
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	saved := os.Stderr
+	os.Stderr = w
+	usage()
+	os.Stderr = saved
+	require.NoError(t, w.Close())
+	raw, err := io.ReadAll(r)
+	require.NoError(t, err)
+	out := string(raw)
+	assert.Contains(t, out, "agent")
+	assert.Contains(t, out, "durable agents on Postgres")
 }
 
 // TestStandardProfileBuildsAndBoots is the issue's acceptance check: a project
@@ -539,6 +582,78 @@ func TestWorkerProfileBuildsAndBoots(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("worker never wrote a heartbeat (last error: %v); log:\n%s", err, &workerLog)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// TestAgentProfileBuildsAndBoots is the agent profile's acceptance check: a
+// project made with the agent profile builds and boots against a real
+// database with the scripted model, and a posted batch leaves a run waiting
+// for approval in agent_runs.
+func TestAgentProfileBuildsAndBoots(t *testing.T) {
+	db := testdb.Shared(t)
+
+	dir := filepath.Join(t.TempDir(), "reviewer")
+	require.NoError(t, createProject(dir, "example.com/reviewer", "agent"))
+
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	require.NoError(t, err)
+	goRun := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("go", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "go %s: %s", strings.Join(args, " "), out)
+	}
+	goRun("mod", "edit", "-replace", keelModule+"="+root)
+	goRun("mod", "tidy")
+	bin := filepath.Join(dir, "reviewer")
+	goRun("build", "-o", bin, ".")
+
+	port := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"DATABASE_URL="+db.URL,
+		"OPERATOR_TOKEN=boot-operator-token",
+		"LLM_PROVIDER=scripted",
+		"PORT="+strconv.Itoa(port),
+	)
+	var serverLog bytes.Buffer
+	cmd.Stdout = &serverLog
+	cmd.Stderr = &serverLog
+	require.NoError(t, cmd.Start())
+
+	base := "http://127.0.0.1:" + strconv.Itoa(port)
+	require.NoError(t, waitForStatus(t, base+"/readyz", http.StatusOK, time.Minute),
+		"agent scaffold never became ready; server log:\n%s", &serverLog)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/batches", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer boot-operator-token")
+	req.Header.Set("Idempotency-Key", "boot-batch")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	posted, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	require.Equal(t, http.StatusAccepted, resp.StatusCode, "POST /api/batches: %s", posted)
+
+	conn, err := pgx.Connect(ctx, db.URL)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close(context.Background()) }()
+
+	deadline := time.Now().Add(time.Minute)
+	for {
+		var count int
+		err := conn.QueryRow(ctx, `SELECT count(*) FROM agent_runs WHERE status = 'waiting'`).Scan(&count)
+		if err == nil && count > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no run reached waiting (last error: %v); log:\n%s", err, &serverLog)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
