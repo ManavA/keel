@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"maps"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/ManavA/keel/agent"
 	"github.com/ManavA/keel/llm"
@@ -230,8 +231,26 @@ func (a *agentModel) response(ctx context.Context, resp *llm.Response, asked str
 	}, nil
 }
 
+// maxLoggedExplanation is how much of a refusal's explanation is logged. It is
+// the provider's own text, and one that quoted the prompt back would otherwise
+// put the prompt in the log.
+const maxLoggedExplanation = 512
+
+// cut returns s, or its first limit bytes ending at a whole character with a
+// mark that it was cut.
+func cut(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return s[:limit] + "…"
+}
+
 // logRefusal says why a model refused, which agent.Response has no place for.
-// The prompt and the reply's text stay out of the log.
+// The prompt and the reply's text stay out of the log, and the explanation is
+// cut at maxLoggedExplanation bytes.
 func (a *agentModel) logRefusal(ctx context.Context, resp *llm.Response) {
 	attrs := []any{"id", resp.ID, "model", resp.Model}
 	if r := resp.Refusal; r != nil {
@@ -239,7 +258,7 @@ func (a *agentModel) logRefusal(ctx context.Context, resp *llm.Response) {
 			attrs = append(attrs, "category", r.Category)
 		}
 		if r.Explanation != "" {
-			attrs = append(attrs, "explanation", r.Explanation)
+			attrs = append(attrs, "explanation", cut(r.Explanation, maxLoggedExplanation))
 		}
 	}
 	a.logger.WarnContext(ctx, "app: agent model: the model refused the request", attrs...)
@@ -309,7 +328,10 @@ func permanentUnlessDone(ctx context.Context, err error) error {
 //
 // where the run's timeline and the approval a person is shown will say why a
 // rule whose condition looks unmet decided. A decision that could not be
-// recorded is an error and no decision, never an Allow.
+// recorded is an error and no decision, never an Allow. If it can never be
+// recorded, whatever is retried (policy.ErrUnrecordable), the error also wraps
+// agent.ErrPermanent, so the engine refuses the call rather than asking again
+// for ever; a store that is down is returned as it is, and is tried again.
 func AgentGuard(d *policy.Decider) agent.Guard { return agentGuard{decider: d} }
 
 type agentGuard struct{ decider *policy.Decider }
@@ -323,6 +345,11 @@ func (g agentGuard) Decide(ctx context.Context, a agent.Action) (agent.Decision,
 	}
 	d, err := g.decider.Decide(ctx, policy.Action{Kind: a.Kind, Target: a.Target, Attrs: a.Attrs})
 	if err != nil {
+		// A decision no store can ever hold is not worth asking for again.
+		// With ctx done the error is the caller's, and comes back as it is.
+		if errors.Is(err, policy.ErrUnrecordable) && ctx.Err() == nil {
+			return agent.Decision{}, fmt.Errorf("app: agent guard: %w: %w", agent.ErrPermanent, err)
+		}
 		return agent.Decision{}, fmt.Errorf("app: agent guard: %w", err)
 	}
 	rule := d.Rule

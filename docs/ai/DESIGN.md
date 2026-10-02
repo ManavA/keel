@@ -4403,7 +4403,11 @@ only `Effect` and `Rule`, gets it in the rule: `<rule> (could not evaluate:
 <names joined by ", ">)`. The run's timeline and the approval a person is
 shown then say why a rule whose condition looks unmet decided; the structured
 field stays in the policy's own record. A decision that could not be recorded
-is an error and no decision.
+is an error and no decision. A decision that can never be recorded (`policy.ErrUnrecordable`:
+a NUL, a value no store holds) comes back wrapped in `agent.ErrPermanent` as
+well, so the engine refuses the call instead of retrying it for ever; a store
+that is down is returned as it is and tried again; and with the caller's
+context done the error is the caller's, as for `AgentModel`.
 
 Composition is the caller's. The `llm` wrappers go outermost first as
 `Budgeted`, `Metered`, `Fallback`, then one `Retrying` per provider (4.7); the

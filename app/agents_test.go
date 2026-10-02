@@ -1,6 +1,7 @@
 package app_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1050,6 +1052,43 @@ func logAttrs(r slog.Record) map[string]string {
 
 // A refusal has nowhere to go in agent.Response, so its reason is logged. The
 // prompt and the reply's text are never logged.
+func TestAgentModel_ALongRefusalExplanationIsCutInTheLog(t *testing.T) {
+	// A provider's explanation is its own text, and could quote the prompt back.
+	long := strings.Repeat("é", 400) // 800 bytes
+	var buf bytes.Buffer
+	resp := &llm.Response{
+		ID:      "msg_01XYZ",
+		Model:   "model-a-20251001",
+		Message: llm.Message{Role: llm.RoleAssistant},
+		Stop:    llm.StopRefusal,
+		Refusal: &llm.Refusal{Category: "policy", Explanation: long},
+	}
+	m := app.AgentModel(answering(resp), app.AgentModelOptions{Logger: slog.New(slog.NewJSONHandler(&buf, nil))})
+
+	generate(t, m, asUser("model-a", "prompt"))
+
+	var line map[string]any
+	require.NoError(t, json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &line))
+	got, _ := line["explanation"].(string)
+	assert.LessOrEqual(t, len(got), 512+len("…"), "the log keeps the start of it")
+	assert.True(t, utf8.ValidString(got), "cut between characters, not inside one")
+	assert.True(t, strings.HasSuffix(got, "…"), "and says it was cut")
+	assert.True(t, strings.HasPrefix(long, strings.TrimSuffix(got, "…")))
+
+	t.Run("one that fits is logged whole", func(t *testing.T) {
+		buf.Reset()
+		short := *resp
+		short.Refusal = &llm.Refusal{Explanation: strings.Repeat("a", 512)}
+		m := app.AgentModel(answering(&short), app.AgentModelOptions{Logger: slog.New(slog.NewJSONHandler(&buf, nil))})
+
+		generate(t, m, asUser("model-a", "prompt"))
+
+		var line map[string]any
+		require.NoError(t, json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &line))
+		assert.Equal(t, strings.Repeat("a", 512), line["explanation"])
+	})
+}
+
 func TestAgentModel_ARefusalIsLogged(t *testing.T) {
 	refusal := func() *llm.Response {
 		return &llm.Response{
@@ -1905,6 +1944,46 @@ func TestAgentGuard_ARecorderThatFailsIsAnErrorAndNotAnAllow(t *testing.T) {
 	assert.Equal(t, agent.Decision{}, got)
 	assert.NotEqual(t, agent.Allow, got.Effect)
 	assert.NotErrorIs(t, err, agent.ErrPermanent)
+}
+
+func TestAgentGuard_ADecisionThatCanNeverBeRecordedIsPermanent(t *testing.T) {
+	never := fmt.Errorf("pg: the action holds a NUL: %w", policy.ErrUnrecordable)
+
+	t.Run("a record no store can hold is permanent, and still itself", func(t *testing.T) {
+		g := app.AgentGuard(newDecider(t, policy.Policy{Default: policy.Allow}, &captureRecorder{err: never}))
+
+		got, err := g.Decide(context.Background(), agent.Action{Kind: "read"})
+
+		require.ErrorIs(t, err, agent.ErrPermanent, "retrying cannot make the record storable")
+		require.ErrorIs(t, err, policy.ErrUnrecordable)
+		require.ErrorIs(t, err, never)
+		assert.Equal(t, agent.Decision{}, got)
+	})
+
+	t.Run("an action too large to copy is permanent", func(t *testing.T) {
+		big := make([]any, 10001)
+		for i := range big {
+			big[i] = i
+		}
+		g := app.AgentGuard(newDecider(t, policy.Policy{Default: policy.Allow}, &captureRecorder{}))
+
+		got, err := g.Decide(context.Background(), agent.Action{Kind: "read", Attrs: map[string]any{"rows": big}})
+
+		require.ErrorIs(t, err, policy.ErrUnrecordable)
+		require.ErrorIs(t, err, agent.ErrPermanent)
+		assert.Equal(t, agent.Decision{}, got)
+	})
+
+	t.Run("with the caller's context done the error comes back as it is", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		g := app.AgentGuard(newDecider(t, policy.Policy{Default: policy.Allow}, &captureRecorder{err: never}))
+
+		_, err := g.Decide(ctx, agent.Action{Kind: "read"})
+
+		require.ErrorIs(t, err, never)
+		assert.NotErrorIs(t, err, agent.ErrPermanent, "a run being shut down is not failed for good")
+	})
 }
 
 func TestAgentGuard_TheContextReachesTheRecorder(t *testing.T) {
