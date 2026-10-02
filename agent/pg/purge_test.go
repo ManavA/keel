@@ -141,13 +141,21 @@ func TestPurge_AndAChildEndingTakeRowsInOneOrder(t *testing.T) {
 	}()
 	holding.arrived(t)
 
+	// The purge, counted: one that Postgres ended for a deadlock would be
+	// tried again, and would succeed the second time.
+	var tries atomic.Int32
+	purging := agentpg.New(stepped{Beginner: pool, before: func(st statement) {
+		if st.n == 1 {
+			tries.Add(1)
+		}
+	}})
 	type purge struct {
 		removed int64
 		err     error
 	}
 	purged := make(chan purge, 1)
 	go func() {
-		removed, err := store.Purge(k.ctx, cut)
+		removed, err := purging.Purge(k.ctx, cut)
 		purged <- purge{removed, err}
 	}()
 	waits(t, pool, purged)
@@ -157,6 +165,7 @@ func TestPurge_AndAChildEndingTakeRowsInOneOrder(t *testing.T) {
 	got := result(t, purged)
 	require.NoError(t, got.err)
 	assert.Equal(t, int64(1), got.removed)
+	assert.Equal(t, int32(1), tries.Load(), "the purge waited for the child and held nothing the child wanted")
 	for _, gone := range []agent.Run{root, child} {
 		_, err := store.GetRun(k.ctx, gone.ID)
 		assert.ErrorIs(t, err, agent.ErrNotFound)
