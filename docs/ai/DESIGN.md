@@ -855,8 +855,19 @@ type Options struct {
 	// MaxTokens is used for a request that sets none. Default 16000 for
 	// Generate and 64000 for Stream.
 	MaxTokens int
-	// HTTPClient defaults to a client with a 10 minute timeout.
+	// HTTPClient defaults to one that gives Generate 10 minutes, puts no
+	// limit of its own on a stream, and follows no redirect. A client given
+	// here is used for every call and keeps its own policies. Its Timeout,
+	// if it has one, cuts a stream short however healthy the stream is. If
+	// it follows redirects, a 307 or 308 sends the request body again, and
+	// the body holds the prompt: where that goes is the given client's
+	// policy. The key and the anthropic headers are withheld from any
+	// origin but the configured one whatever the policy.
 	HTTPClient *http.Client
+	// IdleTimeout is how long a stream may go without a byte from the
+	// server before Stream gives it up as stalled. Zero means two minutes,
+	// and a negative value no limit.
+	IdleTimeout time.Duration
 	// Betas are extra anthropic-beta values to send.
 	Betas []string
 	// RefusalFallback, when "default", asks the API to retry a refused
@@ -864,7 +875,7 @@ type Options struct {
 	// reply.
 	RefusalFallback string
 	// Extra is merged into every request body, for a field this package
-	// does not model.
+	// does not model. A key this package also writes replaces what it wrote.
 	Extra map[string]any
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
@@ -873,13 +884,22 @@ type Options struct {
 // Client calls the Messages API over net/http.
 type Client struct{ /* unexported fields */ }
 
-// New builds a Client. It returns an error when APIKey is empty.
+// New builds a Client. It returns an error when APIKey is empty, and when
+// BaseURL, RefusalFallback or Extra holds something that cannot be used.
 func New(opts Options) (*Client, error)
 
 // Generate implements llm.Model.
 func (c *Client) Generate(ctx context.Context, req llm.Request) (*llm.Response, error)
 
 // Stream implements llm.Model.
+//
+// A delta is delivered as it arrives and cannot be taken back. When a reply
+// is refused part way, fn has already been given the text and tool calls
+// that came before the refusal; the Response carries none of them.
+//
+// A stream is as long as its reply: it is ended by ctx, or by the server
+// sending nothing for Options.IdleTimeout, and not by the time an unstreamed
+// call is given. The time fn takes is the caller's and is not counted.
 func (c *Client) Stream(ctx context.Context, req llm.Request, fn func(llm.Delta) error) (*llm.Response, error)
 
 var _ llm.Model = (*Client)(nil)
@@ -922,16 +942,41 @@ Response:
 | `content`, the whole array | `Message.Opaque{Provider: "anthropic", Data: …}`, the bytes received |
 | `stop_reason` | `end_turn` → `StopEnd`; `tool_use` → `StopToolUse`; `max_tokens` → `StopMaxTokens`; `stop_sequence` → `StopSequence`; `pause_turn` → `StopPause`; `refusal` → `StopRefusal`; `model_context_window_exceeded` → `StopContextWindow` |
 | `stop_details.category`, `.explanation` | `Response.Refusal` |
-| `usage.input_tokens`, `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`, `.output_tokens_details.thinking_tokens` | `Usage.InputTokens`, `.OutputTokens`, `.CacheReadTokens`, `.CacheWriteTokens`, `.ReasoningTokens` |
-| `usage.iterations`, when present | `Response.Attempts`, one per entry: `model` and its token counts |
+| `stop_reason: "refusal"` | `Message` holds its role and nothing else: no `Text`, no `ToolCalls`, no `Opaque`, whatever `content` held |
+| `usage.input_tokens`, `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`, `.output_tokens_details.thinking_tokens` | `Usage.InputTokens`, `.OutputTokens`, `.CacheReadTokens`, `.CacheWriteTokens`, `.ReasoningTokens`; all zero for a refusal the API does not bill |
+| `usage.iterations`, when present | `Response.Attempts`, one per entry: `model`, or the reply's model when the entry names none, and its token counts; no counts for an attempt the API does not bill |
 
 Every block type is kept in `Opaque`, including `thinking` blocks with empty
 text, `redacted_thinking`, and types this package does not know. One rule
 applies before `Opaque` is stored: when the content holds a `fallback` block,
-the reference's table for echoing a fallback turn is applied (drop
-`thinking`, `redacted_thinking`, `connector_text` and client `tool_use`
-blocks that come before the final `fallback` block; keep everything else
-where it is).
+the reference's table for echoing a fallback turn is applied. Of the blocks
+that come before the final `fallback` block, `thinking`, `redacted_thinking`,
+`connector_text` and client `tool_use` blocks are dropped, and so is a
+`server_tool_use` block that has no result block answering it; everything
+else stays where it is. `Text` and `ToolCalls` are read after the rule, so a
+tool call it drops is not reported as a call to run.
+
+A refused reply hands nothing on. The reference says to treat any partial
+output as incomplete and discard it, and a refused request is retried on
+another model as it was sent, so the turn is never replayed and has no
+`Opaque`. A tool call from a turn the model refused must not reach whatever
+runs tools.
+
+`Usage` and `Attempts` hold what was billed, which is less than what the API
+reports. The refusals reference: an attempt that produced output is billed;
+one that declined before any output is billed only when its refusal category
+is `bio`, `frontier_llm` or `reasoning_extraction` (as the page stood in
+September 2026), and in any other category, or with none, is not. So a reply
+refused before any output in an unbilled category has a zero `Usage`. With
+`usage.iterations`, the entries are grouped into runs of one model: every
+run but the last is a model that declined, and the `trigger.category` of the
+`fallback` blocks, one per decline and in order, says why. An attempt that
+was not billed stays in `Attempts`, so the record shows it ran, with a zero
+`Usage`. When the API gives no category (a `fallback` block with no
+`trigger`, a refusal with no `stop_details`, or blocks and runs that do not
+line up), the attempt is counted as billed, so a cost is never understated.
+Entries that are not a model's turn at the reply (`compaction`,
+`advisor_message`) are billed as given.
 
 Streaming. The body adds `"stream": true`. Events, read with
 `llm/internal/sse`:
@@ -939,13 +984,13 @@ Streaming. The body adds `"stream": true`. Events, read with
 | Event | Handling |
 |---|---|
 | `message_start` | Take `message.id`, `message.model` and the first `usage` |
-| `content_block_start` | Open the block at `index` with `content_block` as received |
+| `content_block_start` | Open the block at `index` with `content_block` as received. A `fallback` block also sets the reply's model to its `to.model`: after a decline part way through a stream, `message_start` named the model that declined |
 | `content_block_delta` `text_delta` | Append to the block's text; `fn(Delta{Text})` |
 | `content_block_delta` `input_json_delta` | Append `partial_json`; `fn(Delta{ToolCall})`, with `ID` and `Name` on the first delta of the block |
 | `content_block_delta` `thinking_delta` | Append; `fn(Delta{Reasoning})` when not empty |
 | `content_block_delta` `signature_delta` | Set the block's `signature` |
 | `content_block_stop` | Close the block. A `tool_use` block's accumulated JSON becomes its `input`; empty accumulates to `{}` |
-| `message_delta` | Take `delta.stop_reason`, `delta.stop_details`; `usage` here is cumulative and replaces what was held |
+| `message_delta` | Take `delta.stop_reason`, `delta.stop_details`; `usage` here is cumulative, and each count it carries replaces the one held. The reference types its input and cache counts "number or null", and a count it omits or sends as null keeps the value `message_start` gave |
 | `message_stop` | End |
 | `ping`, and any event not listed | Ignored |
 | `error` | Return an `*llm.Error` of that type; `overloaded_error` and `api_error` are retryable |
@@ -955,15 +1000,75 @@ A block stays in the rebuilt content even when no delta carried text: a
 rebuilt content array. If a block receives a delta type this package does
 not know, the content cannot be rebuilt faithfully, so `Opaque` is left nil
 for that reply and a line is logged at Warn; the turn is then replayed from
-`Text` and `ToolCalls`, which the reference allows.
+`Text` and `ToolCalls`, which the reference allows. `citations_delta` is
+such a type: citations are not mapped.
+
+What bounds a stream. A stream is as long as its reply, so it is not held to
+the 10 minutes an unstreamed call is given: the default client for `Stream`
+has no timeout. Four things end it early.
+
+- The caller's context.
+- An idle limit, `Options.IdleTimeout`, two minutes by default. It is the
+  time between one byte from the server and the next while `Stream` is
+  waiting on the server, for the response to begin and then for each event;
+  a keep-alive `ping` and a comment line count as much as an event does.
+  When it passes, the connection is taken as stalled and the call fails with
+  an `*llm.Error` that is retryable and has no context error in its chain,
+  so it cannot be mistaken for the caller's cancellation, which wins when
+  both hold. The time the caller's `fn` takes over a delta is not counted:
+  the wait starts afresh when `fn` returns.
+- The event reader's bound of 16 MiB on one event.
+- The 32 MiB bound of an unstreamed body, applied to everything the reply
+  keeps and not to the bytes on the wire: the message's id and model, each
+  block as it starts (a tool call's id and name with it), every delta folded
+  into a block, and how the reply ended. Keep-alives and events that are
+  ignored do not count.
+
+Passing either size bound is a plain error, not an `*llm.Error` and not
+retryable: the same request would pass it again. The idle limit is kept by
+one goroutine per stream, which has ended, with its timer, by the time
+`Stream` returns on any path.
+
+A stream that ends before `message_stop`, cleanly or in the middle of an
+event, is a retryable transport failure, and that includes one that ended
+before it sent anything. A reply the server opened and closed with no content
+between is a reply, and an empty one. Reading stops at `message_stop`; the
+little that follows it (up to 64 KiB, for up to 100 milliseconds) is then
+drained so that `net/http` returns the connection to its pool, and nothing in
+that can fail the call.
+
+A response to a streaming request that is 2xx and whose `Content-Type` is not
+`text/event-stream` is not read as a stream. If its body is the API's error
+object it becomes that `*llm.Error`; otherwise the call fails with an
+`*llm.Error` that names the content type and is not retryable.
 
 Errors. A response that is not 2xx becomes `*llm.Error` with `Status`, the
 body's `error.type` and `error.message`, `RequestID` from the `request-id`
 header, and `RetryAfter` from `retry-after` in seconds. `Retryable` is true
 for 408, 409 and every 5xx, which includes 529 `overloaded_error`, and for
 429 only when `retry-after` is present: the reference says a 429 without it
-is a spend cap that keeps failing. A transport failure is retryable unless
-the context ended.
+is a spend cap that keeps failing. A 2xx body that is the API's error object
+(`{"type":"error","error":{…}}`) in place of a reply is an `*llm.Error` of
+that type too, retryable as a stream's `error` event is. The status is the
+answer: a response that is not 2xx is reported as that status even when its
+body could not be read whole, which only costs the error its message.
+
+When a call fails and the caller's context has ended, the error returned is
+the context's, wrapped, and not an `*llm.Error`: the caller gave up and there
+is nothing to retry. With the context live, a transport failure and the HTTP
+client's own timeout are `*llm.Error` with `Err` set and `Retryable` true.
+
+Redirects. The clients this package builds follow none: a 3xx is returned as
+an `*llm.Error`. `net/http` would repeat a 307 or 308 with its body and with
+`x-api-key`, which is not among the headers it withholds from another host. A
+client given in `Options.HTTPClient` keeps its own redirect policy; the
+package wraps a copy of it so that `x-api-key`, `anthropic-version` and
+`anthropic-beta` are taken off any request a redirect sends to another
+origin. Another origin is another scheme, host or port than the configured
+`BaseURL`'s, with default ports counted, and every hop is measured against
+the configured origin and not the hop before. A redirect the given client's
+policy refuses is an `*llm.Error` with the status of the 3xx, and not
+retryable.
 
 Not implemented by this provider: `llm.Embedder`. Anthropic has no embeddings
 endpoint.
@@ -4078,3 +4183,80 @@ chose them.
     bound. Rejected: checking the assembled event, which allocates first
     and checks after. The error is not exported, since no caller has a
     decision to make about it.
+
+The Anthropic provider task read the reference again while it was built, and
+its review ruled on what that turned up. These change section 4.4.
+
+40. **A refused reply carries its refusal and nothing else.** No text, no
+    tool calls and no `Opaque`, streamed or not. Rejected: mapping the
+    content whatever the stop reason, as 4.4 first read. The reference says
+    to discard a refused reply's partial output, and an agent engine must
+    never be handed a tool call from a turn the model refused. Deltas a
+    stream delivered before the refusal cannot be taken back; the `Response`
+    carries none of them. The turn has no provider form because the
+    reference retries a refused request as it was sent and does not continue
+    it (the one exception needs a fallback credit token, which this package
+    does not model).
+
+41. **`Usage` and `Attempts` are what the API bills, not what it reports.**
+    An attempt that declined before any output in a category the reference
+    does not bill is listed with a zero usage, and a reply refused that way
+    has a zero `Usage`. Rejected: one attempt per `usage.iterations` entry
+    with its counts as given, which overstates the cost of every fallback
+    after an unbilled refusal; and leaving such an attempt out, which loses
+    the record that it ran. Where the API does not say why an attempt
+    declined, it is counted as billed. The three billed categories are
+    written into the package with the month they were read, since the
+    reference says the set may change.
+
+42. **The fallback echo rule also drops a server tool call that has no
+    result.** The reference's table has that row and 4.4 did not.
+
+43. **A stream's usage is merged count by count.** `message_delta` carries
+    only the counts that changed; replacing the whole usage, as 4.4 first
+    read, would zero the input tokens of every streamed reply.
+
+44. **A fallback block in a stream sets the reply's model.** After a decline
+    part way through a stream, `message_start` has already named the model
+    that declined.
+
+45. **A stream is bounded by silence and by size, not by a whole-request
+    timeout.** `Options.IdleTimeout` (two minutes by default, negative for
+    none) bounds the time between bytes from the server while `Stream` waits
+    on it; one event is bounded at 16 MiB and all that the reply keeps at
+    32 MiB. Rejected: the 10 minute client timeout and a 32 MiB bound on the
+    stream's bytes, which cut a long reply however healthy it is; an idle
+    limit between events, which takes a server sending comment lines for a
+    dead one; and a limit that runs while the caller's `fn` does, which
+    takes a slow consumer for a silent server. A caller's own `HTTPClient`
+    keeps its `Timeout`, and that does cut a stream.
+
+46. **Passing a size bound is a plain error.** Not an `*llm.Error`: the API
+    did not fail, and the same request would pass the bound again.
+
+47. **The caller's cancellation is the context's error.** A call that fails
+    with the caller's context ended returns that context's error and no
+    `*llm.Error`. With the context live, a transport failure and the HTTP
+    client's own timeout are `*llm.Error` and retryable, though a client
+    timeout satisfies `errors.Is(err, context.DeadlineExceeded)`.
+
+48. **The default client follows no redirect, and no client carries the key
+    to another origin.** `net/http` forwards `x-api-key` across hosts on a
+    redirect. A 3xx is returned as an `*llm.Error`; a caller's client keeps
+    its own policy under a wrapper that strips the package's headers from a
+    request to another scheme, host or port than the configured one.
+    Rejected: comparing each hop with the one before, which hands the key to
+    the second hop on a host the first one left for.
+
+49. **An error object under a 200 is an error; a 200 that is not an event
+    stream is not read as one.** Both are `*llm.Error`. The second names the
+    content type and is not retryable.
+
+50. **A finished stream is drained a little.** Up to 64 KiB for up to 100
+    milliseconds after `message_stop`, so the connection is reused.
+    Rejected: reading to the end of the body, which a server that holds the
+    stream open would turn into a hang after the reply was already whole.
+
+51. **Citations are not mapped.** `citations_delta` is treated as any delta
+    type the package does not know. It can only arrive when a caller turns
+    citations or a server tool on through `Extra`.
