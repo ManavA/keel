@@ -2,6 +2,7 @@ package openai_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"testing"
@@ -129,6 +130,7 @@ func TestClient_SuppliedClientKeepsItsRedirectPolicy(t *testing.T) {
 
 		got := asLLMError(t, err)
 		assert.Equal(t, 307, got.Status)
+		assert.NoError(t, got.Err, "the caller chose the last response, so the 307 is the answer and not a refusal")
 		assert.Equal(t, 1, asked, "the caller's policy was asked")
 		assert.Zero(t, elsewhereRec.count())
 	})
@@ -164,8 +166,33 @@ func TestClient_SuppliedClientKeepsItsRedirectPolicy(t *testing.T) {
 
 		_, err := c.Generate(t.Context(), llm.Request{Messages: userMsg("hi")})
 
-		require.Error(t, err)
+		got := asLLMError(t, err)
 		assert.Contains(t, err.Error(), "stopped after 10 redirects")
+		assert.Equal(t, 307, got.Status)
+		assert.False(t, got.Retryable, "the same request meets the same redirects")
+		assert.False(t, llm.Retryable(err))
 		assert.Equal(t, 10, hops, "ten requests, the tenth redirect refused")
+	})
+
+	t.Run("a redirect the caller's own check refuses is not retryable, for every call", func(t *testing.T) {
+		errPolicy := errors.New("this host may not redirect")
+		for name, call := range redirectCalls {
+			t.Run(name, func(t *testing.T) {
+				elsewhere, elsewhereRec := newServer(t, serveJSON(simpleReply))
+				srv, _ := newServer(t, redirectTo(307, elsewhere.URL+"/v1/chat/completions"))
+				hc := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return errPolicy }}
+				c := newClient(t, srv, func(o *openai.Options) { o.HTTPClient = hc; o.EmbeddingModel = "e" })
+
+				err := call(t.Context(), c)
+
+				got := asLLMError(t, err)
+				assert.ErrorIs(t, err, errPolicy, "the caller's own error is still in the chain")
+				assert.Equal(t, 307, got.Status)
+				assert.False(t, got.Retryable)
+				assert.False(t, llm.Retryable(err))
+				assert.Contains(t, got.Error(), "redirect")
+				assert.Zero(t, elsewhereRec.count())
+			})
+		}
 	})
 }

@@ -9,6 +9,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ManavA/keel/llm"
@@ -17,6 +18,11 @@ import (
 
 // doneMarker is the data of the event that ends a stream.
 const doneMarker = "[DONE]"
+
+// callOverhead is what each tool call counts against the bound of a reply
+// besides its id, name and arguments: what it costs apart from its text, so
+// that a server that opens calls without end meets the bound.
+const callOverhead = 256
 
 // errQuiet is the cause a stream's context is cancelled with when the server
 // has sent nothing for too long.
@@ -66,7 +72,7 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, fn func(llm.Delta)
 	}
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return nil, failed(ctx, c.ifQuiet(ctx, sctx, err))
+		return nil, requestFailed(ctx, resp, c.ifQuiet(ctx, sctx, err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	live := &watchedBody{r: resp.Body, wd: wd}
@@ -83,6 +89,13 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, fn func(llm.Delta)
 	st := newStreamState(c.maxReplyBytes)
 	model := c.modelFor(req)
 	events := sse.NewReader(live)
+	// The callback's time is the caller's and not the server's silence, so
+	// the idle clock waits while it runs.
+	deliver := func(d llm.Delta) error {
+		wd.pause()
+		defer wd.resume()
+		return fn(d)
+	}
 	for {
 		ev, err := events.Next()
 		if err != nil {
@@ -107,7 +120,7 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, fn func(llm.Delta)
 		if e, ok := errorFields(ch.Error); ok && e.present() {
 			return nil, embeddedError(resp.StatusCode, resp.Header.Get("X-Request-Id"), e)
 		}
-		if err := st.apply(ch, fn); err != nil {
+		if err := st.apply(ch, deliver); err != nil {
 			return nil, err
 		}
 	}
@@ -169,9 +182,11 @@ type streamState struct {
 	text      strings.Builder
 	refusal   strings.Builder
 	calls     map[int]*streamCall
-	// latest is the slot of the call the last piece belonged to, which a
-	// piece from a server that sends no index continues.
-	latest int
+	// byKey is the most recent slot opened for each index the server has
+	// sent, and latestKey the index of the last piece, which a piece that
+	// sends none continues.
+	byKey     map[int]int
+	latestKey int
 	// size is what the reply adds up to so far, bounded by limit.
 	size, limit int
 	finish      string
@@ -189,7 +204,7 @@ type streamCall struct {
 }
 
 func newStreamState(limit int) *streamState {
-	return &streamState{calls: map[int]*streamCall{}, limit: limit}
+	return &streamState{calls: map[int]*streamCall{}, byKey: map[int]int{}, limit: limit}
 }
 
 // apply folds one chunk in and passes what it adds to fn.
@@ -248,20 +263,29 @@ func (s *streamState) grow(n int) error {
 	return nil
 }
 
-// slot is the slot a piece of a tool call belongs to: its index, or for a
-// server that sends none the call the last piece belonged to. An id that is not
-// the id the slot already has is a different call, so it takes a new slot and
-// calls are not merged into one malformed call.
+// slot is the slot a piece of a tool call belongs to. A piece belongs to the
+// most recent slot opened for its index, or for a server that sends none, for
+// the index of the last piece. An id that is not the id that slot already has
+// is a different call, so it opens a new slot, and calls are not merged into one
+// malformed call. A slot is the index the server gave unless that slot is taken.
 func (s *streamState) slot(piece wireToolCall) int {
-	idx := s.latest
+	key := s.latestKey
 	if piece.Index != nil {
-		idx = *piece.Index
+		key = *piece.Index
 	}
-	if call, ok := s.calls[idx]; ok && piece.ID != "" && call.id != "" && piece.ID != call.id {
-		idx = s.nextSlot()
+	slot, ok := s.byKey[key]
+	switch call := s.calls[slot]; {
+	case !ok:
+		slot = key
+		if _, taken := s.calls[slot]; taken {
+			slot = s.nextSlot()
+		}
+	case call != nil && piece.ID != "" && call.id != "" && piece.ID != call.id:
+		slot = s.nextSlot()
 	}
-	s.latest = idx
-	return idx
+	s.byKey[key] = slot
+	s.latestKey = key
+	return slot
 }
 
 // nextSlot is the first slot after every one in use.
@@ -275,23 +299,33 @@ func (s *streamState) nextSlot() int {
 
 // applyCall adds one piece of a tool call. The callback gets the id and the
 // name once, with the first piece that carries each, and the arguments as
-// they come.
+// they come. Every byte the reply keeps counts against its bound: each call,
+// its id and name when they are first stored, and its arguments.
 func (s *streamState) applyCall(piece wireToolCall, fn func(llm.Delta) error) error {
-	if err := s.grow(len(piece.Function.Arguments)); err != nil {
-		return err
-	}
 	idx := s.slot(piece)
 	call, ok := s.calls[idx]
 	if !ok {
+		if err := s.grow(callOverhead); err != nil {
+			return err
+		}
 		call = &streamCall{}
 		s.calls[idx] = call
 	}
 	d := llm.ToolCallDelta{Index: idx, InputJSON: piece.Function.Arguments}
 	if call.id == "" && piece.ID != "" {
+		if err := s.grow(len(piece.ID)); err != nil {
+			return err
+		}
 		call.id, d.ID = piece.ID, piece.ID
 	}
 	if call.name == "" && piece.Function.Name != "" {
+		if err := s.grow(len(piece.Function.Name)); err != nil {
+			return err
+		}
 		call.name, d.Name = piece.Function.Name, piece.Function.Name
+	}
+	if err := s.grow(len(piece.Function.Arguments)); err != nil {
+		return err
 	}
 	call.arguments.WriteString(piece.Function.Arguments)
 
@@ -328,15 +362,29 @@ type watchdog struct {
 	idle   time.Duration
 	timer  *time.Timer
 	cancel context.CancelCauseFunc
+
+	// mu guards paused, which the timer's function reads from its own goroutine.
+	mu     sync.Mutex
+	paused bool
 }
 
 // newWatchdog starts the clock when idle is positive; zero is no limit.
 func newWatchdog(idle time.Duration, cancel context.CancelCauseFunc) *watchdog {
 	w := &watchdog{idle: idle, cancel: cancel}
 	if idle > 0 {
-		w.timer = time.AfterFunc(idle, func() { cancel(errQuiet) })
+		w.timer = time.AfterFunc(idle, w.fire)
 	}
 	return w
+}
+
+// fire is the timer's function: the stream has been quiet, unless the clock was
+// stopped for the callback in the moment since it went off.
+func (w *watchdog) fire() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.paused {
+		w.cancel(errQuiet)
+	}
 }
 
 // touch records that bytes arrived.
@@ -346,10 +394,32 @@ func (w *watchdog) touch() {
 	}
 }
 
+// pause stops the clock while the caller's callback runs, and resume starts it
+// again from nothing when the callback returns.
+func (w *watchdog) pause() {
+	if w.idle <= 0 {
+		return
+	}
+	w.mu.Lock()
+	w.paused = true
+	w.timer.Stop()
+	w.mu.Unlock()
+}
+
+func (w *watchdog) resume() {
+	if w.idle <= 0 {
+		return
+	}
+	w.mu.Lock()
+	w.paused = false
+	w.timer.Reset(w.idle)
+	w.mu.Unlock()
+}
+
 // arm sets the clock to d, whatever the limit was.
 func (w *watchdog) arm(d time.Duration) {
 	if w.timer == nil {
-		w.timer = time.AfterFunc(d, func() { w.cancel(errQuiet) })
+		w.timer = time.AfterFunc(d, w.fire)
 		return
 	}
 	w.timer.Reset(d)

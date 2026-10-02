@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/ManavA/keel/llm"
@@ -34,31 +37,63 @@ const (
 // noRedirects is the default client's redirect policy: the 3xx is the answer.
 func noRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
+// redirectRefused is a redirect the client's policy would not follow, or the
+// ten-hop stop of a client with none. It is not the server's fault and asking
+// again meets the same redirect.
+type redirectRefused struct{ err error }
+
+func (e *redirectRefused) Error() string { return e.err.Error() }
+func (e *redirectRefused) Unwrap() error { return e.err }
+
 // guardRedirects returns a copy of a client the caller supplied that keeps its
-// policy on redirects and adds one rule: a request sent on to a host other
-// than the one first asked loses the key and the headers this package added,
-// which net/http would otherwise forward (it drops Authorization only when the
-// host name changes, not when the port does, and drops no other header). The
-// caller's own client is not edited.
+// policy on redirects and adds one rule: a request sent on to an origin other
+// than the configured one, another scheme, host or port, loses the key and the
+// headers this package added. net/http would forward them: it drops
+// Authorization only when the host name changes, not when the scheme or port
+// does, and drops no other header. The caller's own client is not edited.
 func (c *Client) guardRedirects(hc *http.Client) *http.Client {
+	origin := ""
+	if base, err := url.Parse(c.baseURL); err == nil {
+		origin = originOf(base)
+	}
 	guarded := *hc
 	policy := hc.CheckRedirect
 	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if req.URL.Host != via[0].URL.Host {
+		if originOf(req.URL) != origin {
 			req.Header.Del("Authorization")
 			for k := range c.header {
 				req.Header.Del(k)
 			}
 		}
-		if policy != nil {
-			return policy(req, via)
+		var err error
+		switch {
+		case policy != nil:
+			err = policy(req, via)
+		case len(via) >= maxRedirects:
+			err = fmt.Errorf("stopped after %d redirects", maxRedirects)
 		}
-		if len(via) >= maxRedirects {
-			return fmt.Errorf("stopped after %d redirects", maxRedirects)
+		if err != nil && err != http.ErrUseLastResponse { //nolint:errorlint // net/http compares the sentinel by value
+			return &redirectRefused{err: err}
 		}
-		return nil
+		return err
 	}
 	return &guarded
+}
+
+// originOf is the scheme, host and port of u, with the default port of the
+// scheme the same as none and the host in lower case. net/url has already
+// lowered the scheme.
+func originOf(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return u.Scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
 }
 
 // newRequest builds the POST of body to path.
@@ -100,7 +135,7 @@ func (c *Client) fetch(ctx context.Context, path string, body []byte) (answer, e
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return answer{}, failed(ctx, err)
+		return answer{}, requestFailed(ctx, resp, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -115,6 +150,27 @@ func (c *Client) fetch(ctx context.Context, path string, body []byte) (answer, e
 		return answer{}, failed(ctx, err)
 	}
 	return answer{body: raw, status: resp.StatusCode, requestID: resp.Header.Get("X-Request-Id")}, nil
+}
+
+// requestFailed maps an error from sending a request. resp is what came back
+// with it, which is only ever the last response of a redirect the client
+// refused to follow. That is an *llm.Error with the status the server gave and
+// not retryable, like a 3xx the default client does not follow; anything else
+// is failed's.
+func requestFailed(ctx context.Context, resp *http.Response, err error) error {
+	var refused *redirectRefused
+	if ctx.Err() != nil || !errors.As(err, &refused) {
+		return failed(ctx, err)
+	}
+	out := &llm.Error{Provider: Name, Err: err, Message: "redirect not followed: " + refused.err.Error()}
+	if resp != nil {
+		out.Status = resp.StatusCode
+		out.RequestID = resp.Header.Get("X-Request-Id")
+		if msg := redirectMessage(resp); msg != "" {
+			out.Message = msg + ": " + refused.err.Error()
+		}
+	}
+	return out
 }
 
 // failed maps an error from the transport. When the caller's context is done

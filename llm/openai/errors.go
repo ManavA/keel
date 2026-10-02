@@ -70,8 +70,10 @@ func httpError(resp *http.Response, body []byte) *llm.Error {
 	if !ok {
 		fields.Message = snippet(body)
 	}
-	if loc, err := resp.Location(); err == nil && resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		fields.Message = fmt.Sprintf("redirect to %s not followed", loc.Scheme+"://"+loc.Host+loc.Path)
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		if msg := redirectMessage(resp); msg != "" {
+			fields.Message = msg
+		}
 	}
 	if fields.Message == "" {
 		fields.Message = http.StatusText(resp.StatusCode)
@@ -85,6 +87,16 @@ func httpError(resp *http.Response, body []byte) *llm.Error {
 		RetryAfter: retryAfter(resp.Header.Get("Retry-After"), time.Now()),
 		Retryable:  retryableStatus(resp.StatusCode, fields),
 	}
+}
+
+// redirectMessage says where a redirect pointed, without its query, or is
+// empty when the response names no place.
+func redirectMessage(resp *http.Response) string {
+	loc, err := resp.Location()
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("redirect to %s not followed", loc.Scheme+"://"+loc.Host+loc.Path)
 }
 
 // embeddedError maps an error object that arrived in a 200 response, in the

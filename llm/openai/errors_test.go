@@ -409,3 +409,41 @@ func TestErrors_ATimeoutOfTheClientIsRetryable(t *testing.T) {
 		assert.True(t, asLLMError(t, err).Retryable)
 	})
 }
+
+// When the server had already answered with an error status, that is the
+// answer, even if the caller's context ended while its body was being read.
+func TestErrors_AStatusAlreadyAnsweredIsReportedWhenTheCallerCancelsMidBody(t *testing.T) {
+	calls := map[string]func(ctx context.Context, c *openai.Client) error{
+		"Generate": func(ctx context.Context, c *openai.Client) error {
+			_, err := c.Generate(ctx, llm.Request{Messages: userMsg("hi")})
+			return err
+		},
+		"Stream": func(ctx context.Context, c *openai.Client) error {
+			_, err := c.Stream(ctx, llm.Request{Messages: userMsg("hi")}, func(llm.Delta) error { return nil })
+			return err
+		},
+		"Embed": func(ctx context.Context, c *openai.Client) error {
+			_, err := c.Embed(ctx, llm.EmbedRequest{Model: "e", Input: []string{"a"}})
+			return err
+		},
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			srv, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Content-Length", "1000")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, `{"error":{"message":"the server had an err`)
+				w.(http.Flusher).Flush()
+				holdOpen(r)
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+			defer cancel()
+
+			err := call(ctx, newClient(t, srv))
+
+			got := asLLMError(t, err)
+			assert.Equal(t, 500, got.Status, "the status the server gave is what happened")
+		})
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -253,4 +254,86 @@ func TestStream_AResponseThatIsNotAnEventStream(t *testing.T) {
 			assert.Equal(t, "hi", resp.Message.Text)
 		})
 	}
+}
+
+// What a reply keeps is its text, its refusal, and the ids, names and
+// arguments of its tool calls: all of it counts against the bound. A server
+// that opens call after call with a huge name and no arguments, or with ids
+// and nothing else, meets it as surely as one that streams text.
+func TestStream_ToolCallNamesAndIdsAreBounded(t *testing.T) {
+	big := strings.Repeat("a", 1<<20)
+
+	tests := []struct {
+		name  string
+		piece func(i int) string
+	}{
+		{name: "a megabyte name on each of forty calls, with no arguments", piece: func(i int) string { return callPiece(i, "c"+strconv.Itoa(i), big, "") }},
+		{name: "a megabyte id on each of forty calls", piece: func(i int) string { return callPiece(i, big+strconv.Itoa(i), "f", "") }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var events []string
+			for i := range 40 {
+				events = append(events, event(chunk(callsDelta(tt.piece(i)), "")))
+			}
+			srv, _ := newServer(t, flushing(append(events, event(chunk(`{}`, "tool_calls")), event("[DONE]"))...))
+			var seen int
+
+			_, err := newClient(t, srv).
+				Stream(t.Context(), llm.Request{Messages: userMsg("hi")}, func(llm.Delta) error { seen++; return nil })
+
+			require.Error(t, err, "a 40 MiB reply is not a reply within a 32 MiB bound")
+			notAnLLMError(t, err)
+			assert.Contains(t, err.Error(), "larger than")
+			assert.Less(t, seen, 40, "the stream stopped when the reply outgrew the bound")
+		})
+	}
+}
+
+// A callback that takes longer than the idle limit is the caller's time, not
+// the server's silence: the stream goes on when it returns.
+func TestStream_ASlowCallbackIsNotTheServersSilence(t *testing.T) {
+	const slow = 250 * time.Millisecond
+	var events []string
+	for range 4 {
+		events = append(events, event(chunk(textDelta("w"), "")))
+	}
+	events = append(events, event(chunk(`{}`, "stop")), event("[DONE]"))
+
+	t.Run("events arriving steadily, a callback slower than the limit", func(t *testing.T) {
+		srv, _ := newServer(t, flushing(events...))
+
+		resp, err := newClient(t, srv, withIdle(100*time.Millisecond)).
+			Stream(t.Context(), llm.Request{Messages: userMsg("hi")}, func(llm.Delta) error {
+				time.Sleep(slow)
+				return nil
+			})
+
+		require.NoError(t, err, "a callback that blocks is backpressure, and not a reason to retry")
+		assert.Equal(t, "wwww", resp.Message.Text)
+	})
+
+	t.Run("the clock starts again when the callback returns", func(t *testing.T) {
+		srv, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+			flushing(events[0])(w, r)
+			holdOpen(r)
+		})
+		returned := make(chan time.Time, 1)
+
+		start := time.Now()
+		_, err := newClient(t, srv, withIdle(100*time.Millisecond)).
+			Stream(t.Context(), llm.Request{Messages: userMsg("hi")}, func(llm.Delta) error {
+				time.Sleep(slow)
+				returned <- time.Now()
+				return nil
+			})
+		end := time.Now()
+
+		got := asLLMError(t, err)
+		assert.True(t, got.Retryable)
+		assert.Contains(t, got.Error(), "no data from the server")
+		back := <-returned
+		assert.Greater(t, back.Sub(start), slow)
+		assert.Less(t, end.Sub(back), 2*time.Second, "the server's real silence was still caught")
+	})
 }

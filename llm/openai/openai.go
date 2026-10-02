@@ -49,10 +49,13 @@
 // set and Retryable true, unless the caller's context ended. Whatever was
 // delivered to the callback before the cut stays delivered.
 //
-// A stream is bounded by its context, by [Options.IdleTimeout] between bytes,
-// by 16 MiB in one event and by 32 MiB in all that the reply assembles, and
-// not by a timeout on the whole request, which would cut a long reply that is
-// going well. A reply that outgrows a size bound is an error that is not
+// A stream is bounded by its context, by [Options.IdleTimeout] without a byte
+// from the server (a keep-alive comment is a byte; the time a callback takes is
+// not counted), by 16 MiB in one event and by 32 MiB in all that the reply
+// keeps, and not by a timeout on the whole request, which would cut a long
+// reply that is going well. What the reply keeps is its text, its refusal and
+// the id, name and arguments of each tool call, with a fixed charge for each
+// call besides. A reply that outgrows a size bound is an error that is not
 // retryable, since a retry meets the same size. After a stream ends cleanly a
 // small bounded amount of what follows is read, so that the connection is
 // used again.
@@ -74,15 +77,21 @@
 // too, retryable when it is a rate limit, an overload or a server error.
 //
 // When a call fails and the caller's context is done, the error is the
-// context's and is not retryable. When the context is live, a failed or cut
-// connection, and the client's own timeout, are an [*llm.Error] marked
-// retryable. One call is one HTTP request; wrap the client in [llm.Retrying]
-// for retries.
+// context's and is not retryable; the exception is a call the server had
+// already answered with an error status, which is returned as the status it
+// was even if the cancellation cut its body short. When the context is live, a
+// failed or cut connection, and the client's own timeout, are an [*llm.Error]
+// marked retryable. One call is one HTTP request; wrap the client in
+// [llm.Retrying] for retries.
 //
-// The default client does not follow redirects: a 3xx is an [*llm.Error], and
-// nothing is sent to a host other than the configured one. A client given in
-// the options keeps its own policy, and still has the key and [Options.Header]
-// withheld from a host it is sent on to.
+// The default client does not follow redirects: a 3xx is an [*llm.Error] that
+// is not retryable, and nothing is sent to a host other than the configured
+// one. A client given in the options keeps its own policy, and still has the key
+// and [Options.Header] withheld from any other origin than the configured
+// one's. A redirect that such a client refuses, by its own check or by the ten
+// hops net/http allows, is an [*llm.Error] that is not retryable either. A
+// followed 307 or 308 re-sends the request body, which holds the prompt, to
+// wherever the redirect points; that is the supplied client's policy to set.
 //
 // # Sources
 //
@@ -145,12 +154,17 @@ type Options struct {
 	// timeout of its own: a call that is not a stream is bounded by 10
 	// minutes, and a stream by IdleTimeout. A client given here keeps its own
 	// timeout, which then bounds a stream too, and its own policy on
-	// redirects, which may follow one. The key and Header are still withheld
-	// from a host other than the one first asked.
+	// redirects. The key and Header are withheld from a redirect to another
+	// origin than BaseURL's, another scheme, host or port. The request is not:
+	// a client that follows a 307 or 308 re-sends its body, which holds the
+	// prompt, to wherever the redirect points, and that is for the client given
+	// here to decide.
 	HTTPClient *http.Client
-	// IdleTimeout is how long a stream may go without a byte, from the
-	// request being sent to the end of the stream. Zero is two minutes;
-	// negative is no limit.
+	// IdleTimeout is how long a stream may go without receiving a byte from
+	// the server, from the request being sent to the end of the stream. A
+	// keep-alive comment is bytes and counts, so a server that sends nothing
+	// else is bounded by the context and not by this, and the time a callback
+	// takes is not counted. Zero is two minutes; negative is no limit.
 	IdleTimeout time.Duration
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger

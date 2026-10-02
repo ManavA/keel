@@ -785,6 +785,11 @@ func TestStream_ADoneThatFollowsNothing(t *testing.T) {
 			want: &llm.Response{ID: "chatcmpl-1", Model: "m", Message: llm.Message{Role: llm.RoleAssistant}, Stop: llm.StopEnd},
 		},
 		{
+			name: "a role-only delta, then DONE, is the server's empty reply: it said it was done",
+			body: sseBody(chunk(`{"role":"assistant"}`, "")),
+			want: &llm.Response{ID: "chatcmpl-1", Model: "m", Message: llm.Message{Role: llm.RoleAssistant}, Stop: llm.StopEnd},
+		},
+		{
 			name: "a finish reason of length and no content is an empty reply, cut at the bound",
 			body: sseBody(chunk(`{}`, "length")),
 			want: &llm.Response{ID: "chatcmpl-1", Model: "m", Message: llm.Message{Role: llm.RoleAssistant}, Stop: llm.StopMaxTokens},
@@ -910,6 +915,60 @@ func TestStream_ToolCallPiecesWithNoIndex(t *testing.T) {
 			wantDeltas: []llm.Delta{
 				{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_a", Name: "first", InputJSON: `{"x":`}},
 				{ToolCall: &llm.ToolCallDelta{Index: 0, InputJSON: `1}`}},
+			},
+		},
+		{
+			name: "an index reused by a second call: pieces with no id follow the most recent call for it",
+			events: []string{
+				chunk(callsDelta(callPiece(0, "call_a", "first", `{"x":`)), ""),
+				chunk(callsDelta(callPiece(0, "", "", `1}`)), ""),
+				chunk(callsDelta(callPiece(0, "call_b", "second", `{"y":`)), ""),
+				chunk(callsDelta(callPiece(0, "", "", `2}`)), ""),
+				chunk(`{}`, "tool_calls"),
+			},
+			wantCalls: []llm.ToolCall{
+				{ID: "call_a", Name: "first", Input: json.RawMessage(`{"x":1}`)},
+				{ID: "call_b", Name: "second", Input: json.RawMessage(`{"y":2}`)},
+			},
+			wantDeltas: []llm.Delta{
+				{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_a", Name: "first", InputJSON: `{"x":`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 0, InputJSON: `1}`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 1, ID: "call_b", Name: "second", InputJSON: `{"y":`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 1, InputJSON: `2}`}},
+			},
+		},
+		{
+			name: "an index reused by a second call does not collide with a later call that has the next index",
+			events: []string{
+				chunk(callsDelta(callPiece(0, "call_a", "first", `{}`)), ""),
+				chunk(callsDelta(callPiece(0, "call_b", "second", `{}`)), ""),
+				chunk(callsDelta(callPiece(1, "call_c", "third", `{}`)), ""),
+				chunk(callsDelta(callPiece(1, "", "", ` `)), ""),
+				chunk(`{}`, "tool_calls"),
+			},
+			wantCalls: []llm.ToolCall{
+				{ID: "call_a", Name: "first", Input: json.RawMessage(`{}`)},
+				{ID: "call_b", Name: "second", Input: json.RawMessage(`{}`)},
+				{ID: "call_c", Name: "third", Input: json.RawMessage(`{} `)},
+			},
+			wantDeltas: []llm.Delta{
+				{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_a", Name: "first", InputJSON: `{}`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 1, ID: "call_b", Name: "second", InputJSON: `{}`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 2, ID: "call_c", Name: "third", InputJSON: `{}`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 2, InputJSON: ` `}},
+			},
+		},
+		{
+			name: "a piece with no index continues the call of the piece before it, whatever its index was",
+			events: []string{
+				chunk(callsDelta(callPiece(2, "call_a", "first", `{"x":`)), ""),
+				chunk(callsDelta(rawPiece("", "", `1}`)), ""),
+				chunk(`{}`, "tool_calls"),
+			},
+			wantCalls: []llm.ToolCall{{ID: "call_a", Name: "first", Input: json.RawMessage(`{"x":1}`)}},
+			wantDeltas: []llm.Delta{
+				{ToolCall: &llm.ToolCallDelta{Index: 2, ID: "call_a", Name: "first", InputJSON: `{"x":`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 2, InputJSON: `1}`}},
 			},
 		},
 		{
