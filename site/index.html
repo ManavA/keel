@@ -20,7 +20,7 @@ keel new notesapp   # scaffold a service: see the tutorial</code></pre>
 <code>replace</code> directive (the tutorial shows how).</p>
 <div class="cards">
 <div class="card"><h2><a href="tutorial.html">Start here: the tutorial →</a></h2><p>Scaffold the notes service, run it against Postgres, and click through the browser UI. About fifteen minutes.</p></div>
-<div class="card"><h2><a href="tour.html">Tour the packages →</a></h2><p>Six stops across retry, textpolicy, flags, jobs, httpx and config, each with a short sample taken from the real tree.</p></div>
+<div class="card"><h2><a href="tour.html">Tour the packages →</a></h2><p>Seven stops across retry, textpolicy, flags, jobs, httpx, config and policy, each with a short sample taken from the real tree.</p></div>
 <div class="card"><h2><a href="gallery.html">Browse the gallery →</a></h2><p>Every UI block the example app is built from, rendered from the real templates in both themes.</p></div>
 </div>
 <h2>One service, two surfaces</h2>
@@ -35,6 +35,7 @@ rows.</p>
 <tr><th>Data</th><td><code>pg</code> pool, transactions, paging, migrations · <code>outbox</code> transactional events · <code>search</code> document index · <code>idempotency</code> replayed responses</td></tr>
 <tr><th>Work</th><td><code>jobs</code> background runs and outcomes · <code>events</code> publish and subscribe · <code>webhooks</code> outbound delivery · <code>mail</code> transactional email · <code>notifyprefs</code> send-path enforcement</td></tr>
 <tr><th>Edge</th><td><code>auth</code> local, Firebase and OIDC sign-in · <code>flags</code> percentage rollouts · <code>textpolicy</code> normalize-then-match text guard · <code>retry</code> backoff with full jitter · <code>media</code> object storage · <code>geocode</code> address lookup</td></tr>
+<tr><th>AI</th><td><code>llm</code> one model call in, one turn out, with provider subpackages · <code>policy</code> allow, ask or block decisions on actions · <code>agent</code> resumable agent runs journaled in Postgres</td></tr>
 <tr><th>Foundation</th><td><code>config</code> environment loading and redaction · <code>log</code> slog setup and request ids · <code>metrics</code> instrumentation · <code>perf</code> caching and compression · <code>deploy</code> templates · <code>cmd/keel</code> project scaffolding</td></tr>
 </table>
 <h2>Conventions</h2>

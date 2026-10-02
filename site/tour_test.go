@@ -19,6 +19,7 @@ import (
 	"github.com/ManavA/keel/flags"
 	"github.com/ManavA/keel/httpx"
 	"github.com/ManavA/keel/jobs"
+	"github.com/ManavA/keel/policy"
 	"github.com/ManavA/keel/retry"
 	"github.com/ManavA/keel/textpolicy"
 )
@@ -97,4 +98,29 @@ func TestTourConfigRedact(t *testing.T) {
 		"postgres://keel:[redacted]@127.0.0.1:5544/keel?sslmode=disable",
 		config.RedactURL("postgres://keel:s3cret@127.0.0.1:5544/keel?sslmode=disable"))
 	require.Equal(t, "[unset]", config.RedactURL(""))
+}
+
+func TestTourPolicy(t *testing.T) {
+	rules := policy.Policy{Rules: []policy.Rule{
+		{Name: "reads are fine", Effect: policy.Allow,
+			When: policy.Match{Kinds: []string{"read"}}},
+		{Name: "large payments need a person", Effect: policy.Ask,
+			When: policy.Match{Kinds: []string{"pay"}, Attrs: []policy.Cond{
+				{Attr: "amount", Op: policy.OpGt, Value: 500},
+			}}},
+		{Name: "nothing leaves unreviewed", Effect: policy.Block,
+			When: policy.Match{Kinds: []string{"send"}, Attrs: []policy.Cond{
+				{Attr: "external", Op: policy.OpEq, Value: true},
+			}}},
+	}}
+	pay := rules.Decide(policy.Action{
+		Kind: "pay", Target: "vendor:acme", Attrs: map[string]any{"amount": 1200},
+	})
+	require.Equal(t, policy.Ask, pay.Effect)
+	require.Equal(t, "large payments need a person", pay.Rule)
+
+	del := rules.Decide(policy.Action{Kind: "delete", Target: "note:42"})
+	require.Equal(t, policy.Block, del.Effect)
+	require.Equal(t, policy.RuleDefault, del.Rule)
+	require.Equal(t, -1, del.Index)
 }
