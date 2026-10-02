@@ -2842,17 +2842,6 @@ func TestExecute_WritesOnlyTextTheJournalCanHold(t *testing.T) {
 			},
 		},
 		{
-			name: "a delegated call's arguments, which are the child's input",
-			arrange: func(t *testing.T, over func(agent.Store) agent.Store) {
-				call := agent.Call{ID: "call-1", Name: "review", Input: json.RawMessage("{\"doc\":\"marked \xff\xfe\"}")}
-				f := newExecFixture(t, execConfig{
-					defs: []agent.Definition{execLead(), execReviewer()}, over: over,
-					script: agenttest.ByAgent(map[string]agenttest.Script{"lead": agenttest.Replies(agenttest.Use(call))}),
-				})
-				f.execute(f.start("lead", "hello").ID)
-			},
-		},
-		{
 			name: "who cancelled a run and why, passed on to its child",
 			arrange: func(t *testing.T, over func(agent.Store) agent.Store) {
 				f := newExecFixture(t, execConfig{

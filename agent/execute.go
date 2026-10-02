@@ -2,12 +2,15 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"runtime/debug"
 	"slices"
 	"time"
+
+	"github.com/ManavA/keel/agent/internal/storerule"
 )
 
 const (
@@ -413,6 +416,7 @@ func (x *execution) model(run Run, seq int, steps []Step) (ending, error) {
 	// A reply is the assistant's turn, whatever role its model wrote on it.
 	msg := resp.Message
 	msg.Role = RoleAssistant
+	msg = journalMessage(msg)
 	now = x.e.clock.Now()
 	err = x.e.store.CompleteModel(x.work, x.lease, CompleteModelRequest{
 		Seq: seq, Message: msg, Stop: resp.Stop, Model: resp.Model, Usage: resp.Usage, Now: now,
@@ -1003,4 +1007,29 @@ func (x *execution) unwritten(run Run, err error) (ending, error) {
 	x.e.log.WarnContext(x.step, "agent: an execution could not let its run go; the lease is left to lapse",
 		"run", run.ID, "agent", run.Agent, "error", err)
 	return endedUnwritten, err
+}
+
+// journalMessage makes a model's reply one a store can keep. A store refuses
+// raw JSON that is not JSON or not UTF-8, and a reply it refused would be
+// refused again on every retry. Arguments it could not keep become a malformed
+// call, held as one JSON string with U+FFFD for what was not UTF-8, which is
+// answered with an error and never run; a provider form it could not keep is
+// dropped, so the turn is rebuilt from its text and calls.
+func journalMessage(msg Message) Message {
+	if len(msg.Calls) > 0 {
+		calls := make([]Call, len(msg.Calls))
+		copy(calls, msg.Calls)
+		for i, c := range calls {
+			if storerule.ValidRaw(c.Input) == nil {
+				continue
+			}
+			held, _ := json.Marshal(string(c.Input))
+			calls[i].Input, calls[i].Malformed = held, true
+		}
+		msg.Calls = calls
+	}
+	if msg.Opaque != nil && storerule.ValidRaw(msg.Opaque.Data) != nil {
+		msg.Opaque = nil
+	}
+	return msg
 }
