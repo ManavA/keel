@@ -2,10 +2,12 @@ package app
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"strings"
 
@@ -26,9 +28,12 @@ const answerSchemaName = "answer"
 // AgentModelOptions configures AgentModel. The zero value prices nothing.
 type AgentModelOptions struct {
 	// Prices turns each reply's tokens into the cost a run's budget is
-	// measured in. With Prices set, a reply that neither the model it names
-	// nor the model the request asked for can price fails the run rather than
-	// being counted as free. AgentModel keeps a copy of the table.
+	// measured in. Nil prices nothing: every reply costs zero. Anything else
+	// is a table, and a table that lists no model that answers, an empty one
+	// included, fails the run on every reply rather than leaving its cost limit
+	// silently off: a reply that neither the model it names nor the model
+	// priced for the request can price is a permanent error. AgentModel keeps a
+	// copy of the table.
 	Prices llm.Prices
 	// Effort is sent with every request.
 	Effort llm.Effort
@@ -38,8 +43,17 @@ type AgentModelOptions struct {
 	// DefaultMaxTokens bounds the reply to a request that sets no MaxTokens.
 	// Zero is 16000, the number llm.Budgeted assumes for a request that sets
 	// none: the adapter always sends a bound, so that a budget's hold is a
-	// real upper bound on the call.
+	// real upper bound on the call. It goes to every model the adapter serves,
+	// so a model with a lower output cap needs it set lower.
 	DefaultMaxTokens int
+	// Model is the model a request that names none is sent to, and priced as.
+	// It is llm.BudgetOptions.Model's counterpart: give both the same name, so
+	// that the budget and the adapter settle the same price.
+	Model string
+	// Logger receives one warning for each refusal, with the provider's reply
+	// id, the model and the refusal's reason. Nil uses slog.Default(). Neither
+	// the prompt nor the reply's text is logged.
+	Logger *slog.Logger
 }
 
 // AgentModel adapts an llm.Model to agent.Model. It uses Generate only.
@@ -53,11 +67,21 @@ type AgentModelOptions struct {
 // An assistant turn's tool calls, results and opaque provider form are copied
 // across field for field and byte for byte: the adapter never decodes or
 // re-encodes JSON, so a turn goes back to its provider exactly as the provider
-// wrote it. Each reply's cost is Prices.CostFor with the request's model as the
-// model asked for, and is zero when no Prices are set.
+// wrote it. Each reply's cost is Prices.CostFor with the model sent as the
+// model asked for, and is zero when Prices is nil.
+//
+// A refused reply reaches the engine with nothing to act on: its Message has
+// the role and nothing else, no text, no tool calls and no opaque form, which
+// would replay the calls dropped.
+//
+// What is not carried: the run id and the agent name are not sent to the model,
+// and the provider's reply id and the refusal's details are logged, not
+// returned. DefaultMaxTokens bounds the reply of every model the adapter
+// serves, so a model with a lower output cap needs it set lower.
 //
 // Errors are classified as llm.Retryable classifies them. The caller's own
-// cancellation or deadline, read from ctx, is returned as it is. An
+// cancellation or deadline, read from ctx, decides before anything else: an
+// error met while ctx is done is returned as it is. Otherwise an
 // ErrBudgetExceeded, an ErrNoPrice, a reply that cannot be priced and an
 // *llm.Error that is not retryable are wrapped in agent.ErrPermanent and still
 // unwrap to themselves. Every other error, a retryable *llm.Error included, is
@@ -67,12 +91,17 @@ func AgentModel(m llm.Model, opts AgentModelOptions) agent.Model {
 		opts.DefaultMaxTokens = defaultMaxTokens
 	}
 	opts.Prices = maps.Clone(opts.Prices)
-	return &agentModel{model: m, opts: opts}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &agentModel{model: m, opts: opts, logger: logger}
 }
 
 type agentModel struct {
-	model llm.Model
-	opts  AgentModelOptions
+	model  llm.Model
+	opts   AgentModelOptions
+	logger *slog.Logger
 }
 
 var _ agent.Model = (*agentModel)(nil)
@@ -82,14 +111,15 @@ func (a *agentModel) Generate(ctx context.Context, req agent.Request) (agent.Res
 	if a.model == nil {
 		return agent.Response{}, fmt.Errorf("%w: app: agent model: no llm.Model to ask", agent.ErrPermanent)
 	}
-	resp, err := a.model.Generate(ctx, a.request(req))
+	sent := a.request(req)
+	resp, err := a.model.Generate(ctx, sent)
 	if err != nil {
 		return agent.Response{}, classify(ctx, err)
 	}
 	if resp == nil {
 		return agent.Response{}, errNoReply
 	}
-	return a.response(resp, req.Model)
+	return a.response(ctx, resp, sent.Model)
 }
 
 // errNoReply is what a model that returns neither a reply nor an error has
@@ -99,7 +129,7 @@ var errNoReply = errors.New("app: agent model: the model returned neither a repl
 // request is the llm.Request for req. Nothing in it shares memory with req.
 func (a *agentModel) request(req agent.Request) llm.Request {
 	out := llm.Request{
-		Model:     req.Model,
+		Model:     cmp.Or(req.Model, a.opts.Model),
 		System:    req.System,
 		Messages:  mapSlice(req.Messages, llmMessage),
 		Tools:     mapSlice(req.Tools, a.llmTool),
@@ -158,13 +188,13 @@ func agentMessage(m llm.Message) agent.Message {
 	return out
 }
 
-// response is the agent.Response for resp. asked is the model the request
-// named, which prices a reply whose own model the table does not list.
-func (a *agentModel) response(resp *llm.Response, asked string) (agent.Response, error) {
+// response is the agent.Response for resp. asked is the model the request was
+// sent to, which prices a reply whose own model the table does not list.
+func (a *agentModel) response(ctx context.Context, resp *llm.Response, asked string) (agent.Response, error) {
 	stop, ok := agentStop(resp.Stop)
 	if !ok {
-		return agent.Response{}, fmt.Errorf("%w: app: agent model: the reply stopped for %q, which agent has no name for",
-			agent.ErrPermanent, resp.Stop)
+		return agent.Response{}, permanentUnlessDone(ctx,
+			fmt.Errorf("the reply stopped for %q, which agent has no name for", resp.Stop))
 	}
 	// What the run's limits count is what was billed: every attempt, as the
 	// cost is, and not only the last model's share.
@@ -180,19 +210,39 @@ func (a *agentModel) response(resp *llm.Response, asked string) (agent.Response,
 		InputTokens:  billed.InputTokens + billed.CacheReadTokens + billed.CacheWriteTokens,
 		OutputTokens: billed.OutputTokens,
 	}
-	if len(a.opts.Prices) > 0 {
+	msg := agentMessage(resp.Message)
+	if stop == agent.StopRefusal {
+		a.logRefusal(ctx, resp)
+		msg = agent.Message{Role: msg.Role}
+	}
+	if a.opts.Prices != nil {
 		cost, err := a.opts.Prices.CostFor(resp, asked)
 		if err != nil {
-			return agent.Response{}, fmt.Errorf("app: agent model: price the reply: %w: %w", agent.ErrPermanent, err)
+			return agent.Response{}, permanentUnlessDone(ctx, err)
 		}
 		usage.CostMicros = cost
 	}
 	return agent.Response{
-		Message: agentMessage(resp.Message),
+		Message: msg,
 		Stop:    stop,
 		Usage:   usage,
 		Model:   resp.Model,
 	}, nil
+}
+
+// logRefusal says why a model refused, which agent.Response has no place for.
+// The prompt and the reply's text stay out of the log.
+func (a *agentModel) logRefusal(ctx context.Context, resp *llm.Response) {
+	attrs := []any{"id", resp.ID, "model", resp.Model}
+	if r := resp.Refusal; r != nil {
+		if r.Category != "" {
+			attrs = append(attrs, "category", r.Category)
+		}
+		if r.Explanation != "" {
+			attrs = append(attrs, "explanation", r.Explanation)
+		}
+	}
+	a.logger.WarnContext(ctx, "app: agent model: the model refused the request", attrs...)
 }
 
 // agentStop is the agent.Stop for s. A reason agent has no name for is not
@@ -216,29 +266,28 @@ func agentStop(s llm.StopReason) (agent.Stop, bool) {
 	}
 }
 
-// classify says what the engine should make of a model's error.
-//
-// The caller's own context ending is the caller's, whatever the error says:
-// a worker that is shutting down must not fail a run for good. Otherwise an
-// error no retry will fix is wrapped in agent.ErrPermanent, and anything else
-// is returned as it is. A provider's own mark is trusted before a context
-// error in the chain, as llm.Retryable trusts it.
+// classify says what the engine should make of a model's error: permanent when
+// no retry will fix it, and otherwise as it is. A provider's own mark is
+// trusted before a context error in the chain, as llm.Retryable trusts it.
 func classify(ctx context.Context, err error) error {
-	if ctx.Err() != nil {
-		return err
-	}
 	if errors.Is(err, llm.ErrBudgetExceeded) || errors.Is(err, llm.ErrNoPrice) {
-		return permanent(err)
+		return permanentUnlessDone(ctx, err)
 	}
 	var provider *llm.Error
 	if errors.As(err, &provider) && !llm.Retryable(err) {
-		return permanent(err)
+		return permanentUnlessDone(ctx, err)
 	}
 	return err
 }
 
-// permanent marks err as one no retry will fix. It still unwraps to err.
-func permanent(err error) error {
+// permanentUnlessDone marks err as one no retry will fix, and it still unwraps
+// to err. The caller's own context ending decides before that: a worker that is
+// shutting down must not fail a run for good, and an error that is real comes
+// back, and is marked, on the retry.
+func permanentUnlessDone(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return err
+	}
 	return fmt.Errorf("app: agent model: %w: %w", agent.ErrPermanent, err)
 }
 

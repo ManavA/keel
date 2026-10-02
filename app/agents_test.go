@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"strings"
 	"sync"
@@ -770,17 +771,10 @@ func TestAgentModel_Cost(t *testing.T) {
 		want   int64
 	}{
 		{
-			name:  "with no table nothing is priced",
+			name:  "with a nil table nothing is priced, whatever model answers",
 			asked: "model-a",
-			reply: &llm.Response{Model: "model-a", Usage: usageA, Stop: llm.StopEnd},
+			reply: &llm.Response{Model: "model-zzz", Usage: usageA, Stop: llm.StopEnd},
 			want:  0,
-		},
-		{
-			name:   "an empty table is no table",
-			prices: llm.Prices{},
-			asked:  "model-a",
-			reply:  &llm.Response{Model: "model-zzz", Usage: usageA, Stop: llm.StopEnd},
-			want:   0,
 		},
 		{
 			name:   "from the table, at each kind of token's own price",
@@ -906,6 +900,283 @@ func TestAgentModel_PricesAreCopiedWhenTheModelIsBuilt(t *testing.T) {
 	assert.Equal(t, int64(costA), generate(t, m, asUser("model-a", "hi")).Usage.CostMicros)
 }
 
+// nil prices nothing. A table that is there and empty, such as one that failed
+// to load, is not "no prices": it lists no model, so no reply can be priced and a
+// run's cost limit is not silently off.
+func TestAgentModel_NilAndEmptyPrices(t *testing.T) {
+	t.Run("nil prices nothing, and every reply costs zero", func(t *testing.T) {
+		m := app.AgentModel(answering(&llm.Response{Model: "model-zzz", Usage: usageA, Stop: llm.StopEnd}), app.AgentModelOptions{Prices: nil})
+
+		resp, err := m.Generate(context.Background(), asUser("model-zzz", "hi"))
+
+		require.NoError(t, err)
+		assert.Zero(t, resp.Usage.CostMicros)
+		assert.Equal(t, int64(1230), resp.Usage.InputTokens)
+	})
+
+	for name, prices := range map[string]llm.Prices{"an empty table": {}, "a table made empty": make(llm.Prices, 4)} {
+		t.Run(name+" lists no model, so every reply is unpriceable and permanent", func(t *testing.T) {
+			m := app.AgentModel(answering(&llm.Response{Model: "model-a", Usage: usageA, Stop: llm.StopEnd}), app.AgentModelOptions{Prices: prices})
+
+			resp, err := m.Generate(context.Background(), asUser("model-a", "hi"))
+
+			require.ErrorIs(t, err, agent.ErrPermanent)
+			require.ErrorIs(t, err, llm.ErrNoPrice)
+			assert.Equal(t, agent.Response{}, resp, "not a reply that cost nothing")
+		})
+	}
+}
+
+// The budget prices a request that names no model at its own Options.Model. The
+// adapter has the same option, sends it when the request names none, and prices
+// at it, so the two settle the same price.
+func TestAgentModel_ARequestThatNamesNoModel(t *testing.T) {
+	t.Run("the option is sent when the request names none, and the request's own wins", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			option  string
+			request string
+			want    string
+		}{
+			{name: "none named anywhere", want: ""},
+			{name: "the option", option: "model-a", want: "model-a"},
+			{name: "the request's own over the option", option: "model-a", request: "model-b", want: "model-b"},
+			{name: "the request's own, no option", request: "model-b", want: "model-b"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				model := answering(plainReply())
+
+				generate(t, app.AgentModel(model, app.AgentModelOptions{Model: tt.option}), asUser(tt.request, "hi"))
+
+				assert.Equal(t, tt.want, model.requests()[0].Model)
+			})
+		}
+	})
+
+	t.Run("a dated id is priced as the option's model", func(t *testing.T) {
+		m := app.AgentModel(answering(&llm.Response{Model: "model-a-20251001", Usage: usageA, Stop: llm.StopEnd}),
+			app.AgentModelOptions{Model: "model-a", Prices: twoPrices()})
+
+		resp := generate(t, m, asUser("", "hi"))
+
+		assert.Equal(t, int64(costA), resp.Usage.CostMicros)
+	})
+
+	t.Run("with no option, a request that names no model cannot price a dated id", func(t *testing.T) {
+		m := app.AgentModel(answering(&llm.Response{Model: "model-a-20251001", Usage: usageA, Stop: llm.StopEnd}),
+			app.AgentModelOptions{Prices: twoPrices()})
+
+		_, err := m.Generate(context.Background(), asUser("", "hi"))
+
+		require.ErrorIs(t, err, agent.ErrPermanent)
+		require.ErrorIs(t, err, llm.ErrNoPrice)
+	})
+
+	// Parity: for each reply, a Budgeted given the model as its Options.Model
+	// settles the cost the adapter reports.
+	replies := []struct {
+		name  string
+		reply *llm.Response
+	}{
+		{"a listed model", &llm.Response{Model: "model-b", Usage: usageB, Stop: llm.StopEnd}},
+		{"the alias itself", &llm.Response{Model: "model-a", Usage: usageA, Stop: llm.StopEnd}},
+		{"a dated id", &llm.Response{Model: "model-a-20251001", Usage: usageA, Stop: llm.StopEnd}},
+		{"a reply that names no model", &llm.Response{Usage: usageA, Stop: llm.StopEnd}},
+		{"two attempts, one on a dated id", &llm.Response{
+			Model: "model-b", Usage: usageB, Stop: llm.StopEnd,
+			Attempts: []llm.Attempt{{Model: "model-a-20251001", Usage: usageA}, {Model: "model-b", Usage: usageB}},
+		}},
+		{"a refusal on a dated id", &llm.Response{Model: "model-a-20251001", Usage: usageA, Stop: llm.StopRefusal}},
+	}
+	for _, tt := range replies {
+		t.Run("parity with Budgeted: "+tt.name, func(t *testing.T) {
+			budget, err := llm.NewBudgeted(answering(tt.reply), llm.BudgetOptions{
+				MaxCostMicros: 1 << 40, Prices: twoPrices(), Model: "model-a",
+			})
+			require.NoError(t, err)
+			m := app.AgentModel(budget, app.AgentModelOptions{Model: "model-a", Prices: twoPrices()})
+
+			resp := generate(t, m, asUser("", "hi"))
+
+			assert.Equal(t, int64(1), budget.Spent().Calls)
+			assert.Equal(t, budget.Spent().CostMicros, resp.Usage.CostMicros, "the budget and the adapter charge the same")
+			assert.NotZero(t, resp.Usage.CostMicros)
+		})
+	}
+}
+
+// logSink is a slog.Handler that keeps what it is given.
+type logSink struct {
+	mu   sync.Mutex
+	recs []slog.Record
+}
+
+func (*logSink) Enabled(context.Context, slog.Level) bool { return true }
+func (s *logSink) Handle(_ context.Context, r slog.Record) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recs = append(s.recs, r.Clone())
+	return nil
+}
+func (s *logSink) WithAttrs([]slog.Attr) slog.Handler { return s }
+func (s *logSink) WithGroup(string) slog.Handler      { return s }
+
+func (s *logSink) records() []slog.Record {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]slog.Record(nil), s.recs...)
+}
+
+// logText is everything a record says: its message and every attribute.
+func logText(r slog.Record) string {
+	var b strings.Builder
+	b.WriteString(r.Message)
+	r.Attrs(func(a slog.Attr) bool {
+		b.WriteString(" " + a.Key + "=" + a.Value.String())
+		return true
+	})
+	return b.String()
+}
+
+func logAttrs(r slog.Record) map[string]string {
+	out := map[string]string{}
+	r.Attrs(func(a slog.Attr) bool {
+		out[a.Key] = a.Value.String()
+		return true
+	})
+	return out
+}
+
+// A refusal has nowhere to go in agent.Response, so its reason is logged. The
+// prompt and the reply's text are never logged.
+func TestAgentModel_ARefusalIsLogged(t *testing.T) {
+	refusal := func() *llm.Response {
+		return &llm.Response{
+			ID:    "msg_01XYZ",
+			Model: "model-a-20251001",
+			Message: llm.Message{
+				Role:      llm.RoleAssistant,
+				Text:      "reply text that must not be logged",
+				ToolCalls: []llm.ToolCall{{ID: "c", Name: "n", Input: rawOf(`{"secret":"call input that must not be logged"}`)}},
+			},
+			Stop:    llm.StopRefusal,
+			Refusal: &llm.Refusal{Category: "cyber", Explanation: "the request asked for something the model will not do"},
+		}
+	}
+	request := asUser("model-a", "prompt text that must not be logged")
+	request.System = "system text that must not be logged"
+
+	t.Run("one line at warning level with the id, the model, the category and the explanation", func(t *testing.T) {
+		sink := &logSink{}
+		m := app.AgentModel(answering(refusal()), app.AgentModelOptions{Logger: slog.New(sink)})
+
+		generate(t, m, request)
+
+		recs := sink.records()
+		require.Len(t, recs, 1)
+		assert.Equal(t, slog.LevelWarn, recs[0].Level)
+		assert.Equal(t, map[string]string{
+			"id":          "msg_01XYZ",
+			"model":       "model-a-20251001",
+			"category":    "cyber",
+			"explanation": "the request asked for something the model will not do",
+		}, logAttrs(recs[0]))
+		assert.Contains(t, recs[0].Message, "refus")
+	})
+
+	t.Run("never the prompt, the system text, or what the reply said", func(t *testing.T) {
+		sink := &logSink{}
+		m := app.AgentModel(answering(refusal()), app.AgentModelOptions{Logger: slog.New(sink)})
+
+		generate(t, m, request)
+
+		require.Len(t, sink.records(), 1)
+		all := logText(sink.records()[0])
+		for _, secret := range []string{"prompt text", "system text", "reply text", "call input", "secret"} {
+			assert.NotContains(t, all, secret)
+		}
+	})
+
+	t.Run("a refusal that gives no reason is logged with what there is", func(t *testing.T) {
+		sink := &logSink{}
+		reply := refusal()
+		reply.Refusal = nil
+		m := app.AgentModel(answering(reply), app.AgentModelOptions{Logger: slog.New(sink)})
+
+		generate(t, m, request)
+
+		require.Len(t, sink.records(), 1)
+		assert.Equal(t, map[string]string{"id": "msg_01XYZ", "model": "model-a-20251001"}, logAttrs(sink.records()[0]))
+	})
+
+	t.Run("an empty part of the reason is not logged as an empty field", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			reason *llm.Refusal
+			want   map[string]string
+		}{
+			{"a category alone", &llm.Refusal{Category: "cyber"}, map[string]string{"id": "msg_01XYZ", "model": "model-a-20251001", "category": "cyber"}},
+			{"an explanation alone", &llm.Refusal{Explanation: "not something it does"}, map[string]string{"id": "msg_01XYZ", "model": "model-a-20251001", "explanation": "not something it does"}},
+			{"neither", &llm.Refusal{}, map[string]string{"id": "msg_01XYZ", "model": "model-a-20251001"}},
+		}
+		for _, tt := range tests {
+			sink := &logSink{}
+			reply := refusal()
+			reply.Refusal = tt.reason
+			m := app.AgentModel(answering(reply), app.AgentModelOptions{Logger: slog.New(sink)})
+
+			generate(t, m, request)
+
+			require.Len(t, sink.records(), 1, tt.name)
+			assert.Equal(t, tt.want, logAttrs(sink.records()[0]), tt.name)
+		}
+	})
+
+	t.Run("a reply that is not a refusal logs nothing", func(t *testing.T) {
+		sink := &logSink{}
+		reply := refusal()
+		reply.Stop = llm.StopEnd
+		m := app.AgentModel(answering(reply), app.AgentModelOptions{Logger: slog.New(sink)})
+
+		generate(t, m, request)
+
+		assert.Empty(t, sink.records())
+	})
+
+	t.Run("a failed call logs nothing", func(t *testing.T) {
+		sink := &logSink{}
+		m := app.AgentModel(failing(errors.New("down")), app.AgentModelOptions{Logger: slog.New(sink)})
+
+		_, _ = m.Generate(context.Background(), request)
+
+		assert.Empty(t, sink.records())
+	})
+
+	t.Run("no Logger is slog.Default", func(t *testing.T) {
+		sink := &logSink{}
+		was := slog.Default()
+		slog.SetDefault(slog.New(sink))
+		t.Cleanup(func() { slog.SetDefault(was) })
+		m := app.AgentModel(answering(refusal()), app.AgentModelOptions{})
+
+		generate(t, m, request)
+
+		require.Len(t, sink.records(), 1)
+		assert.Equal(t, "msg_01XYZ", logAttrs(sink.records()[0])["id"])
+	})
+
+	t.Run("a refusal an unpriceable table turns into an error is still logged", func(t *testing.T) {
+		sink := &logSink{}
+		m := app.AgentModel(answering(refusal()), app.AgentModelOptions{Logger: slog.New(sink), Prices: llm.Prices{"other": {}}})
+
+		_, err := m.Generate(context.Background(), request)
+
+		require.ErrorIs(t, err, llm.ErrNoPrice)
+		assert.Len(t, sink.records(), 1)
+	})
+}
+
 // A refused reply carries no text and no tool calls. The adapter passes what
 // it is given, and a refusal is a reply, not an error.
 func TestAgentModel_ARefusalIsAReply(t *testing.T) {
@@ -924,19 +1195,65 @@ func TestAgentModel_ARefusalIsAReply(t *testing.T) {
 		assert.Equal(t, int64(costA), resp.Usage.CostMicros, "what was refused was still billed")
 	})
 
-	t.Run("one that carries something is passed as it is, not invented or dropped", func(t *testing.T) {
-		reply := &llm.Response{
-			Model:   "model-a",
-			Message: llm.Message{Role: llm.RoleAssistant, Text: "I can't help with that."},
-			Stop:    llm.StopRefusal,
-			Refusal: &llm.Refusal{Category: "cyber", Explanation: "no"},
+	// A refusal reaches the engine with nothing to act on, whatever the
+	// provider put in it: an engine that journals calls before it reads the stop
+	// would run them, and the opaque form would replay them.
+	reasons := map[string]*llm.Refusal{
+		"with a reason":       {Category: "cyber", Explanation: "no"},
+		"with an empty field": {},
+		"with no reason":      nil,
+	}
+	for name, reason := range reasons {
+		t.Run("one that carries text, two calls and an opaque form reaches the engine with none of them, "+name, func(t *testing.T) {
+			reply := &llm.Response{
+				ID:    "msg_01",
+				Model: "model-a",
+				Message: llm.Message{
+					Role: llm.RoleAssistant,
+					Text: "I can't help with that.",
+					ToolCalls: []llm.ToolCall{
+						{ID: "call-1", Name: "delete_all", Input: rawOf(`{"everything":true}`)},
+						{ID: "call-2", Name: "send", Input: rawOf(`{"to":"x"}`)},
+					},
+					ToolResults: []llm.ToolResult{{CallID: "call-0", Content: "stale"}},
+					Opaque:      &llm.Opaque{Provider: "anthropic", Data: rawOf(oddJSON[1].data)},
+				},
+				Stop:    llm.StopRefusal,
+				Usage:   usageA,
+				Refusal: reason,
+			}
+
+			resp := generate(t, app.AgentModel(answering(reply), app.AgentModelOptions{Prices: twoPrices()}), asUser("model-a", "hi"))
+
+			assert.Equal(t, agent.StopRefusal, resp.Stop)
+			assert.Empty(t, resp.Message.Text)
+			assert.Empty(t, resp.Message.Calls)
+			assert.Empty(t, resp.Message.Results)
+			assert.Nil(t, resp.Message.Opaque)
+			assert.Equal(t, agent.Message{Role: agent.RoleAssistant}, resp.Message)
+			assert.Equal(t, "model-a", resp.Model)
+			assert.Equal(t, int64(costA), resp.Usage.CostMicros, "what was refused was still billed")
+			assert.Equal(t, int64(1230), resp.Usage.InputTokens)
+		})
+	}
+
+	t.Run("only a refusal loses its content: every other stop keeps it", func(t *testing.T) {
+		for _, stop := range []llm.StopReason{llm.StopEnd, llm.StopToolUse, llm.StopMaxTokens, llm.StopSequence, llm.StopPause, llm.StopContextWindow} {
+			reply := plainReply()
+			reply.Stop = stop
+			reply.Message = llm.Message{
+				Role:      llm.RoleAssistant,
+				Text:      "some text",
+				ToolCalls: []llm.ToolCall{{ID: "call-1", Name: "n", Input: rawOf(`{}`)}},
+				Opaque:    &llm.Opaque{Provider: "p", Data: rawOf(`{"a":1}`)},
+			}
+
+			resp := generate(t, app.AgentModel(answering(reply), app.AgentModelOptions{}), asUser("model-a", "hi"))
+
+			assert.Equal(t, "some text", resp.Message.Text, "stop %s", stop)
+			assert.Len(t, resp.Message.Calls, 1, "stop %s", stop)
+			assert.NotNil(t, resp.Message.Opaque, "stop %s", stop)
 		}
-
-		resp := generate(t, app.AgentModel(answering(reply), app.AgentModelOptions{}), asUser("model-a", "hi"))
-
-		assert.Equal(t, agent.StopRefusal, resp.Stop)
-		assert.Equal(t, "I can't help with that.", resp.Message.Text)
-		assert.Empty(t, resp.Message.Calls)
 	})
 
 	// Fallback moves past a refusal and returns the last one as the reply when
@@ -1125,6 +1442,83 @@ func TestAgentModel_TheCallersContext(t *testing.T) {
 
 		assertTheCallers(t, err, context.Canceled)
 		assert.True(t, isTheError(err, wrapped), "returned as it is")
+	})
+}
+
+// The context decides before anything the error says: a budget refusal, an
+// ErrNoPrice or a reply nothing can price, met while the caller's context is
+// done, is returned as it is. The retry meets it again, and an error that is
+// real then is permanent.
+func TestAgentModel_TheCallersContextDecidesBeforeAnyOtherError(t *testing.T) {
+	done := func() context.Context {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
+	}
+	budgetErr := fmt.Errorf("llm: budget: a call of up to 9 tokens: %w", llm.ErrBudgetExceeded)
+	noPriceErr := fmt.Errorf("pricing the worst case: %w: %q", llm.ErrNoPrice, "m")
+
+	tests := []struct {
+		name  string
+		model llm.Model
+		opts  app.AgentModelOptions
+		is    error
+		same  error
+	}{
+		{name: "a budget refusal", model: failing(budgetErr), is: llm.ErrBudgetExceeded, same: budgetErr},
+		{name: "an ErrNoPrice from the model", model: failing(noPriceErr), is: llm.ErrNoPrice, same: noPriceErr},
+		{
+			name:  "a reply nothing can price",
+			model: answering(&llm.Response{Model: "model-z", Usage: usageA, Stop: llm.StopEnd}),
+			opts:  app.AgentModelOptions{Prices: twoPrices()},
+			is:    llm.ErrNoPrice,
+		},
+		{
+			name:  "a reply that stopped for a reason agent has no name for",
+			model: answering(&llm.Response{Model: "model-a", Usage: usageA, Stop: "something_new"}),
+		},
+		{
+			name:  "a reply no empty table can price",
+			model: answering(&llm.Response{Model: "model-a", Usage: usageA, Stop: llm.StopEnd}),
+			opts:  app.AgentModelOptions{Prices: llm.Prices{}},
+			is:    llm.ErrNoPrice,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, err := app.AgentModel(tt.model, tt.opts).Generate(done(), asUser("model-y", "hi"))
+
+			require.Error(t, err)
+			if tt.is != nil {
+				require.ErrorIs(t, err, tt.is)
+			}
+			assert.NotErrorIs(t, err, agent.ErrPermanent, "a shutdown must not fail the run for good")
+			assert.Equal(t, agent.Response{}, resp)
+			if tt.same != nil {
+				assert.True(t, isTheError(err, tt.same), "returned as it is")
+			}
+		})
+	}
+
+	t.Run("a real budget in front of a model, with the caller's context done", func(t *testing.T) {
+		budget, err := llm.NewBudgeted(llm.NewScripted(echoScript, llm.ScriptedOptions{}), llm.BudgetOptions{MaxTokens: 10})
+		require.NoError(t, err)
+
+		_, err = app.AgentModel(budget, app.AgentModelOptions{}).Generate(done(), asUser("model-y", "hi"))
+
+		require.ErrorIs(t, err, llm.ErrBudgetExceeded)
+		assert.NotErrorIs(t, err, agent.ErrPermanent)
+	})
+
+	t.Run("the same errors with the context live are permanent", func(t *testing.T) {
+		for _, tt := range tests {
+			_, err := app.AgentModel(tt.model, tt.opts).Generate(context.Background(), asUser("model-y", "hi"))
+
+			require.ErrorIs(t, err, agent.ErrPermanent, tt.name)
+			if tt.is != nil {
+				require.ErrorIs(t, err, tt.is, tt.name)
+			}
+		}
 	})
 }
 

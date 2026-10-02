@@ -3987,9 +3987,12 @@ package app
 // AgentModelOptions configures AgentModel. The zero value prices nothing.
 type AgentModelOptions struct {
 	// Prices turns each reply's tokens into the cost a run's budget is
-	// measured in. With Prices set, a reply that neither the model it names
-	// nor the model the request asked for can price fails the run rather than
-	// being counted as free. AgentModel keeps a copy of the table.
+	// measured in. Nil prices nothing: every reply costs zero. Anything else
+	// is a table, and a table that lists no model that answers, an empty one
+	// included, fails the run on every reply rather than leaving its cost limit
+	// silently off: a reply that neither the model it names nor the model
+	// priced for the request can price is a permanent error. AgentModel keeps a
+	// copy of the table.
 	Prices llm.Prices
 	// Effort is sent with every request.
 	Effort llm.Effort
@@ -3999,8 +4002,17 @@ type AgentModelOptions struct {
 	// DefaultMaxTokens bounds the reply to a request that sets no MaxTokens.
 	// Zero is 16000, the number llm.Budgeted assumes for a request that sets
 	// none: the adapter always sends a bound, so that a budget's hold is a
-	// real upper bound on the call.
+	// real upper bound on the call. It goes to every model the adapter
+	// serves, so a model with a lower output cap needs it set lower.
 	DefaultMaxTokens int
+	// Model is the model a request that names none is sent to, and priced as.
+	// It is llm.BudgetOptions.Model's counterpart: give both the same name, so
+	// that the budget and the adapter settle the same price.
+	Model string
+	// Logger receives one warning for each refusal, with the provider's reply
+	// id, the model and the refusal's reason. Nil uses slog.Default(). Neither
+	// the prompt nor the reply's text is logged.
+	Logger *slog.Logger
 }
 
 // AgentModel adapts an llm.Model to agent.Model.
@@ -4014,7 +4026,8 @@ func AgentGuard(d *policy.Decider) agent.Guard
 
 | `agent.Request` | `llm.Request` |
 |---|---|
-| `Model`, `System` | The same fields |
+| `Model` | The same field; when it is empty, `AgentModelOptions.Model` |
+| `System` | The same field |
 | `MaxTokens` | The same field; when it is zero or less, `DefaultMaxTokens`. A request the adapter sends always sets one |
 | `Messages`: `Role`, `Text`, `Calls`, `Results`, `Opaque` | `Role`, `Text`, `ToolCalls`, `ToolResults`, `Opaque`, field for field: a call's `ID`, `Name`, `Input` and `Malformed`, a result's `CallID`, `Content` and `IsError`, an opaque form's `Provider` and `Data` |
 | `Tools` | `Tools`, with `Strict` from `StrictTools` |
@@ -4032,20 +4045,33 @@ order and spacing included.
 | `Message` | `Message`, field for field |
 | `Stop` | The constant of the same name; `StopSequence` becomes `StopEnd`. A reason `agent` has no name for is a permanent error |
 | `Model` | `Model` |
-| `Usage`, and `Attempts` when there are some | `InputTokens` is input plus cache reads plus cache writes, and `OutputTokens`, summed over every attempt, or over the one `Model` and `Usage` when there are none; `CostMicros` is `Prices.CostFor(resp, asked)` with the request's `Model` as `asked`, and zero when no `Prices` are set |
+| `Usage`, and `Attempts` when there are some | `InputTokens` is input plus cache reads plus cache writes, and `OutputTokens`, summed over every attempt, or over the one `Model` and `Usage` when there are none; `CostMicros` is `Prices.CostFor(resp, asked)` with the model the request was sent to as `asked`, and zero when `Prices` is nil |
 
-A refused reply carries no text and no tool calls. The adapter passes what it
-is given, invents and drops no content, and maps the stop reason: a refusal is
-a reply, not an error, including one `Fallback` returns after the models behind
-it failed. Its `Refusal` explanation has no place in `agent.Response` and is
-not carried.
+A refused reply is meant to carry no text and no tool calls, and the adapter
+makes that so: when the stop is a refusal, the `agent.Response` has the role
+and nothing else, no text, no calls and no opaque form (which would replay the
+calls dropped), whatever the provider put in the reply, so that an engine that
+journals calls before it reads the stop has none to run. The usage and the cost
+are still reported, since a refusal is billed. A refusal is a reply, not an
+error, including one `Fallback` returns after the models behind it failed. Its
+reason has no place in `agent.Response`: the adapter logs one line at warning
+level through `Logger`, with the provider's reply id, the model, and the
+refusal's category and explanation when the reply carries them, and never the
+prompt or the reply's text. Any other content passes as it is given.
+
+Not carried: the run id and the agent name are not sent to the model, and the
+provider's reply id and the refusal's details are logged, not returned.
 
 Errors are classified as `llm.Retryable` classifies them, which trusts an
 `*llm.Error` in the chain before it looks for a context error:
 
 - The caller's own cancellation or deadline, read from the context given to
-  `Generate`, is returned as it is: neither retryable nor permanent. A worker
-  that is shutting down must not fail a run for good.
+  `Generate`, is returned as it is: neither retryable nor permanent. It decides
+  before anything else: a budget refusal, an `ErrNoPrice`, a reply that cannot
+  be priced or a reply with a stop `agent` has no name for, met while the
+  context is done, is returned as it is too. A worker that is shutting down
+  must not fail a run for good, and an error that is real comes back, and is
+  marked, on the retry.
 - `ErrBudgetExceeded`, `ErrNoPrice`, a reply that cannot be priced, and an
   `*llm.Error` that is not retryable are returned wrapped in
   `agent.ErrPermanent`, and still unwrap to themselves.
@@ -4053,9 +4079,12 @@ Errors are classified as `llm.Retryable` classifies them, which trusts an
   they are, and the engine tries again later.
 - A nil reply with a nil error is an error, and not a permanent one.
 
-With `Prices` set, a reply that is priced at neither the model it names nor the
-model the request asked for is an `ErrNoPrice` and so permanent: a run with a
-cost budget must not treat an unpriced call as free. The reply is priced as
+With `Prices` not nil, a reply that is priced at neither the model it names nor
+the model the request was sent to is an `ErrNoPrice` and so permanent, and an
+empty table prices nothing: a run with a cost budget must not treat an unpriced
+call as free. A request that names no model is sent to, and priced at,
+`AgentModelOptions.Model`, as `llm.Budgeted` prices it at its own
+`BudgetOptions.Model`. The reply is priced as
 `llm`'s budget and meter price it, so a provider that answers an alias with a
 dated id costs what the alias costs (decision 54).
 
@@ -4734,8 +4763,9 @@ lead confirmed its choices, and the table now states each of them.
     spelling: normalising inside `policy` would pick one spelling for every
     caller's idea of what a target is.
 
-54. **`AgentModel` prices a reply as the budget and meter do and always bounds
-    it; `AgentGuard` says what a policy could not evaluate.** Section 8 first
+54. **`AgentModel` prices a reply as the budget and meter do, always bounds it,
+    and lets a refusal act on nothing; `AgentGuard` says what a policy could not
+    evaluate.** Section 8 first
     priced a reply with `Prices.CostOf` and made a model the table lacks a
     permanent error. Now `Prices.CostFor`, which is decision 44's one function
     under a name, prices each attempt at the model it names, then at the model
@@ -4763,4 +4793,19 @@ lead confirmed its choices, and the table now states each of them.
     amount arrived as the string "1250"; and a field on `agent.Decision`,
     which changes the journal and every store. `AgentGuard` hands `Kind`,
     `Target` and `Attrs` to `policy` as they are, as decision 53 asks of
-    whatever builds an `Action`.
+    whatever builds an `Action`. The review of the adapters added four rulings.
+    A refusal reaches the engine with the role and nothing else: the first
+    wording, that the adapter passes what it is given, let a refusal a provider
+    returned with tool calls in it reach an engine that journals calls before it
+    reads the stop, and the opaque form would have replayed them; the narrowest
+    place to make that impossible is here, beside the planner reading the stop
+    first. The refusal's reason, which `agent.Response` has no place for, is
+    logged through `AgentModelOptions.Logger`, and never the prompt or the
+    text. `AgentModelOptions.Model` is `BudgetOptions.Model`'s counterpart, so
+    that a request naming no model is priced where the budget prices it and
+    not as `""`, which a table keyed by alias cannot price. Nil `Prices` prices
+    nothing and any other table is set, so that a table that failed to load
+    fails the run instead of switching its cost limit off. Rejected: reading an
+    empty table as no table. And the caller's context decides before a budget
+    refusal, an `ErrNoPrice` and an unpriceable reply as it does before a
+    provider error.
