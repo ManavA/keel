@@ -417,12 +417,14 @@ func (e *Error) Error() string {
 func (e *Error) Unwrap() error { return e.Err }
 
 // Retryable reports whether err is a provider failure worth trying again.
-// Context cancellation, ErrBudgetExceeded and any error that is not an *Error
-// are not.
+//
+// If err holds an *Error, its Retryable field decides, whatever the error it
+// wraps says. A client's own timeout wraps context.DeadlineExceeded while the
+// caller's context is still live, and is worth another try; a provider whose
+// caller's context is done returns that context's error and no *Error. Any
+// other error is not retryable: a bare context cancellation or deadline,
+// ErrBudgetExceeded, and anything that is not from a provider.
 func Retryable(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
 	var e *Error
 	return errors.As(err, &e) && e.Retryable
 }
@@ -575,7 +577,10 @@ type FallbackOptions struct {
 	// ShouldFallback decides whether err moves on to the next model. Nil
 	// uses the default above.
 	ShouldFallback func(err error) bool
-	// OnRefusal also moves on when a model answers with StopRefusal.
+	// OnRefusal also moves on when a model answers with StopRefusal. A
+	// refusal is billed, so if no later model answers, the last refusal is the
+	// reply, with a nil error and every refused attempt in Attempts, and the
+	// failures that followed are logged.
 	OnRefusal bool
 	Logger    *slog.Logger
 }
@@ -607,6 +612,9 @@ type BudgetOptions struct {
 	// DefaultMaxTokens is the reply bound assumed for a request that sets
 	// none. Default 16000.
 	DefaultMaxTokens int
+	// Logger receives a warning when a call settles for more than was held
+	// for it. Nil uses slog.Default().
+	Logger *slog.Logger
 }
 
 // Spend is what a Budgeted has used.
@@ -642,8 +650,11 @@ type CallRecord struct {
 	// failed.
 	Model string
 	Usage Usage
-	// CostMicros is the call's cost, and Priced whether the table had a
-	// price for every model that worked on it.
+	// CostMicros is the call's cost, and Priced whether every attempt was
+	// priced: by its own model's name in the table or, failing that, at the
+	// model the request asked for. A model that a fallback moves to should be
+	// listed in the table, since otherwise it is priced at the first model's
+	// rate.
 	CostMicros int64
 	Priced     bool
 	Stop       StopReason
@@ -787,38 +798,85 @@ wrapper waits that long, capped at `MaxRetryAfter`, before returning the
 error to `retry.Do`, whose jitter is then added on top; it does not wait
 after the last attempt. `Stream` is retried only while `fn` has not been
 called: a stream that has delivered a delta is never replayed into the same
-callback. The error returned is `retry.Do`'s `*retry.Error`, through which
-`errors.As` still finds the `*llm.Error`.
+callback, so a failure after one is not retried, and an error returned by `fn`
+itself comes back as `fn` returned it. The caller's own context ending stops
+the loop at once, in a wait or between attempts, and the error returned wraps
+the context's. Any other failure is returned as `retry.Do`'s `*retry.Error`,
+through which `errors.As` still finds the `*llm.Error`. A model that returns
+neither a reply nor an error is a bug, not a transient failure: it is reported
+and not retried.
 
 **`Fallback`.** Each model is tried in order. By default the chain moves on
-after any error except a cancelled or expired context and
-`ErrBudgetExceeded`; `ShouldFallback` replaces that test. With `OnRefusal`,
-a reply with `StopRefusal` also moves on. `Request.Model` goes to the first
-model only: a model name means something to one provider, so each later
-model uses its own configured default. A model that did not produce an
-assistant turn's `Opaque` ignores it and builds the turn from `Text` and
-`ToolCalls`, which is how a conversation crosses providers. When every model
-fails, the error wraps `errors.Join` of all of them. `Stream` moves on only
-before the first delta.
+after any error except `ErrBudgetExceeded`; `ShouldFallback` replaces that
+test. The caller's context ending stops the chain whatever `ShouldFallback`
+says, and it is read from the context, not from the error: an HTTP client's
+own timeout wraps `context.DeadlineExceeded` while the caller's context is
+live, and is a failed model like any other. `Request.Model` goes to the first
+model only: a model name means something to one provider, so each later model
+uses its own configured default. A model that did not produce an assistant
+turn's `Opaque` ignores it and builds the turn from `Text` and `ToolCalls`,
+which is how a conversation crosses providers. When every model fails, or the
+chain stops early, the error is `llm: fallback:` wrapping `errors.Join` of
+`model i of n: <error>` for each model tried; a nil model is refused by
+`NewFallback`. A model that returns neither a reply nor an error has failed.
+
+`Stream` moves on only before the first delta. Once the caller's callback has
+been called the chain ends with what that model returns, and an error returned
+by the callback itself comes back as the callback returned it.
+
+With `OnRefusal`, a reply with `StopRefusal` also moves on. A refusal is
+billed, so it is not dropped: it is listed in the `Attempts` of the reply that
+follows, so that a price table sees every billed attempt, and if no later
+model answers, the last refusal is itself the reply, with a nil error and every
+refused attempt in its `Attempts`. The failures that followed it are logged
+at warning level. This holds when the chain is ended by the caller's context,
+by a refused budget, or by a `ShouldFallback` that says no. For a stream the
+returned `Response` is authoritative, not the deltas: a later model may have
+delivered deltas and then failed, and the reply is still the earlier refusal.
+A refusal that itself delivered a delta stops the chain and is the reply, so a
+refused attempt's own deltas are never left unaccounted. The one exception is
+the callback's own error, which is returned with no reply, so a refusal moved
+past before it is in no account; that is accepted, since the caller stopped
+the stream, and its usage is logged at warning level.
 
 **`Budgeted`.** Before a call it computes the worst case: estimated input
 tokens plus the request's `MaxTokens` (or `DefaultMaxTokens`), and that
 usage priced for the model the request names, or `BudgetOptions.Model` when
-it names none. If what is spent, plus what calls in flight have reserved,
-plus this worst case would pass a limit, it returns an error wrapping
-`ErrBudgetExceeded` and makes no call. Otherwise it reserves the worst
-case, makes the call, releases the reservation and adds the real usage and
-`Prices.CostOf(resp)`. With `MaxCostMicros` set, a
-request for a model the table does not list is refused with `ErrNoPrice`,
-because an unpriced call cannot be shown to fit. A call that fails adds
-nothing: whether the provider billed it cannot be known. The guarantee is
-therefore: no call starts once the budget is spent, and none starts whose
-worst-case estimate does not fit; real spend can pass the limit by at most
-the error of the estimates of the calls in flight.
+it names none. If what is spent, plus what calls in flight hold, plus this
+worst case would pass a limit, it returns an error wrapping
+`ErrBudgetExceeded` and makes no call. Otherwise it holds the worst case,
+makes the call, gives the hold back, also if the model panics, and adds the
+real usage, summed over the reply's `Attempts`, and its cost. Each attempt is
+priced at the model it names or, when the table does not list that one, at the
+model the request asked for: a provider commonly answers an alias with a dated
+id. Only a reply that can be priced at neither is charged the cost that was
+held. With `MaxCostMicros` set, a request for a model the table does not list
+is refused with `ErrNoPrice`, because an unpriced call cannot be shown to fit.
+A call that fails adds nothing, the call itself included: whether the provider
+billed it cannot be known. A negative limit refuses every call. A model that
+returns neither a reply nor an error has failed.
+
+The guarantee is therefore: no call starts once the budget is spent, and none
+starts whose worst case, priced as the model asked for, does not fit. It does
+not promise that real spend stays under the limit, because the hold is an
+upper bound only as far as its parts are. The estimate of the input can
+undercount a prompt; the reply can come from a dearer model than the one the
+hold was priced at; a chain behind the budget can bill several attempts for
+one call. Real spend is added as it is, never clamped to what was held, so the
+next call is refused for it, and a call that settles for more than its hold, in
+a dimension that has a limit, is logged at warning level with the model asked
+for, the model that answered, the hold and the real figures.
 
 **`Metered`.** Every call, failed or not, produces one `CallRecord` and adds
-to `Totals`. `Priced` is false when the table had no price for a model that
-worked on the reply; the tokens are still counted.
+to `Totals`. A failed call has no usage and costs nothing: its record carries
+the error and the model asked for, `Priced` is false, and `Totals.Calls` still
+counts it. `Priced` is true when every attempt behind the reply was priced, by
+its own model's name or, failing that, at the model the request asked for;
+otherwise, and with no table, it is false and the tokens are still counted. A
+fallback to a different model should therefore list that model in the table,
+since otherwise it is priced at the first model's rate. The record is made
+when the call, or the stream, ends, and `Record` runs after the totals are
+updated and with no lock held.
 
 **`Decode`.** Unmarshals `resp.Message.Text` into `T`. It refuses a reply
 whose `Stop` is not `StopEnd`, since the reference says a refused or
@@ -1098,18 +1156,32 @@ provider consumes an `*http.Client`. Nothing else.
 Every type here is safe for concurrent use. `Scripted`, `Budgeted` and
 `Metered` guard their state with a mutex; the providers hold no state beyond
 their options. No call is retried unless it is wrapped in `Retrying`: a
-provider makes one HTTP request per call. A cancelled context ends a call at
-once and is never retried and never moves a `Fallback` on.
+provider makes one HTTP request per call.
+
+The caller's own context ending, cancelled or past its deadline, ends a call
+at once: it is never retried and never moves a `Fallback` on. That is read
+from the context, not from an error that merely wraps a deadline. An HTTP
+client's own timeout wraps `context.DeadlineExceeded` while the caller's
+context is live; it is a failure of the provider, which marks it retryable,
+and both `Retryable` and `Fallback` treat it as one. A provider whose caller's
+context is done returns the context's error and no `*Error`.
 
 A provider reads at most 32 MiB of response body, and the event reader at
 most 16 MiB per event; past either it returns an error instead of
 allocating without limit.
 
-The order to compose the wrappers, outermost first, is `Metered`,
-`Budgeted`, `Fallback`, then one `Retrying` per provider: each provider
-retries its own transient failures before the chain moves on, the budget
-sees one call however many attempts it took, and the meter sees what the
-budget let through.
+The order to compose the wrappers, outermost first, is `Budgeted`, `Metered`,
+`Fallback`, then one `Retrying` per provider: each provider retries its own
+transient failures before the chain moves on, the budget refuses a call
+before anything else sees it, and the budget and the meter each see one call
+however many attempts it took. The meter records only what the budget let
+through.
+
+Two things hold for every wrapper. A stream callback's own error is the
+caller's signal to stop, not a failure of the model, so each wrapper returns it
+as the callback returned it, never wrapped, joined or retried. And a model that
+returns neither a reply nor an error is a bug in the model: each wrapper
+reports it as an error with one message, and none counts it as a reply.
 
 ### 4.8 In-process default
 
@@ -4078,3 +4150,54 @@ chose them.
     bound. Rejected: checking the assembled event, which allocates first
     and checks after. The error is not exported, since no caller has a
     decision to make about it.
+
+The review of the wrappers task settled the points below. They refine 4.3 and
+4.7, which they take precedence over. They carry no numbers, so that
+decisions added by tasks running at the same time do not collide.
+
+**The budget is outermost and the meter sits inside it.** `Budgeted`, then
+`Metered`, then `Fallback`. Rejected: the meter outermost, which records a
+call the budget refused as a failed call with no usage, and so counts as a
+call something that never reached a provider.
+
+**Only the caller's context ends a `Fallback` chain, and `Retryable` trusts
+the provider's mark.** Rejected: reading `context.DeadlineExceeded` or
+`context.Canceled` in the error chain as the caller's. An `http.Client`'s own
+timeout satisfies `errors.Is(err, context.DeadlineExceeded)` while the
+caller's context is live, so a provider that hangs, which is the case a
+fallback exists for, would end the chain and would not be retried. The
+default test for moving on is now `ErrBudgetExceeded` alone; `Retryable`
+decides by the `*Error` it finds, and a provider returns the context's own
+error and no `*Error` once the caller's context is done.
+
+**A refusal that was moved past is billed, and is the reply if no later model
+answers.** With `OnRefusal`, the last refusal comes back with a nil error and
+every refused attempt in `Attempts`, and the failures that followed are
+logged. Rejected: an error, which leaves what was paid for out of the budget
+and the meter, and bills another refusal each time the caller tries the step
+again.
+
+**A reply is priced at the model it names, then at the model the request asked
+for, then at the cost that was held for it.** One function does it, for the
+budget and the meter. Rejected: pricing only at the model the reply names. A
+provider commonly answers an alias with a dated id, so a table keyed by alias
+would fail on every call and the budget would refuse far too early.
+
+**A stream callback's own error comes back untouched, and a model's nil reply
+with a nil error is an error.** See 4.7. Rejected: letting the retry wrapper
+and the chain wrap the callback's error, which makes the caller's own signal
+to stop read as a model failure; and handling a nil reply differently in each
+wrapper.
+
+**A settle that passes its hold is added as it is and logged.** `Budgeted`
+adds a call's real cost and tokens, never clamped to what was held, and logs
+at warning level, through `BudgetOptions.Logger`, a call that settles for more
+than its hold in a dimension that has a limit. Rejected: clamping, which
+forgets real spend and lets the next call through on money already gone; and
+staying silent, which hides that the guarantee in 4.3 did not cover that call.
+The field is new, and its zero value works.
+
+**A callback's error after a refusal that was moved past loses the refusal's
+billing, and is logged.** The error comes back with no reply for the usage to
+ride in. Rejected: returning a reply with the error, which breaks the rule that
+a callback's error comes back as the callback returned it.

@@ -1,7 +1,6 @@
 package llm
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -46,12 +45,14 @@ func (e *Error) Error() string {
 func (e *Error) Unwrap() error { return e.Err }
 
 // Retryable reports whether err is a provider failure worth trying again.
-// Context cancellation, ErrBudgetExceeded and any error that is not an *Error
-// are not.
+//
+// If err holds an *Error, its Retryable field decides, whatever the error it
+// wraps says. A client's own timeout wraps context.DeadlineExceeded while the
+// caller's context is still live, and is worth another try; a provider whose
+// caller's context is done returns that context's error and no *Error. Any
+// other error is not retryable: a bare context cancellation or deadline,
+// ErrBudgetExceeded, and anything that is not from a provider.
 func Retryable(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
 	var e *Error
 	return errors.As(err, &e) && e.Retryable
 }

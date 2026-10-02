@@ -49,8 +49,10 @@
 // # Wrappers
 //
 // [Retrying], [Fallback], [Budgeted] and [Metered] each wrap a Model and are
-// one. Compose them, outermost first, as Metered, Budgeted, Fallback, then
+// one. Compose them, outermost first, as Budgeted, Metered, Fallback, then
 // one Retrying per provider: each provider retries its own transient
-// failures before the chain moves on, the budget sees one call however many
-// attempts it took, and the meter sees what the budget let through.
+// failures before the chain moves on, the budget refuses a call before
+// anything else sees it, and the budget and the meter each see one call
+// however many attempts it took. The meter records only what the budget let
+// through.
 package llm
