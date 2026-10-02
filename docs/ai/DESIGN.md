@@ -2994,7 +2994,8 @@ func New(db keelpg.Beginner) *Store
 
 // Purge deletes runs that ended before olderThan and were not started by
 // another run, with their steps, approvals and child runs, and reports how
-// many it removed.
+// many it removed. The keys Once recorded for a removed run's steps go with
+// it. A purge that Postgres ends for a deadlock is tried once more.
 func (s *Store) Purge(ctx context.Context, olderThan time.Time) (int64, error)
 
 // Once records key in tx and reports whether this is the first time it has
@@ -3161,26 +3162,27 @@ from the request; a store never reads a clock.
 
 | Method | Effect |
 |---|---|
-| Every method, in this order | First, what the request alone shows to be wrong is refused, before the store is touched: an id to be kept that is not a UUID in canonical form, a TTL of zero or less, a `To` that is no step status, a `Status` the method does not take, attributes JSON cannot hold, a claim with no owner. A Postgres store makes these checks in Go before it opens a transaction. Second, a run or an approval that does not exist is `ErrNotFound`. Third, for a method that takes a `Lease`, a lease that is not the run's is `ErrLeaseLost`. Fourth, and only then, whatever depends on the state of the run, its steps and its approvals: its status, a step's `From`, a parent that does not exist, an approval already recorded. So a call that is wrong in two ways gets the same error from every store: a lost lease with a bad argument is refused for the argument, and a lost lease with a step in the wrong status is `ErrLeaseLost` |
+| Every method, in this order | First, what the request alone shows to be wrong is refused, before the store is touched: an id to be kept that is not a UUID in canonical form, a TTL of zero or less, a `To` that is no step status, a `Status` the method does not take, a cause that is none of the three, attributes JSON cannot hold, raw JSON that is not JSON, a claim with no owner, a name that cannot be kept, a list cursor whose id is not a UUID. A Postgres store makes these checks in Go before it opens a transaction. Second, a run or an approval that does not exist is `ErrNotFound`. Third, for a method that takes a `Lease`, a lease that is not the run's is `ErrLeaseLost`. Fourth, and only then, whatever depends on the state of the run, its steps and its approvals: its status, a step's `From`, a parent that does not exist or is not one level above, an approval already recorded. So a call that is wrong in two ways gets the same error from every store: a lost lease with a bad argument is refused for the argument, and a lost lease with a step in the wrong status is `ErrLeaseLost` |
+| Every string | A database column holds neither a NUL character nor a byte that is not UTF-8, and a model, a tool or a person can put either in anything they write. **A string a store only records is kept, with each such character as the replacement character U+FFFD**: a run's input, output and error, a reason, a tool's result, a rule and a decision, the name of a tool the model called and of the model that answered, why it stopped, who decided or cancelled and why, and the strings inside `Metadata` and an `Action`, keys included. So no journal write fails, and no run is wedged, for what a model or a tool wrote. **A string a store compares is refused**, as an argument and with nothing changed, because it could only be kept as another name: an agent's name, a start key, a lease's owner, and an id, which has its own rule below. In a filter such a name is no run's, and lists or claims nothing. Inside what is kept as JSON, which is a message and a definition, a NUL is kept, since JSON has an escape for it, and only the byte that is not UTF-8 becomes the replacement character. **Raw JSON is kept as the bytes it came as, or refused**: a call's arguments, the provider's form of a turn, a tool's schema and the output schema must be JSON, in UTF-8. A call the model wrote badly is not lost by this: its arguments are held as one JSON string |
 | Every method that changes anything | Adds one to the run's `Rev`, stamps each step and approval it touched with the new `Rev`, and sets `UpdatedAt` to the request's time. One call adds one, however many steps and approvals it touches: they all carry the one new `Rev`. `Heartbeat` is the exception: it changes only the lease's expiry and leaves `Rev` and `UpdatedAt` alone. A call that changes nothing leaves them alone too: a call that is refused, a `Park` that reports false, a `RequestApproval` that returns an approval already recorded, a `RequestCancel` of a run already marked, an `ExpireApprovals` with nothing due |
 | Every method taking a `Lease` | Once the request itself has passed, locks the run, and returns `ErrLeaseLost` without changing anything unless the run's owner and epoch equal the lease's. The fence comes before every check that reads the store, and after the checks of the request alone. A lease with an empty `Owner` is never the run's, even when the run records no owner, so nothing writes to a run nobody holds. The hold is the epoch and not the time: under a lease that has lapsed and that no other claim has taken, a write goes through and `Heartbeat` extends the expiry. A run that does not exist is `ErrNotFound`, whatever the lease |
 | Every method that makes a waiting run runnable | These are `DecideApproval`, `ExpireApprovals`, `RequestCancel`, and `Finish` for the run's parent. Each sets `Status` runnable and clears `Reason`, since the run no longer waits. A run that is not waiting keeps its status and its lease |
-| Every method that is given something to keep | Refuses, with an error that is none of the package's sentinels and with nothing changed, what a database could not keep or would keep as something else. An id to be stored must be a UUID in the one form `uuid.NewString` writes, lower case with hyphens: a run's `ID` and `ParentID`, an approval's `ID`, a step's `ChildRunID`. Another spelling of a UUID, upper case or without hyphens, is refused, because a database would take it and hand back the canonical one, and the id would no longer be the one given. A `ParentID` must name a run that exists. The other refusals are in the rows below |
-| `CreateRun` | The run is stored as given, with `Rev` 1 whatever `Rev` it was given. `Status` must be `StatusRunnable`: any other is an error and stores nothing. `ID`, and `ParentID` when set, must be UUIDs in canonical form. These are judged from the request, so a create that would find its key is still refused for them. Then a create that finds its agent and key returns the run that has them, as it now stands, and stores nothing. Otherwise an id already in use is an error, and the run that has it is left alone, and a `ParentID` that names no run is an error. `Metadata` reads back as a JSON round trip gives it, so a byte that is not UTF-8 comes back as the replacement character, and as an empty map, not nil, when the run was given none |
-| `Claim` | 6.6. `Owner` must not be empty and `TTL` must be more than zero: otherwise an error. A claim leaves `NextAttemptAt` as it is, for the next `Yield` to set or clear. With `RunID`, the same conditions apply to that run alone, its agent being named in `Agents` among them, and `ErrNotClaimable` is returned when they do not hold. A claim by `RunID` locks the run and waits for a write in progress before it decides; only a claim without `RunID` passes over a run that is locked. A `RunID` that names no run is `ErrNotFound` |
+| Every method that is given something to keep | Refuses, with an error that is none of the package's sentinels and with nothing changed, what a database could not keep or would keep as something else, where that would change what the thing is or names. (A string that is only recorded is the exception, and is kept as the row above says.) An id to be stored must be a UUID in the one form `uuid.NewString` writes, lower case with hyphens: a run's `ID` and `ParentID`, an approval's `ID`, a step's `ChildRunID`. Another spelling of a UUID, upper case or without hyphens, is refused, because a database would take it and hand back the canonical one, and the id would no longer be the one given. A `ParentID` must name a run that exists, one level above. The other refusals are in the rows below |
+| `CreateRun` | The run is stored as given, with `Rev` 1 whatever `Rev` it was given. `Status` must be `StatusRunnable`: any other is an error and stores nothing. `ID`, and `ParentID` when set, must be UUIDs in canonical form; `Agent`, `Key` and `LeaseOwner` must be strings that can be kept; and each schema in `Definition` must be JSON. These are judged from the request, so a create that would find its key is still refused for them. Then a create that finds its agent and key returns the run that has them, as it now stands, and stores nothing. Otherwise an id already in use is an error, and the run that has it is left alone; then a `ParentID` that names no run is an error; and then a `Depth` that is not the parent's plus one, or not zero for a run with no parent, is an error. The depth is what the order of row locks is taken from (6.10), so a store does not take the caller's word for it. `Metadata` reads back as a JSON round trip gives it, so a byte that is not UTF-8 comes back as the replacement character, and as an empty map, not nil, when the run was given none |
+| `Claim` | 6.6. `Owner` must not be empty, must be a string that can be kept, and `TTL` must be more than zero: otherwise an error. Of runs created at the same instant the one whose id sorts first is taken first: a table keeps no order of arrival. A claim leaves `NextAttemptAt` as it is, for the next `Yield` to set or clear. With `RunID`, the same conditions apply to that run alone, its agent being named in `Agents` among them, and `ErrNotClaimable` is returned when they do not hold. A claim by `RunID` locks the run and waits for a write in progress before it decides; only a claim without `RunID` passes over a run that is locked. A `RunID` that names no run is `ErrNotFound` |
 | `Heartbeat` | Sets the lease's expiry to `now` plus `ttl` and reports the cancel mark. `ttl` must be more than zero: otherwise an error, and the lease is as it was |
 | `Yield` | Owner cleared, expiry cleared, `NextAttemptAt` set as given, which clears it when none is given. With `Failed`: `Failures` plus one, `Error` recorded. Without it, `Failures` and `Error` stay as they were. `Error` is therefore the last failure: it stays through later executions that go well, until `Finish` |
 | `Park` | 6.10. Sets `Status` waiting and `Reason`, clears the lease |
 | `Finish` | `Status` must be completed, failed or cancelled: any other is an error and changes nothing, and is judged before the run is looked for and before the lease. Sets `Status`, `Reason`, `Output`, `Error`, `FinishedAt`; clears the lease; sets every pending approval of the run `cancelled`; and when the run has a parent that is waiting, sets it runnable and adds one to its `Rev`. `Error` is set as given, so a run that ended well has none, whatever an earlier failure left. A cancelled approval gets that status, `DecidedAt` the request's time and the run's new `Rev`, and no `DecidedBy` or `Reason`, since nobody decided it |
 | `BeginModel` | `seq` must be one past the last step, or name a model step that is `started`; otherwise `ErrConflict`. Inserts the step as `started` with `Attempts` 1, or adds one to `Attempts` and resets `StartedAt` |
-| `CompleteModel` | The step must be a `started` model step; otherwise `ErrConflict`, which is also the answer when `seq` names no step. Sets it `completed` with the message, stop, model name, usage and `FinishedAt`. On the run: adds the usage, adds one to `ModelCalls`, adds finish less start to `ActiveMillis`, sets `Failures` to 0. Appends one tool step per `Message.Calls` entry at `Seq+1`, `Seq+2`, …: `proposed`, `Turn` the model step's `seq`, `Name` and `Call` from the call, `Key` from `StepKey` |
+| `CompleteModel` | Each call's `Input` and the message's `Opaque.Data` must be JSON, in UTF-8, or an error, judged before the lease. The step must be a `started` model step; otherwise `ErrConflict`, which is also the answer when `seq` names no step. Sets it `completed` with the message, stop, model name, usage and `FinishedAt`. On the run: adds the usage, adds one to `ModelCalls`, adds finish less start to `ActiveMillis`, sets `Failures` to 0. Appends one tool step per `Message.Calls` entry at `Seq+1`, `Seq+2`, …: `proposed`, `Turn` the model step's `seq`, `Name` and `Call` from the call, `Key` from `StepKey` |
 | `UpdateStep` | `To` must be one of the six step statuses, and `ChildRunID`, when set, a UUID: otherwise an error, and nothing changes. The step must be a tool step in `From`; otherwise `ErrConflict`, which is also the answer when `seq` names no step. Sets `Status` to `To` and records what the request carries: `Decision` and `Rule` only when `Decision` is not empty, `Result` and `IsError` only when `Result` is not nil, and `ChildRunID` only when it is not empty. A `Result` that points at an empty string is a result and is recorded. `To` of `started` adds one to `Attempts` and sets `StartedAt`. A final `To` sets `FinishedAt`, sets the run's `Failures` to 0, and when `From` is `started` adds finish less start to `ActiveMillis`. `Usage` is added to the step and the run. The store checks nothing else about the move; which moves are legal is the engine's business |
-| `RequestApproval` | `ID` must be a UUID, or an error. The step must be a tool step: a model step, or a `seq` that names no step, is `ErrConflict`. If an approval exists for the run, `Seq` and the step's current `Attempts`, it is returned and nothing changes. That lookup comes before the check of `From`, and looks at neither the approval's status nor the rest of the request, so a question asked again after its answer comes back answered. Otherwise the step must be in `From`, or `ErrConflict`; it becomes `waiting`, and an approval is inserted as pending with `Attempt` the step's `Attempts`, `Tool` its name and `Input` its call's arguments. The step's `Decision` and `Rule` are set only when the request's `Decision` is not empty, as in `UpdateStep`: the question about an interrupted call does not replace the guard's answer on the step. The approval's `Rule` is the request's either way. `Action.Attrs` reads back as a JSON round trip gives it: a number as a `float64`, an object as a `map[string]any`, a list as a `[]any`, a byte that is not UTF-8 as the replacement character, and an empty map, not nil, when there were none. An integer above 2^53 is therefore no longer exact when it is read back, as it would not be from a database; one that must be exact goes in a string. Attributes JSON cannot hold, a channel or a function, are an error, judged before the lease |
+| `RequestApproval` | `ID` must be a UUID and `Cause` one of the three causes, or an error. The step must be a tool step: a model step, or a `seq` that names no step, is `ErrConflict`. If an approval exists for the run, `Seq` and the step's current `Attempts`, it is returned and nothing changes. That lookup comes before the check of `From`, and looks at neither the approval's status nor the rest of the request, so a question asked again after its answer comes back answered. Otherwise the step must be in `From`, or `ErrConflict`; it becomes `waiting`, and an approval is inserted as pending with `Attempt` the step's `Attempts`, `Tool` its name and `Input` its call's arguments. The step's `Decision` and `Rule` are set only when the request's `Decision` is not empty, as in `UpdateStep`: the question about an interrupted call does not replace the guard's answer on the step. The approval's `Rule` is the request's either way. `Action.Attrs` reads back as a JSON round trip gives it: a number as a `float64`, an object as a `map[string]any`, a list as a `[]any`, a byte that is not UTF-8 as the replacement character, and an empty map, not nil, when there were none. An integer above 2^53 is therefore no longer exact when it is read back, as it would not be from a database; one that must be exact goes in a string. Attributes JSON cannot hold, a channel or a function, are an error, judged before the lease |
 | `DecideApproval` | Locks the run. A pending approval becomes approved or declined with who, why and when; a waiting run becomes runnable. Anything but pending, an expired or a cancelled approval included, is returned as it stands with `ErrAlreadyDecided` |
 | `ExpireApprovals` | The same as a decline, for every pending approval whose `ExpiresAt` is not after `now`, with status `expired`: `DecidedAt` is `now`, and `DecidedBy` and `Reason` stay empty, since nobody decided. Approvals of one run that lapse in one call change the run once and carry the one new `Rev`. With `DecideApproval` and `Finish` this keeps one rule: an approval's `DecidedAt` is nil exactly while it is pending |
 | `RequestCancel` | Locks the run. Sets the mark, who and why; a waiting run becomes runnable. A run already marked is left exactly as it is: the first request's who and why stand and `Rev` does not move. `ErrFinished` for a run that has ended |
 | `Changes` | The run as it stands, always. With it, the steps in `Seq` order and the approvals in the order `ListApprovals` gives, whatever order they changed in. A reader that passes each answer's `Run.Rev` as the next call's `since` misses no change, whatever is being written meanwhile. A step or approval may be newer than the run it is returned with; the next call then returns it again |
-| `ListRuns` | Newest first by `CreatedAt`, then `ID` descending. A `Limit` of zero or less is 50, and one over 200 is 200. A `ParentID` that names no run, or is not a UUID, lists nothing |
+| `ListRuns` | Newest first by `CreatedAt`, then `ID` descending. A `Limit` of zero or less is 50, and one over 200 is 200. A `ParentID` that names no run, or is not a UUID, lists nothing. `Before` is an argument, and may have come from a client: a cursor whose `ID` is not a UUID in canonical form is refused with an error, before the filters are looked at and with nothing asked of a database, one with a time and no id included. The zero `Cursor` is the one exception, and lists from the start. A cursor whose id no run has is a position like any other: the runs listed are those whose `(CreatedAt, ID)` sorts below it |
 | `ListApprovals` | Oldest first by `RequestedAt`, then `ID`. `Limit` as for `ListRuns`. A `RunID` that names no run, or is not a UUID, lists nothing |
 | Any method given an id that does not exist | `ErrNotFound`. An id that is not a UUID does not exist either: it is `ErrNotFound` like any other, and never the database's complaint about its form. Nor does another spelling of an id that does exist: a store knows a run or an approval by the one string it was given, so its id in upper case or without hyphens is `ErrNotFound`, though a database would find the row. A filter is not a lookup, and lists nothing, for an id nothing has, one that is not a UUID, and another spelling of one that exists. A `seq` is not an id: a step that does not exist is `ErrConflict`, as the rows above say |
 
@@ -3376,21 +3378,21 @@ How `agent/pg` writes and reads the columns, beyond what their types say:
   four-byte column is never bound: a `seq` that does not fit names no step,
   and a run with such a depth is refused.
 
-What each column does with a NUL character, which a model, a tool or a
-person can put in any string:
+What each column does with a string it cannot hold, which is one with a NUL
+character in it or a byte that is not UTF-8. The rule is the one in 6.2's
+table, "Every string"; this is where it lands:
 
-| Columns | Type | A NUL |
+| Columns | Type | What the store does |
 |---|---|---|
-| `agent_runs.definition`, `agent_steps.message`, `agent_steps.call`, `agent_approvals.input` | `json` | Kept, as the escape `\u0000`, and reads back as it was written |
-| `agent_runs.metadata`, `agent_approvals.action` | `jsonb` | Refused by Postgres, SQLSTATE `22P05` |
-| Every `TEXT` column. Those a model or a tool writes: `agent_runs.input`, `output` and `error`; `agent_steps.name` and `result`; `agent_approvals.tool`. Those a person or the service writes: `agent`, `reason`, `start_key`, `lease_owner`, `cancel_by`, `cancel_reason`, `stop`, `decision`, `rule`, `decided_by`, the approval's `reason`, and `agent_tool_effects.key` | `text` | Refused by Postgres, SQLSTATE `22021`, and so is a byte that is not UTF-8 |
+| `agent_runs.definition`, `agent_steps.message`, `agent_steps.call`, `agent_approvals.input` | `json` | A NUL is kept, as the escape `\u0000`, and reads back as it was written. A byte that is not UTF-8 in a string is written as U+FFFD by `encoding/json`; in a raw value it is refused |
+| `agent_runs.metadata`, `agent_approvals.action` | `jsonb` | Postgres would refuse a NUL. The store writes U+FFFD for it, in keys and in values at any depth; `encoding/json` has already done the same for a byte that is not UTF-8 |
+| The `TEXT` columns a store only records: `agent_runs.reason`, `input`, `output`, `error`, `cancel_by`, `cancel_reason`; `agent_steps.name`, `stop`, `decision`, `rule`, `result`; `agent_approvals.tool`, `rule`, `decided_by`, `reason` | `text` | Postgres would refuse either character. The store writes U+FFFD for each |
+| The `TEXT` columns a store compares: `agent_runs.agent`, `start_key`, `lease_owner`; `agent_tool_effects.key` | `text` | Refused in Go, before a transaction is opened |
 
-So the DDL as it stands lets a string wedge a run: a tool result that holds
-a NUL, or a byte that is not UTF-8, cannot be journaled, the call is made
-again, and the run ends as failed. `agent/pg` returns Postgres's error for
-these and writes nothing. Decision 48 left the rule to this store; the
-store's task raised it rather than choose, and the rule is not yet made.
-`agent/pg/nul_test.go` records each column's behaviour as it is.
+So no statement is ever sent that Postgres would refuse for a string, and a
+tool result or a model's last words cannot keep a step from being journaled.
+`agent/pg/nul_test.go` holds the store to this column by column, and the
+suite holds both stores to what reads back.
 
 ### 6.4 The journal and the conversation
 
@@ -3753,9 +3755,9 @@ returning <the run's columns>
 `$1` is the claim's time and `$3` that time plus the TTL, added in Go like
 every other time the store writes. `skip locked` means two processes
 claiming at once take different runs and neither waits. Runs created at one
-instant are taken in the order of their ids. The table has no column for the
-order runs arrived in, which is how `MemoryStore` breaks the same tie, and
-the suite pins neither.
+instant are taken in the order of their ids, by both stores: the table has
+no column for the order runs arrived in, so that is the one order both can
+keep.
 
 A claim that names its run (`ClaimRequest.RunID`, which `Execute` uses) is
 two statements in one transaction. The first locks the row, and so waits for
@@ -4004,9 +4006,16 @@ each hold a row the other wants. And an approval stamped with a `Rev`
 computed from a run that was not locked could carry a `Rev` the run has
 since been given by another write, and a reader that had seen that `Rev`
 would never be sent the lapse. The order relies on a child's `Depth` being
-its parent's plus one, which the engine sets and the store does not check;
-a store handed other depths can still deadlock, which Postgres detects and
-reports as an error, and nothing is corrupted by it.
+its parent's plus one, which `CreateRun` holds every run to.
+
+`Purge` takes rows in the same order. It locks every run it will remove, the
+roots that ended before the cut and all that is under them, deepest first,
+and only then deletes: the keys `Once` recorded under those runs' ids, and
+the roots, whose steps, approvals and child runs go with them. A delete that
+started at the root would hold the parent's row while its cascade waited for
+a child's, which is the reverse of a child's `Finish`. Should Postgres end a
+purge for a deadlock all the same, `Purge` tries once more before it returns
+the error.
 
 ### 6.11 Child runs and cancellation
 
@@ -5467,3 +5476,46 @@ them. These are written from the OpenAI provider's side.
     kept for the run that has ended cancelled (rejected: `EventRunCancelled`
     for both, which makes one type mean two things, and nothing at all, which
     leaves a subscriber no hint that a run is about to stop).
+
+**A store keeps every string it is handed or refuses it for what it is, and
+    the two stores agree where the suite used to be silent.** A text column
+    holds neither a NUL nor a byte that is not UTF-8, and a `jsonb` column no
+    NUL, so the DDL as first written let a tool's result, a model's final
+    answer or an error's text fail a journal write: the call was made again
+    until the run failed. A string a store only records is now kept with
+    U+FFFD in place of each such character, by both stores, and a string a
+    store compares (an agent's name, a start key, an owner, a `Once` key) is
+    refused before the store is touched (rejected: `bytea` or a JSON string
+    for the free-text columns, which keeps one character for a model at the
+    cost of every person who reads the table; refusing every such string,
+    which is the wedge with a better message; and replacing in a name too,
+    under which two keys could become one). Raw JSON is kept byte for byte
+    or refused: `agent/pg` writes the object around each raw value itself,
+    because `encoding/json` respaces and re-escapes one, and both stores
+    refuse a raw value that is not JSON or not UTF-8 (rejected: leaving it
+    to the column, which refuses it after the lease has been checked and
+    with the database's error).
+
+    The suite now pins what it left open, so that a test passing on one
+    store passes on the other. Runs created at one instant are claimed in
+    the order of their ids (rejected: the order they arrived in, which
+    `MemoryStore` had and a table does not keep). A list cursor is an
+    argument: one whose id is not a canonical UUID is refused, a time with
+    no id included, and the zero cursor lists from the start (rejected:
+    comparing the id as whatever string it is, which a `uuid` column cannot
+    do, so that a malformed cursor from a client reached the database). A
+    cause that is none of the three is refused (rejected: leaving it to the
+    table's CHECK, which fires after the lease). A run's `Depth` must be its
+    parent's plus one, or zero with no parent (rejected: taking the caller's
+    word, when the order rows are locked in is taken from it and a wrong
+    depth is a deadlock). A claim by id for another agent's run is
+    `ErrNotClaimable`, as it already was.
+
+    `Purge` locks what it will remove in the order every writer takes rows,
+    children first, removes the `Once` keys recorded under those runs' ids,
+    and is tried once more if Postgres ends it for a deadlock (rejected:
+    leaving the retry to the caller, who cannot tell a deadlock from any
+    other failure without knowing the driver; and a delete that starts at
+    the root, whose cascade takes a child's row after its parent's). A
+    `Once` key that is not a step's, one a tool made up, is not removed:
+    the table cannot tell whose it is.
