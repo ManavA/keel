@@ -2598,6 +2598,10 @@ func (f GuardFunc) Decide(ctx context.Context, a agent.Action) (agent.Decision, 
 // ErrKilled is what a FaultStore returns once it has been killed.
 var ErrKilled = errors.New("agenttest: store killed")
 
+// ErrFault is what a FaultStore returns for a call that FailBefore or
+// FailAfter chose. The store goes on working after it.
+var ErrFault = errors.New("agenttest: store fault")
+
 // FaultStore wraps a Store so a test can stop a process at a chosen store
 // call, the way a crash would.
 type FaultStore struct{ /* unexported fields */ }
@@ -2617,6 +2621,19 @@ func (f *FaultStore) KillBefore(n int)
 // later one: the write landed and the caller never learned of it.
 func (f *FaultStore) KillAfter(n int)
 
+// FailBefore makes the next times calls of op fail with ErrFault without
+// reaching the store, and leaves the store working: other methods, and op
+// itself once the count is spent, go through. op is the name of a Store
+// method, as "CompleteModel"; any other name panics, so that a misspelt one
+// is not a fault that silently never happens.
+func (f *FaultStore) FailBefore(op string, times int)
+
+// FailAfter lets the next times calls of op reach the store and then fails
+// each with ErrFault: the write landed, the caller was told it did not, and
+// the store goes on working. op is as for FailBefore, and a fault asked for
+// with FailBefore is spent first.
+func (f *FaultStore) FailAfter(op string, times int)
+
 // Calls reports how many calls have arrived.
 func (f *FaultStore) Calls() int
 
@@ -2630,6 +2647,13 @@ var (
 	_ agent.Store = (*FaultStore)(nil)
 )
 ```
+
+Which fault to ask for: `Kill`, `KillBefore` and `KillAfter` are a crash,
+after which that `FaultStore` never works again and another process carries
+on through the store it wraps, while `FailBefore` and `FailAfter` are a
+failure the process outlives, such as a store error the engine answers by
+giving the run back as failed, or a heartbeat that fails while the journal
+can still be written.
 
 What the engine's methods do beyond their comments:
 
@@ -2654,23 +2678,28 @@ from the request; a store never reads a clock.
 
 | Method | Effect |
 |---|---|
-| Every method that changes anything | Adds one to the run's `Rev`, stamps each step and approval it touched with the new `Rev`, and sets `UpdatedAt`. `Heartbeat` is the exception: it changes only the lease's expiry and leaves `Rev` alone |
-| Every method taking a `Lease` | Locks the run, and returns `ErrLeaseLost` without changing anything unless the run's owner and epoch equal the lease's |
-| `CreateRun` | The run is stored as given, with `Rev` 1. `Status` must be `StatusRunnable` |
-| `Claim` | 6.6. With `RunID`, the same conditions apply to that run alone, and `ErrNotClaimable` is returned when they do not hold |
-| `Yield` | Owner cleared, expiry cleared, `NextAttemptAt` set as given. With `Failed`: `Failures` plus one, `Error` recorded |
+| Every method that changes anything | Adds one to the run's `Rev`, stamps each step and approval it touched with the new `Rev`, and sets `UpdatedAt` to the request's time. One call adds one, however many steps and approvals it touches: they all carry the one new `Rev`. `Heartbeat` is the exception: it changes only the lease's expiry and leaves `Rev` and `UpdatedAt` alone. A call that changes nothing leaves them alone too: a call that is refused, a `Park` that reports false, a `RequestApproval` that returns an approval already recorded, an `ExpireApprovals` with nothing due |
+| Every method taking a `Lease` | Locks the run, and returns `ErrLeaseLost` without changing anything unless the run's owner and epoch equal the lease's. A lease with an empty `Owner` is never the run's, even when the run records no owner, so nothing writes to a run nobody holds. The hold is the epoch and not the time: under a lease that has lapsed and that no other claim has taken, a write goes through and `Heartbeat` extends the expiry. A run that does not exist is `ErrNotFound`, whatever the lease |
+| Every method that makes a waiting run runnable | These are `DecideApproval`, `ExpireApprovals`, `RequestCancel`, and `Finish` for the run's parent. Each sets `Status` runnable and clears `Reason`, since the run no longer waits. A run that is not waiting keeps its status and its lease |
+| `CreateRun` | The run is stored as given, with `Rev` 1 whatever `Rev` it was given. `Status` must be `StatusRunnable`: any other is an error and stores nothing. A create that finds its agent and key returns the run that has them, as it now stands, and stores nothing. Otherwise an id already in use is an error, and the run that has it is left alone |
+| `Claim` | 6.6. `Owner` must not be empty: a claim without one is an error. A claim leaves `NextAttemptAt` as it is, for the next `Yield` to set or clear. With `RunID`, the same conditions apply to that run alone, its agent being named in `Agents` among them, and `ErrNotClaimable` is returned when they do not hold. A `RunID` that names no run is `ErrNotFound` |
+| `Yield` | Owner cleared, expiry cleared, `NextAttemptAt` set as given, which clears it when none is given. With `Failed`: `Failures` plus one, `Error` recorded. Without it, `Failures` and `Error` stay as they were |
 | `Park` | 6.10. Sets `Status` waiting and `Reason`, clears the lease |
-| `Finish` | Sets `Status`, `Reason`, `Output`, `Error`, `FinishedAt`; clears the lease; sets every pending approval of the run `cancelled`; and when the run has a parent that is waiting, sets it runnable and adds one to its `Rev` |
+| `Finish` | `Status` must be completed, failed or cancelled: any other is an error and changes nothing. Sets `Status`, `Reason`, `Output`, `Error`, `FinishedAt`; clears the lease; sets every pending approval of the run `cancelled`; and when the run has a parent that is waiting, sets it runnable and adds one to its `Rev`. A cancelled approval gets that status and the run's new `Rev` and nothing else: nobody decided it, so it has no `DecidedAt`, `DecidedBy` or `Reason` |
 | `BeginModel` | `seq` must be one past the last step, or name a model step that is `started`; otherwise `ErrConflict`. Inserts the step as `started` with `Attempts` 1, or adds one to `Attempts` and resets `StartedAt` |
-| `CompleteModel` | The step must be a `started` model step. Sets it `completed` with the message, stop, model name, usage and `FinishedAt`. On the run: adds the usage, adds one to `ModelCalls`, adds finish less start to `ActiveMillis`, sets `Failures` to 0. Appends one tool step per `Message.Calls` entry at `Seq+1`, `Seq+2`, …: `proposed`, `Turn` the model step's `seq`, `Name` and `Call` from the call, `Key` from `StepKey` |
-| `UpdateStep` | The step must be a tool step in `From`; otherwise `ErrConflict`. Sets `Status` to `To` and records what the request carries. `To` of `started` adds one to `Attempts` and sets `StartedAt`. A final `To` sets `FinishedAt`, sets the run's `Failures` to 0, and when `From` is `started` adds finish less start to `ActiveMillis`. `Usage` is added to the step and the run. The store checks nothing else about the move; which moves are legal is the engine's business |
-| `RequestApproval` | If an approval exists for the run, `Seq` and the step's current `Attempts`, it is returned and nothing changes. Otherwise the step must be in `From`; it becomes `waiting` with the decision and rule, and an approval is inserted as pending with `Attempt` the step's `Attempts`, `Tool` its name and `Input` its call's arguments |
-| `DecideApproval` | Locks the run. A pending approval becomes approved or declined with who, why and when; a waiting run becomes runnable. Anything but pending is returned as it stands with `ErrAlreadyDecided` |
-| `ExpireApprovals` | The same as a decline, for every pending approval whose `ExpiresAt` is not after `now`, with status `expired` |
+| `CompleteModel` | The step must be a `started` model step; otherwise `ErrConflict`, which is also the answer when `seq` names no step. Sets it `completed` with the message, stop, model name, usage and `FinishedAt`. On the run: adds the usage, adds one to `ModelCalls`, adds finish less start to `ActiveMillis`, sets `Failures` to 0. Appends one tool step per `Message.Calls` entry at `Seq+1`, `Seq+2`, …: `proposed`, `Turn` the model step's `seq`, `Name` and `Call` from the call, `Key` from `StepKey` |
+| `UpdateStep` | The step must be a tool step in `From`; otherwise `ErrConflict`, which is also the answer when `seq` names no step. Sets `Status` to `To` and records what the request carries: `Decision` and `Rule` only when `Decision` is not empty, `Result` and `IsError` only when `Result` is not nil, and `ChildRunID` only when it is not empty. A `Result` that points at an empty string is a result and is recorded. `To` of `started` adds one to `Attempts` and sets `StartedAt`. A final `To` sets `FinishedAt`, sets the run's `Failures` to 0, and when `From` is `started` adds finish less start to `ActiveMillis`. `Usage` is added to the step and the run. The store checks nothing else about the move; which moves are legal is the engine's business |
+| `RequestApproval` | The step must be a tool step: a model step, or a `seq` that names no step, is `ErrConflict`. If an approval exists for the run, `Seq` and the step's current `Attempts`, it is returned and nothing changes. That lookup comes before the check of `From`, and looks at neither the approval's status nor the rest of the request, so a question asked again after its answer comes back answered. Otherwise the step must be in `From`, or `ErrConflict`; it becomes `waiting` with the decision and rule, and an approval is inserted as pending with `Attempt` the step's `Attempts`, `Tool` its name and `Input` its call's arguments |
+| `DecideApproval` | Locks the run. A pending approval becomes approved or declined with who, why and when; a waiting run becomes runnable. Anything but pending, an expired or a cancelled approval included, is returned as it stands with `ErrAlreadyDecided` |
+| `ExpireApprovals` | The same as a decline, for every pending approval whose `ExpiresAt` is not after `now`, with status `expired`: `DecidedAt` is `now`, and `DecidedBy` and `Reason` stay empty, since nobody decided. Approvals of one run that lapse in one call change the run once and carry the one new `Rev` |
 | `RequestCancel` | Locks the run. Sets the mark, who and why; a waiting run becomes runnable. `ErrFinished` for a run that has ended |
-| `ListRuns` | Newest first by `CreatedAt`, then `ID` descending |
-| `ListApprovals` | Oldest first by `RequestedAt`, then `ID` |
-| Any method given an id that does not exist | `ErrNotFound` |
+| `Changes` | The run as it stands, always. With it, the steps in `Seq` order and the approvals in the order `ListApprovals` gives, whatever order they changed in |
+| `ListRuns` | Newest first by `CreatedAt`, then `ID` descending. A `Limit` of zero or less is 50, and one over 200 is 200 |
+| `ListApprovals` | Oldest first by `RequestedAt`, then `ID`. `Limit` as for `ListRuns` |
+| Any method given an id that does not exist | `ErrNotFound`. An id that is not a UUID does not exist either: it is `ErrNotFound` like any other, and never the database's complaint about its form. A `seq` is not an id: a step that does not exist is `ErrConflict`, as the rows above say |
+
+`agenttest.RunStoreSuite` has a case for each of these, and both stores
+pass it.
 
 ### 6.3 Tables
 
@@ -3101,12 +3130,15 @@ select lease_owner, lease_epoch from agent_runs where id = $1 for update
 ```
 
 If they differ, the transaction ends with `ErrLeaseLost` and changes
-nothing. A claim is an update of the same row, so it waits for a write in
-progress and the next holder always reads a journal that includes it. A
-process that was paused past its lease, or partitioned from the database
-and back, therefore cannot add to a journal another process now owns. What
-it can still do is finish the tool call it was in the middle of. That is
-the one way a tool can run twice at the same moment, and 6.7 covers it.
+nothing. It ends the same way when the lease names no owner, whatever the
+row holds: a run nobody holds records an empty owner, and a lease with none
+must not match it. A claim is an update of the same row, so it waits for a
+write in progress and the next holder always reads a journal that includes
+it. A process that was paused past its lease, or partitioned from the
+database and back, therefore cannot add to a journal another process now
+owns. What it can still do is finish the tool call it was in the middle of.
+That is the one way a tool can run twice at the same moment, and 6.7 covers
+it.
 
 **Clock.** Lease times are written and compared on the engine's `Clock`,
 not the database's. Processes sharing runs must keep their clocks within a
@@ -4078,3 +4110,34 @@ chose them.
     bound. Rejected: checking the assembled event, which allocates first
     and checks after. The error is not exported, since no caller has a
     decision to make about it.
+
+The memory store task wrote the `Store` contract suite, and so met the
+places where the table in 6.2 did not say what a store does. The project
+lead confirmed its choices, and the table now states each of them.
+
+40. **The `Store` contract is the table in 6.2 as the suite holds a store to
+    it, and `FaultStore` can also fail one named method.** Fifteen
+    behaviours were chosen where the table was silent and are now written
+    into it; `agent/pg` passes the same suite, so they bind both stores.
+    The ones that had an alternative: a lease with no owner never holds a
+    run, and a claim needs an owner (rejected: comparing owner and epoch
+    and nothing else, under which a lease with no owner matches a run
+    nobody holds and may write to it); an id that is not a UUID is
+    `ErrNotFound`, and so is `Claim` for a `RunID` that names no run
+    (rejected: the driver's error for a malformed id, which the HTTP
+    surface would serve as a 500, and `ErrNotClaimable` for a run that is
+    not there); a waiting run made runnable loses its `Reason` (rejected:
+    leaving it, so that a runnable run says it waits on an approval); one
+    call adds one to a run's `Rev` however many approvals it touches
+    (rejected: one per approval, which makes the number of revisions
+    depend on how a store batches its writes); an approval that lapsed
+    records when and no one, and one cancelled by its run ending records
+    neither (rejected: a decision time on an approval nobody decided); a
+    step that does not exist is `ErrConflict` (rejected: `ErrNotFound`,
+    which is for ids, and a `seq` is a position); `Changes` returns steps
+    in journal order (rejected: by `Rev`, which the stream wants and sorts
+    for itself, while the timeline wants the journal). On the test kit:
+    `FailBefore` and `FailAfter` fail a named method a given number of
+    times and leave the store working (rejected: kills alone, which
+    cannot make a store failure the process outlives, the case that ends
+    an execution as failed and has it tried again).
