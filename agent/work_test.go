@@ -107,7 +107,8 @@ func TestTick_ClaimsNoMoreThanConcurrency(t *testing.T) {
 
 		require.NoError(t, err)
 		assert.Equal(t, agent.Report{Claimed: 2, Completed: 2}, report)
-		assert.Equal(t, 2, store.claims, "a pass asks for a run no more often than it has slots")
+		claims, _, _ := store.count()
+		assert.Equal(t, 2, claims, "a pass asks for a run no more often than it has slots")
 		for i, run := range runs {
 			got := f.run(run.ID)
 			if i < 2 {
@@ -295,7 +296,8 @@ func TestTick_AStoreThatFails(t *testing.T) {
 			assert.Equal(t, agent.Report{Claimed: 1, Completed: 1}, report)
 			assert.Equal(t, agent.StatusCompleted, f.run(runs[0].ID).Status)
 			assert.Zero(t, f.run(runs[1].ID).LeaseEpoch)
-			assert.Equal(t, 2, store.claims, "a pass stops asking once the store has failed")
+			claims, _, _ := store.count()
+			assert.Equal(t, 2, claims, "a pass stops asking once the store has failed")
 		})
 	})
 }

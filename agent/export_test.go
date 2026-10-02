@@ -18,3 +18,6 @@ var ErrDrained = errDrained
 
 // LastWriteTimeout is lastWriteTimeout.
 const LastWriteTimeout = lastWriteTimeout
+
+// ErrTimeBudget is errTimeBudget.
+var ErrTimeBudget = errTimeBudget
