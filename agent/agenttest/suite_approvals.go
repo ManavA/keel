@@ -58,17 +58,86 @@ func requestApprovalCases() []storeCase {
 		{"records a question that has no attributes and never lapses", func(k *kit) {
 			run, lease := k.proposed(agentAlpha)
 			req := k.askRequest(2)
+			require.Nil(k.t, req.Action.Attrs)
 
 			got, err := k.store.RequestApproval(k.ctx, lease, req)
 
 			require.NoError(k.t, err)
+			// No attributes read back as none, and never as nil.
 			want := agent.Approval{
 				ID: req.ID, RunID: run.ID, Seq: 2, Cause: agent.CauseGuard,
-				Tool: toolSend, Input: raw(sendInput), Action: req.Action, Rule: suiteRule,
+				Tool: toolSend, Input: raw(sendInput), Rule: suiteRule,
+				Action: agent.Action{Kind: "run", Target: toolSend, Attrs: map[string]any{}},
 				Status: agent.ApprovalPending, Rev: run.Rev + 1, RequestedAt: req.Now,
 			}
 			k.equalApproval(want, got)
 			k.equalApproval(want, k.approval(req.ID))
+		}},
+		{"reads an action's attributes back as JSON gives them", func(k *kit) {
+			_, lease := k.proposed(agentAlpha)
+			req := k.askRequest(2)
+			req.Action.Attrs = map[string]any{
+				agent.AttrAgent: agentAlpha,
+				agent.AttrSeq:   2,
+				"ratio":         1.5,
+				"urgent":        true,
+				"nothing":       nil,
+				"nested":        map[string]any{"to": "a", "n": 2},
+				"list":          []any{"x", 1, false},
+				"names":         []string{"a", "b"},
+			}
+			// A number is a float64, an object a map[string]any and a list
+			// a []any, whatever Go type they were given as.
+			want := map[string]any{
+				agent.AttrAgent: agentAlpha,
+				agent.AttrSeq:   float64(2),
+				"ratio":         1.5,
+				"urgent":        true,
+				"nothing":       nil,
+				"nested":        map[string]any{"to": "a", "n": float64(2)},
+				"list":          []any{"x", float64(1), false},
+				"names":         []any{"a", "b"},
+			}
+
+			got, err := k.store.RequestApproval(k.ctx, lease, req)
+
+			require.NoError(k.t, err)
+			assert.Equal(k.t, want, got.Action.Attrs, "as returned")
+			assert.Equal(k.t, want, k.approval(req.ID).Action.Attrs, "as read")
+			listed := k.approvals(lease.RunID)
+			require.Len(k.t, listed, 1)
+			assert.Equal(k.t, want, listed[0].Action.Attrs, "as listed")
+		}},
+		{"a question that carries no decision leaves the step's decision and rule", func(k *kit) {
+			run, lease := k.proposed(agentAlpha)
+			require.NoError(k.t, k.store.UpdateStep(k.ctx, lease, agent.StepUpdate{
+				Seq: 2, From: agent.StepProposed, To: agent.StepStarted, Decision: agent.Allow, Rule: suiteRule, Now: k.tick(),
+			}))
+			// The call was interrupted. The question about running it again
+			// is not the guard's answer, and must not replace it.
+			req := k.askRequest(2)
+			req.From, req.Cause, req.Decision, req.Rule = agent.StepStarted, agent.CauseInterrupted, "", agent.RuleInterrupted
+
+			got, err := k.store.RequestApproval(k.ctx, lease, req)
+
+			require.NoError(k.t, err)
+			assert.Equal(k.t, agent.RuleInterrupted, got.Rule, "the approval carries the rule it was asked under")
+			step := k.step(run.ID, 2)
+			assert.Equal(k.t, agent.StepWaiting, step.Status)
+			assert.Equal(k.t, agent.Allow, step.Decision)
+			assert.Equal(k.t, suiteRule, step.Rule)
+		}},
+		{"an approval id that is not a UUID is refused", func(k *kit) {
+			run, lease := k.proposed(agentAlpha)
+			before := k.snapshot(run.ID)
+			req := k.askRequest(2)
+			req.ID = malformedID
+
+			_, err := k.store.RequestApproval(k.ctx, lease, req)
+
+			require.Error(k.t, err)
+			assert.NotErrorIs(k.t, err, agent.ErrConflict)
+			k.unchanged(before)
 		}},
 		{"asked again for the same step and attempt, returns the approval already recorded", func(k *kit) {
 			run, lease := k.proposed(agentAlpha)
@@ -768,6 +837,8 @@ func listApprovalsCases() []storeCase {
 				{"a run and a status it has", agent.ApprovalFilter{RunID: pendingRun.ID, Status: agent.ApprovalPending}, []string{pending.ID}},
 				{"a run and a status it has not", agent.ApprovalFilter{RunID: pendingRun.ID, Status: agent.ApprovalApproved}, []string{}},
 				{"a run with no approvals", agent.ApprovalFilter{RunID: empty.ID}, []string{}},
+				{"a run id nothing has", agent.ApprovalFilter{RunID: uuid.NewString()}, []string{}},
+				{"a run id that is not a UUID", agent.ApprovalFilter{RunID: malformedID}, []string{}},
 			}
 			for _, tt := range tests {
 				assert.Equal(k.t, tt.want, list(k, tt.filter), tt.name)

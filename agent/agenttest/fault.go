@@ -52,7 +52,9 @@ var storeOps = []string{
 // wraps. It is safe for concurrent use.
 //
 // A call that fails returns no part of the store's answer, whether or not it
-// reached the store.
+// reached the store. That holds for a call the store itself refused: a fault
+// after the store hides the store's own error too, as a connection lost
+// before the reply would.
 type FaultStore struct {
 	inner agent.Store
 
@@ -100,8 +102,9 @@ func (f *FaultStore) KillBefore(n int) {
 }
 
 // KillAfter lets the nth call reach the store, then fails it and every
-// later one: the write landed and the caller never learned of it. n counts
-// as it does for KillBefore.
+// later one: the write landed and the caller never learned of it. If the
+// store refused the nth call, the caller does not learn that either. n
+// counts as it does for KillBefore.
 func (f *FaultStore) KillAfter(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -122,9 +125,10 @@ func (f *FaultStore) FailBefore(op string, times int) {
 }
 
 // FailAfter lets the next times calls of op reach the store and then fails
-// each with ErrFault: the write landed, the caller was told it did not, and
-// the store goes on working. op is as for FailBefore, and a fault asked for
-// with FailBefore is spent first.
+// each with ErrFault, whatever the store answered: a write that landed is
+// reported as failed, and so is a call the store refused. The store goes on
+// working. op is as for FailBefore, and a fault asked for with FailBefore is
+// spent first.
 func (f *FaultStore) FailAfter(op string, times int) {
 	f.addFaults(f.failAfter, op, times)
 }
@@ -142,6 +146,9 @@ func (f *FaultStore) addFaults(faults map[string]int, op string, times int) {
 }
 
 // Calls reports how many calls have arrived, those that failed included.
+// Every Store method counts, reads and heartbeats as much as writes, so a
+// count taken from one run is the count of another only when both make the
+// same calls: keep a real heartbeat timer out of a run that is counted.
 func (f *FaultStore) Calls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

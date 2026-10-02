@@ -244,13 +244,15 @@ func completeModelCases() []storeCase {
 			assert.Equal(k.t, 2, k.step(run.ID, 1).Attempts)
 			assert.Equal(k.t, 1, k.run(run.ID).ModelCalls, "a call lost to an interruption is on no record")
 		}},
-		{"resets Failures", func(k *kit) {
+		{"resets Failures, and leaves the Error of the last failure", func(k *kit) {
 			run, lease := k.held(agentAlpha)
 			lease = k.failOnce(lease)
 
 			k.reply(lease)
 
-			assert.Zero(k.t, k.run(run.ID).Failures)
+			after := k.run(run.ID)
+			assert.Zero(k.t, after.Failures)
+			assert.Equal(k.t, "boom", after.Error, "Error is the last failure, until Finish says how the run ended")
 		}},
 		{"keeps the message as it was given, its provider's form included", func(k *kit) {
 			run, lease := k.held(agentAlpha)
@@ -584,6 +586,32 @@ func updateStepCases() []storeCase {
 				require.ErrorIs(k.t, err, agent.ErrConflict, tt.name)
 				k.unchanged(before)
 			}
+		}},
+		{"a To that is no step status is refused", func(k *kit) {
+			run, lease := k.proposed(agentAlpha)
+			before := k.snapshot(run.ID)
+
+			for _, to := range []agent.StepStatus{"", "done", "Completed"} {
+				err := k.store.UpdateStep(k.ctx, lease, agent.StepUpdate{
+					Seq: 2, From: agent.StepProposed, To: to, Result: result("never recorded"), Now: k.tick(),
+				})
+
+				require.Error(k.t, err, "to %q", to)
+				assert.NotErrorIs(k.t, err, agent.ErrConflict, "the step was in From; it is the request that is refused")
+				k.unchanged(before)
+			}
+		}},
+		{"a child run id that is not a UUID is refused", func(k *kit) {
+			run, lease := k.proposed(agentAlpha)
+			k.update(lease, 2, agent.StepProposed, agent.StepStarted)
+			before := k.snapshot(run.ID)
+
+			err := k.store.UpdateStep(k.ctx, lease, agent.StepUpdate{
+				Seq: 2, From: agent.StepStarted, To: agent.StepWaiting, ChildRunID: malformedID, Now: k.tick(),
+			})
+
+			require.Error(k.t, err)
+			k.unchanged(before)
 		}},
 		{"a move made twice is refused the second time", func(k *kit) {
 			run, lease := k.proposed(agentAlpha)

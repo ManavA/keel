@@ -429,7 +429,7 @@ func TestFaultStore_KillAfterLeavesTheWriteInTheStore(t *testing.T) {
 	faulty := agenttest.NewFaultStore(inner)
 	faulty.KillAfter(1)
 	ctx := t.Context()
-	run := agent.Run{ID: "run-1", Agent: "alpha", Status: agent.StatusRunnable, CreatedAt: kitStart, UpdatedAt: kitStart}
+	run := agent.Run{ID: faultRunID, Agent: "alpha", Status: agent.StatusRunnable, CreatedAt: kitStart, UpdatedAt: kitStart}
 
 	_, created, err := faulty.CreateRun(ctx, run)
 	require.ErrorIs(t, err, agenttest.ErrKilled)
@@ -448,7 +448,7 @@ func TestFaultStore_KillBeforeLeavesTheStoreAsItWas(t *testing.T) {
 	faulty := agenttest.NewFaultStore(inner)
 	faulty.KillBefore(1)
 	ctx := t.Context()
-	run := agent.Run{ID: "run-1", Agent: "alpha", Status: agent.StatusRunnable, CreatedAt: kitStart, UpdatedAt: kitStart}
+	run := agent.Run{ID: faultRunID, Agent: "alpha", Status: agent.StatusRunnable, CreatedAt: kitStart, UpdatedAt: kitStart}
 
 	_, _, err := faulty.CreateRun(ctx, run)
 	require.ErrorIs(t, err, agenttest.ErrKilled)
@@ -633,6 +633,10 @@ func TestFaultStore_IsSafeForConcurrentUse(t *testing.T) {
 	assert.Len(t, inner.seen(), killAt, "calls up to and including the nth reached the store")
 	assert.Equal(t, goroutines*calls-killAt+1, killed, "the nth call and every later one failed")
 }
+
+// faultRunID is the run the tests over a real store write: a store keeps a
+// run only under a UUID.
+const faultRunID = "0b0e7b1c-3a57-4c8e-9d2f-5f1a6c9e4d10"
 
 // A FaultStore that is not armed is the store it wraps: it passes the whole
 // Store contract.

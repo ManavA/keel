@@ -250,6 +250,24 @@ func claimCases() []storeCase {
 			assert.Nil(k.t, got)
 			k.unchanged(before)
 		}},
+		{"a claim with a TTL of zero or less is refused", func(k *kit) {
+			run := k.create(agentAlpha)
+			before := k.snapshot(run.ID)
+
+			for _, ttl := range []time.Duration{0, -time.Second} {
+				got, err := k.store.Claim(k.ctx, agent.ClaimRequest{Owner: workerA, Agents: suiteAgents, Now: k.tick(), TTL: ttl})
+				require.Error(k.t, err, "ttl %s", ttl)
+				assert.Nil(k.t, got)
+
+				got, err = k.store.Claim(k.ctx, agent.ClaimRequest{
+					Owner: workerA, Agents: suiteAgents, RunID: run.ID, Now: k.tick(), TTL: ttl,
+				})
+				require.Error(k.t, err, "ttl %s, by id", ttl)
+				assert.NotErrorIs(k.t, err, agent.ErrNotClaimable, "the claim is refused, not the run")
+				assert.Nil(k.t, got)
+			}
+			k.unchanged(before)
+		}},
 		{"eight claims at once for one run: one takes it", func(k *kit) {
 			run := k.create(agentAlpha)
 			now := k.tick()
@@ -405,6 +423,20 @@ func heartbeatCases() []storeCase {
 
 			require.NoError(k.t, err)
 			assert.True(k.t, cancelRequested)
+		}},
+		{"a TTL of zero or less is refused, and the lease is as it was", func(k *kit) {
+			run, lease := k.held(agentAlpha)
+			before := k.snapshot(run.ID)
+
+			for _, ttl := range []time.Duration{0, -time.Second} {
+				_, err := k.store.Heartbeat(k.ctx, lease, k.tick(), ttl)
+				require.Error(k.t, err, "ttl %s", ttl)
+				assert.NotErrorIs(k.t, err, agent.ErrLeaseLost, "the heartbeat is refused, not the lease")
+			}
+			k.unchanged(before)
+
+			_, err := k.store.Heartbeat(k.ctx, lease, k.tick(), suiteTTL)
+			assert.NoError(k.t, err)
 		}},
 		{"extends a lapsed lease that nobody has taken: the hold is the epoch, not the time", func(k *kit) {
 			run, lease := k.held(agentAlpha)
@@ -628,6 +660,12 @@ func fencingCases() []storeCase {
 			assert.Len(k.t, k.steps(run.ID), 1, "a hold is lost to another claim, not to the clock")
 		}},
 		storeCase{"a write racing a takeover lands before the claim or not at all", func(k *kit) {
+			// The claim names the run, and a claim by id waits for a write
+			// in progress and then decides: it must take the run in every
+			// round, whichever of the two reaches the run first. A claim
+			// that passed over a run being written to, as a claim without
+			// RunID may, would fail here with ErrNotClaimable, and leave a
+			// lapsed run unclaimed because its last holder was still writing.
 			const rounds = 50
 			for range rounds {
 				run, held := k.held(agentAlpha)

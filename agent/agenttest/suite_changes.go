@@ -137,6 +137,9 @@ func changesCases() []storeCase {
 		{"every change adds one to Rev, and reading the changes since rebuilds the run", func(k *kit) {
 			followRevisions(k)
 		}},
+		{"a reader following a run while it is written to misses nothing", func(k *kit) {
+			followWhileWritten(k)
+		}},
 	}
 }
 
@@ -334,6 +337,9 @@ func followRevisions(k *kit) {
 		{"RequestCancel", true, func(now time.Time) error {
 			return k.store.RequestCancel(k.ctx, agent.CancelRequest{RunID: runID, By: personA, Reason: "wrong batch", Now: now})
 		}},
+		{"RequestCancel again", false, func(now time.Time) error {
+			return k.store.RequestCancel(k.ctx, agent.CancelRequest{RunID: runID, By: personB, Reason: "asked twice", Now: now})
+		}},
 		{"Park once cancellation is requested", false, func(now time.Time) error {
 			parked, err := k.store.Park(k.ctx, lease, agent.ParkRequest{Reason: agent.ReasonApproval, Now: now})
 			if err == nil && parked {
@@ -396,10 +402,94 @@ func followRevisions(k *kit) {
 		for _, a := range asked {
 			assert.Equal(k.t, normalApproval(a), normalApproval(approvals[a.ID]), "%s: approval %s", op.name, a.ID)
 			assert.LessOrEqual(k.t, a.Rev, seen, "%s: no approval is ahead of its run", op.name)
+			assert.Equal(k.t, a.Status == agent.ApprovalPending, a.DecidedAt == nil,
+				"%s: an approval has no DecidedAt exactly while it is pending (it is %s)", op.name, a.Status)
 		}
 	}
 
 	ended := k.run(runID)
 	assert.Equal(k.t, agent.StatusCancelled, ended.Status)
 	assert.Equal(k.t, []int{1, 2, 3, 4, 5, 6}, stepSeqs(k.steps(runID)))
+}
+
+// followWhileWritten has one goroutine journal a run under its lease while
+// the test reads the changes since the last revision it saw, as the event
+// stream does from another process. Once the writer stops, what the reader
+// has pieced together must be the journal: a change the reader's revision
+// moved past without having read it would be lost for good. A step may be
+// delivered more than once, and newer each time, never older.
+//
+// It does not assert that a step is never ahead of the run it came with: a
+// store that reads the run and then its steps may return a step written in
+// between, which the next read delivers again and nothing loses.
+func followWhileWritten(k *kit) {
+	const turns = 30
+	run, lease := k.held(agentAlpha)
+
+	written := make(chan error, 1)
+	go func() {
+		written <- func() error {
+			for turn := range turns {
+				seq := turn*3 + 1
+				if err := k.store.BeginModel(k.ctx, lease, seq, k.tick()); err != nil {
+					return err
+				}
+				if err := k.store.CompleteModel(k.ctx, lease, agent.CompleteModelRequest{
+					Seq:     seq,
+					Message: Use(Call("call-1", toolLookup, lookupInput), Call("call-2", toolSend, sendInput)).Message,
+					Stop:    agent.StopToolUse,
+					Model:   suiteModel,
+					Now:     k.tick(),
+				}); err != nil {
+					return err
+				}
+				for _, call := range []int{seq + 1, seq + 2} {
+					for _, move := range [][2]agent.StepStatus{
+						{agent.StepProposed, agent.StepStarted},
+						{agent.StepStarted, agent.StepCompleted},
+					} {
+						if err := k.store.UpdateStep(k.ctx, lease, agent.StepUpdate{
+							Seq: call, From: move[0], To: move[1], Now: k.tick(),
+						}); err != nil {
+							return err
+						}
+					}
+				}
+			}
+			return nil
+		}()
+	}()
+
+	var since int64
+	have := map[int]agent.Step{}
+	read := func() {
+		got, err := k.store.Changes(k.ctx, run.ID, since)
+		require.NoError(k.t, err)
+		for _, s := range got.Steps {
+			if earlier, ok := have[s.Seq]; ok {
+				assert.GreaterOrEqual(k.t, s.Rev, earlier.Rev, "step %d was delivered again as it was before", s.Seq)
+			}
+			have[s.Seq] = s
+		}
+		assert.GreaterOrEqual(k.t, got.Run.Rev, since, "a run's revision never goes back")
+		since = got.Run.Rev
+	}
+	for writing := true; writing; {
+		select {
+		case err := <-written:
+			require.NoError(k.t, err)
+			writing = false
+		default:
+			read()
+		}
+	}
+	read()
+
+	journal := k.steps(run.ID)
+	require.Len(k.t, journal, turns*3)
+	require.Len(k.t, have, len(journal))
+	for _, s := range journal {
+		assert.Equal(k.t, normalStep(s), normalStep(have[s.Seq]), "step %d", s.Seq)
+	}
+	assert.Equal(k.t, k.run(run.ID).Rev, since)
 }

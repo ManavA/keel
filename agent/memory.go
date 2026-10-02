@@ -10,6 +10,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // The bounds on a listing's length, for RunFilter.Limit and
@@ -28,8 +30,11 @@ const (
 // into it. Two Engines over one MemoryStore therefore behave as two
 // processes over one database, which is how takeover is tested without one.
 //
-// Like every Store it never reads a clock. Ids are the caller's too, and are
-// not checked for form.
+// Like every Store it never reads a clock. What it refuses and how values
+// read back are as agent/pg has them, so that a test passing on one passes
+// on the other: an id must be a UUID in its canonical form, a child's parent
+// must exist, and metadata and an action's attributes come back as a JSON
+// round trip gives them.
 type MemoryStore struct {
 	mu   sync.Mutex
 	runs map[string]*memoryRun
@@ -70,8 +75,8 @@ var _ Store = (*MemoryStore)(nil)
 
 // CreateRun implements Store.
 func (s *MemoryStore) CreateRun(_ context.Context, run Run) (Run, bool, error) {
-	if run.ID == "" {
-		return Run{}, false, errors.New("agent: create run: id is empty")
+	if !isUUID(run.ID) {
+		return Run{}, false, fmt.Errorf("agent: create run: id %q is not a UUID", run.ID)
 	}
 	if run.Status != StatusRunnable {
 		return Run{}, false, fmt.Errorf("agent: create run: status is %q, not %q", run.Status, StatusRunnable)
@@ -90,17 +95,38 @@ func (s *MemoryStore) CreateRun(_ context.Context, run Run) (Run, bool, error) {
 		return Run{}, false, fmt.Errorf("agent: create run: id %q is already in use", run.ID)
 	}
 
+	var parent *memoryRun
+	if run.ParentID != "" {
+		named, ok := s.runs[run.ParentID]
+		if !ok {
+			// An id that is not a UUID names no run either.
+			return Run{}, false, fmt.Errorf("agent: create run: parent %q does not exist", run.ParentID)
+		}
+		parent = named
+	}
+
 	r := &memoryRun{run: cloneRun(run)}
 	r.run.Rev = 1
+	if r.run.Metadata == nil {
+		r.run.Metadata = map[string]string{}
+	}
 	s.runs[run.ID] = r
 	s.order = append(s.order, r)
 	if run.Key != "" {
 		s.keys[key] = r
 	}
-	if parent, ok := s.runs[run.ParentID]; ok {
+	if parent != nil {
 		parent.children = append(parent.children, r)
 	}
 	return cloneRun(r.run), true, nil
+}
+
+// isUUID reports whether id is a UUID as uuid.NewString writes one. Other
+// spellings of the same UUID are refused: a database would take them and
+// hand back this one, and the id would no longer be the one given.
+func isUUID(id string) bool {
+	parsed, err := uuid.Parse(id)
+	return err == nil && parsed.String() == id
 }
 
 // GetRun implements Store.
@@ -163,12 +189,16 @@ func listLimit(limit int) int {
 }
 
 // Claim implements Store. The conditions and the update are those of the
-// claim statement in agent/pg.
+// claim statement in agent/pg. Behind the one mutex every claim waits for a
+// write in progress, which is what the contract asks of a claim by RunID.
 func (s *MemoryStore) Claim(_ context.Context, req ClaimRequest) (*Run, error) {
 	// A hold with no owner is no hold: the run would read as released, and
 	// every write under it would be refused.
 	if req.Owner == "" {
 		return nil, errors.New("agent: claim: owner is empty")
+	}
+	if req.TTL <= 0 {
+		return nil, fmt.Errorf("agent: claim: ttl is %s, not more than zero", req.TTL)
 	}
 
 	s.mu.Lock()
@@ -256,6 +286,10 @@ func wake(r *memoryRun) {
 
 // Heartbeat implements Store.
 func (s *MemoryStore) Heartbeat(_ context.Context, lease Lease, now time.Time, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		return false, fmt.Errorf("agent: heartbeat: ttl is %s, not more than zero", ttl)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -339,7 +373,9 @@ func (s *MemoryStore) Finish(_ context.Context, lease Lease, req FinishRequest) 
 	rev := touch(r, req.Now)
 	for _, a := range r.approvals {
 		if a.approval.Status == ApprovalPending {
+			cancelled := req.Now
 			a.approval.Status = ApprovalCancelled
+			a.approval.DecidedAt = &cancelled
 			a.approval.Rev = rev
 		}
 	}
@@ -473,6 +509,13 @@ func activeMillis(start *time.Time, end time.Time) int64 {
 
 // UpdateStep implements Store.
 func (s *MemoryStore) UpdateStep(_ context.Context, lease Lease, req StepUpdate) error {
+	if !isStepStatus(req.To) {
+		return fmt.Errorf("agent: update step: %q is not a step status", req.To)
+	}
+	if req.ChildRunID != "" && !isUUID(req.ChildRunID) {
+		return fmt.Errorf("agent: update step: child run id %q is not a UUID", req.ChildRunID)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -516,8 +559,24 @@ func (s *MemoryStore) UpdateStep(_ context.Context, lease Lease, req StepUpdate)
 	return nil
 }
 
+func isStepStatus(status StepStatus) bool {
+	switch status {
+	case StepProposed, StepWaiting, StepStarted, StepCompleted, StepBlocked, StepDeclined:
+		return true
+	}
+	return false
+}
+
 // RequestApproval implements Store.
 func (s *MemoryStore) RequestApproval(_ context.Context, lease Lease, req ApprovalRequest) (Approval, error) {
+	if !isUUID(req.ID) {
+		return Approval{}, fmt.Errorf("agent: request approval: id %q is not a UUID", req.ID)
+	}
+	action, err := storedAction(req.Action)
+	if err != nil {
+		return Approval{}, fmt.Errorf("agent: request approval: %w", err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -537,17 +596,16 @@ func (s *MemoryStore) RequestApproval(_ context.Context, lease Lease, req Approv
 	if st.Status != req.From {
 		return Approval{}, ErrConflict
 	}
-	if req.ID == "" {
-		return Approval{}, errors.New("agent: request approval: id is empty")
-	}
 	if _, ok := s.approvals[req.ID]; ok {
 		return Approval{}, fmt.Errorf("agent: request approval: id %q is already in use", req.ID)
 	}
 
 	rev := touch(r, req.Now)
 	st.Status = StepWaiting
-	st.Decision = req.Decision
-	st.Rule = req.Rule
+	if req.Decision != "" {
+		st.Decision = req.Decision
+		st.Rule = req.Rule
+	}
 	st.Rev = rev
 
 	a := &memoryApproval{run: r, approval: Approval{
@@ -557,7 +615,7 @@ func (s *MemoryStore) RequestApproval(_ context.Context, lease Lease, req Approv
 		Attempt:     st.Attempts,
 		Cause:       req.Cause,
 		Tool:        st.Name,
-		Action:      cloneAction(req.Action),
+		Action:      action,
 		Rule:        req.Rule,
 		Status:      ApprovalPending,
 		Rev:         rev,
@@ -677,6 +735,10 @@ func (s *MemoryStore) RequestCancel(_ context.Context, req CancelRequest) error 
 	if r.run.Terminal() {
 		return ErrFinished
 	}
+	// The first request stands: who asked, why, and the one revision.
+	if r.run.CancelRequested {
+		return nil
+	}
 	r.run.CancelRequested = true
 	r.run.CancelBy = req.By
 	r.run.CancelReason = req.Reason
@@ -779,6 +841,26 @@ func cloneApproval(a Approval) Approval {
 	return a
 }
 
+// storedAction is a as it reads back from a store: its attributes through
+// JSON, so a number is a float64, an object a map[string]any and a list a
+// []any, and no attributes are an empty map. It fails for attributes JSON
+// cannot hold.
+func storedAction(a Action) (Action, error) {
+	text, err := json.Marshal(a.Attrs)
+	if err != nil {
+		return Action{}, fmt.Errorf("action attributes: %w", err)
+	}
+	var attrs map[string]any
+	if err := json.Unmarshal(text, &attrs); err != nil {
+		return Action{}, fmt.Errorf("action attributes: %w", err)
+	}
+	if attrs == nil {
+		attrs = map[string]any{}
+	}
+	a.Attrs = attrs
+	return a, nil
+}
+
 func cloneAction(a Action) Action {
 	if a.Attrs != nil {
 		attrs := make(map[string]any, len(a.Attrs))
@@ -790,9 +872,8 @@ func cloneAction(a Action) Action {
 	return a
 }
 
-// cloneValue copies an attribute's value through the shapes JSON has: maps,
-// lists and raw JSON. Anything else is a scalar, or is the caller's own type
-// and stays shared.
+// cloneValue copies an attribute's value. A stored action's attributes have
+// been through JSON, so a value is a map, a list or a scalar.
 func cloneValue(v any) any {
 	switch v := v.(type) {
 	case map[string]any:
@@ -807,10 +888,6 @@ func cloneValue(v any) any {
 			out[i] = cloneValue(e)
 		}
 		return out
-	case []string:
-		return slices.Clone(v)
-	case json.RawMessage:
-		return slices.Clone(v)
 	}
 	return v
 }

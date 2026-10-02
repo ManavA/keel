@@ -50,12 +50,13 @@ func finishCases() []storeCase {
 			beforeOther := k.snapshot(other.ID)
 			journal := k.steps(run.ID)
 
-			k.finish(lease, agent.StatusFailed)
+			now := k.tick()
+			require.NoError(k.t, k.store.Finish(k.ctx, lease, agent.FinishRequest{Status: agent.StatusFailed, Now: now}))
 
 			after := k.run(run.ID)
-			// Nobody answered it, so it has a status and no answer.
+			// It was settled when its run ended, and by nobody.
 			want := pending
-			want.Status, want.Rev = agent.ApprovalCancelled, after.Rev
+			want.Status, want.DecidedAt, want.Rev = agent.ApprovalCancelled, &now, after.Rev
 			k.equalApproval(want, k.approval(pending.ID))
 			k.equalApproval(approved, k.approval(approved.ID))
 			k.equalApproval(declined, k.approval(declined.ID))
@@ -126,6 +127,26 @@ func finishCases() []storeCase {
 			k.finish(lease, agent.StatusCompleted)
 
 			k.unchanged(before)
+		}},
+		{"records the Error it is given in place of the last failure's", func(k *kit) {
+			tests := []struct {
+				name string
+				req  agent.FinishRequest
+				want string
+			}{
+				{"a run that ended well has none", agent.FinishRequest{Status: agent.StatusCompleted, Output: "the answer"}, ""},
+				{"a run that failed has its own", agent.FinishRequest{Status: agent.StatusFailed, Error: "gave up"}, "gave up"},
+			}
+			for _, tt := range tests {
+				run, lease := k.held(agentAlpha)
+				lease = k.failOnce(lease)
+				require.Equal(k.t, "boom", k.run(run.ID).Error)
+				tt.req.Now = k.tick()
+
+				require.NoError(k.t, k.store.Finish(k.ctx, lease, tt.req), tt.name)
+
+				assert.Equal(k.t, tt.want, k.run(run.ID).Error, tt.name)
+			}
 		}},
 		{"a status that is not final is refused", func(k *kit) {
 			run, lease := k.held(agentAlpha)
@@ -203,6 +224,34 @@ func requestCancelCases() []storeCase {
 
 			lease := k.claim(workerB, run.ID)
 			assert.Equal(k.t, run.LeaseEpoch+1, lease.Epoch, "the run can be picked up, to be ended")
+		}},
+		{"asked again of a run already marked, changes nothing: the first request stands", func(k *kit) {
+			tests := []struct {
+				name string
+				run  func() agent.Run
+			}{
+				{"a run being executed", func() agent.Run {
+					run, _ := k.held(agentAlpha)
+					return run
+				}},
+				{"a run that was waiting", func() agent.Run {
+					run, _ := k.parked(agentAlpha, nil)
+					return run
+				}},
+			}
+			for _, tt := range tests {
+				run := tt.run()
+				require.NoError(k.t, k.store.RequestCancel(k.ctx, agent.CancelRequest{
+					RunID: run.ID, By: personA, Reason: "wrong batch", Now: k.tick(),
+				}), tt.name)
+				before := k.snapshot(run.ID)
+
+				err := k.store.RequestCancel(k.ctx, agent.CancelRequest{RunID: run.ID, By: personB, Reason: "another reason", Now: k.tick()})
+
+				require.NoError(k.t, err, tt.name)
+				k.unchanged(before)
+				assert.Equal(k.t, personA, before.run.CancelBy, tt.name)
+			}
 		}},
 		{"a run that has ended is ErrFinished", func(k *kit) {
 			for _, status := range finalStatuses {

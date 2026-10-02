@@ -86,8 +86,11 @@ type Model struct {
 	requests []agent.Request
 }
 
-// NewModel builds a Model over script.
+// NewModel builds a Model over script. A nil script is one with no replies.
 func NewModel(script Script) *Model {
+	if script == nil {
+		script = Replies()
+	}
 	return &Model{script: script}
 }
 

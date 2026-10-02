@@ -44,15 +44,18 @@ func createRunCases() []storeCase {
 			k.equalRun(want, stored)
 			k.equalRun(want, k.run(run.ID))
 		}},
-		{"stores a run that has nothing optional set", func(k *kit) {
+		{"stores a run that has nothing optional set, and reads its metadata back empty", func(k *kit) {
 			run := k.newRun(agentAlpha)
+			require.Nil(k.t, run.Metadata)
 
 			stored, created, err := k.store.CreateRun(k.ctx, run)
 			require.NoError(k.t, err)
 			assert.True(k.t, created)
 
+			// No metadata reads back as none, and never as nil, so a test
+			// that compares it says the same of every store.
 			want := run
-			want.Rev = 1
+			want.Rev, want.Metadata = 1, map[string]string{}
 			k.equalRun(want, stored)
 			k.equalRun(want, k.run(run.ID))
 		}},
@@ -123,6 +126,39 @@ func createRunCases() []storeCase {
 				_, err = k.store.GetRun(k.ctx, run.ID)
 				assert.ErrorIs(k.t, err, agent.ErrNotFound, "status %q", status)
 			}
+		}},
+		{"a parent that does not exist is refused", func(k *kit) {
+			run := k.newRun(agentBeta)
+			run.ParentID, run.ParentSeq, run.Depth = uuid.NewString(), 2, 1
+
+			_, created, err := k.store.CreateRun(k.ctx, run)
+
+			require.Error(k.t, err)
+			assert.False(k.t, created)
+			_, err = k.store.GetRun(k.ctx, run.ID)
+			assert.ErrorIs(k.t, err, agent.ErrNotFound, "the child was not stored")
+		}},
+		{"an id or a parent id that is not a UUID is refused", func(k *kit) {
+			parent := k.create(agentAlpha)
+			valid := k.newRun(agentBeta)
+
+			badID := valid
+			badID.ID = malformedID
+			_, created, err := k.store.CreateRun(k.ctx, badID)
+			require.Error(k.t, err, "the run's own id")
+			assert.False(k.t, created)
+
+			badParent := valid
+			badParent.ParentID = malformedID
+			_, created, err = k.store.CreateRun(k.ctx, badParent)
+			require.Error(k.t, err, "its parent's id")
+			assert.False(k.t, created)
+			_, err = k.store.GetRun(k.ctx, valid.ID)
+			assert.ErrorIs(k.t, err, agent.ErrNotFound, "nothing was stored")
+
+			// The same run under ids a store can keep is accepted.
+			valid.ParentID = parent.ID
+			k.insert(valid)
 		}},
 		{"an id already taken is refused, and the run that has it is left alone", func(k *kit) {
 			first := k.create(agentAlpha)
@@ -205,6 +241,8 @@ func listRunsCases() []storeCase {
 				{"a parent with no children", agent.RunFilter{ParentID: waiting.ID}, []string{}},
 				{"an agent and a status together", agent.RunFilter{Agent: agentBeta, Status: agent.StatusRunnable}, []string{child.ID}},
 				{"an agent with no runs", agent.RunFilter{Agent: "gamma"}, []string{}},
+				{"a parent id nothing has", agent.RunFilter{ParentID: uuid.NewString()}, []string{}},
+				{"a parent id that is not a UUID", agent.RunFilter{ParentID: malformedID}, []string{}},
 			}
 			for _, tt := range tests {
 				assert.Equal(k.t, tt.want, list(k, tt.filter), tt.name)

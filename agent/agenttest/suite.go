@@ -380,8 +380,9 @@ func (k *kit) timeIs(want time.Time, got *time.Time, what string) {
 }
 
 // The normal forms below are what two stores must agree on. A store may hand
-// back an instant in another zone, or an empty map or list where it was given
-// none; neither is a difference.
+// back an instant in another zone, or an empty list where it was given none;
+// neither is a difference. Metadata and an action's attributes are not
+// normalised: the contract says how they read back.
 
 func normalTime(t time.Time) time.Time { return t.Round(0).UTC() }
 
@@ -399,9 +400,6 @@ func normalRun(r agent.Run) agent.Run {
 	r.FinishedAt = normalTimePtr(r.FinishedAt)
 	r.LeaseExpiresAt = normalTimePtr(r.LeaseExpiresAt)
 	r.NextAttemptAt = normalTimePtr(r.NextAttemptAt)
-	if len(r.Metadata) == 0 {
-		r.Metadata = nil
-	}
 	if len(r.Definition.Tools) == 0 {
 		r.Definition.Tools = nil
 	}
@@ -441,9 +439,6 @@ func normalApproval(a agent.Approval) agent.Approval {
 	a.RequestedAt = normalTime(a.RequestedAt)
 	a.DecidedAt = normalTimePtr(a.DecidedAt)
 	a.ExpiresAt = normalTimePtr(a.ExpiresAt)
-	if len(a.Action.Attrs) == 0 {
-		a.Action.Attrs = nil
-	}
 	return a
 }
 

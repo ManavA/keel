@@ -258,6 +258,17 @@ func TestModel_NamesTheModelThatAnswered(t *testing.T) {
 	}
 }
 
+func TestModel_ANilScriptHasNoReplies(t *testing.T) {
+	model := agenttest.NewModel(nil)
+
+	_, err := model.Generate(t.Context(), conversation("alpha", 0))
+	require.Error(t, err, "as a script with no replies answers, and not a panic")
+
+	_, want := agenttest.Replies()(agent.Request{}, 0)
+	assert.Equal(t, want.Error(), err.Error())
+	assert.Len(t, model.Requests(), 1)
+}
+
 func TestModel_ReturnsTheScriptsError(t *testing.T) {
 	boom := errors.New("model unavailable")
 	model := agenttest.NewModel(func(agent.Request, int) (agent.Response, error) {

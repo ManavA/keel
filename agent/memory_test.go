@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -40,14 +41,76 @@ func TestMemoryStore_TwoStoresShareNothing(t *testing.T) {
 	first, second := agent.NewMemoryStore(), agent.NewMemoryStore()
 	ctx := t.Context()
 
-	_, _, err := first.CreateRun(ctx, agent.Run{ID: "run-1", Agent: "alpha", Status: agent.StatusRunnable})
+	_, _, err := first.CreateRun(ctx, agent.Run{ID: memoryRunID, Agent: "alpha", Status: agent.StatusRunnable})
 	require.NoError(t, err)
 
-	_, err = second.GetRun(ctx, "run-1")
+	_, err = second.GetRun(ctx, memoryRunID)
 	assert.ErrorIs(t, err, agent.ErrNotFound)
 }
 
+// A database takes a UUID in several spellings and hands back the canonical
+// one. MemoryStore keeps the string it is given, so it takes only that one:
+// an id never reads back as anything but what was stored.
+func TestMemoryStore_TakesAUUIDInItsCanonicalFormOnly(t *testing.T) {
+	spellings := []struct {
+		name string
+		id   string
+		ok   bool
+	}{
+		{"canonical", "0b0e7b1c-3a57-4c8e-9d2f-5f1a6c9e4d10", true},
+		{"upper case", "0B0E7B1C-3A57-4C8E-9D2F-5F1A6C9E4D10", false},
+		{"in braces", "{0b0e7b1c-3a57-4c8e-9d2f-5f1a6c9e4d10}", false},
+		{"without hyphens", "0b0e7b1c3a574c8e9d2f5f1a6c9e4d10", false},
+		{"as a URN", "urn:uuid:0b0e7b1c-3a57-4c8e-9d2f-5f1a6c9e4d10", false},
+		{"empty", "", false},
+	}
+	for _, tt := range spellings {
+		t.Run(tt.name, func(t *testing.T) {
+			store := agent.NewMemoryStore()
+
+			stored, created, err := store.CreateRun(t.Context(), agent.Run{ID: tt.id, Agent: "alpha", Status: agent.StatusRunnable})
+
+			if !tt.ok {
+				require.Error(t, err)
+				assert.False(t, created)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.id, stored.ID)
+		})
+	}
+}
+
+func TestMemoryStore_RefusesAttributesJSONCannotHold(t *testing.T) {
+	f := newMemoryFixture(t)
+	require.NoError(t, f.store.UpdateStep(f.ctx, f.lease, agent.StepUpdate{
+		Seq: 3, From: agent.StepWaiting, To: agent.StepStarted, Now: f.tick(),
+	}))
+	before := f.state()
+	req := memoryQuestion(f.tick())
+	req.ID, req.From = memoryID("9000", 2), agent.StepStarted
+	req.Action.Attrs = map[string]any{"reply": make(chan string)}
+
+	_, err := f.store.RequestApproval(f.ctx, f.lease, req)
+
+	require.Error(t, err)
+	assert.Equal(t, before, f.state(), "nothing was recorded")
+}
+
 var memoryStart = time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)
+
+// The ids the fixtures use. A store keeps a run or an approval only under a
+// UUID.
+const (
+	memoryRunID      = "00000000-0000-4000-8000-000000000001"
+	memoryOtherRunID = "00000000-0000-4000-8000-000000000002"
+	memoryApprovalID = "00000000-0000-4000-9000-000000000001"
+)
+
+// memoryID is the nth id of a series, for tests that need many.
+func memoryID(series string, n int) string {
+	return fmt.Sprintf("00000000-0000-4000-%s-%012d", series, n)
+}
 
 // memoryFixture is a store holding one run that has every kind of value a
 // caller could keep a reference into: maps, lists, raw JSON and pointers to
@@ -71,7 +134,7 @@ func newMemoryFixture(t *testing.T) *memoryFixture {
 	t.Helper()
 	f := &memoryFixture{
 		t: t, ctx: t.Context(), store: agent.NewMemoryStore(),
-		clock: agenttest.NewClock(memoryStart), runID: "run-1",
+		clock: agenttest.NewClock(memoryStart), runID: memoryRunID,
 	}
 
 	now := f.tick()
@@ -136,7 +199,7 @@ func memoryMessage() agent.Message {
 func memoryQuestion(now time.Time) agent.ApprovalRequest {
 	expires := now.Add(time.Hour)
 	return agent.ApprovalRequest{
-		ID: "approval-1", Seq: 3, From: agent.StepProposed, Cause: agent.CauseGuard,
+		ID: memoryApprovalID, Seq: 3, From: agent.StepProposed, Cause: agent.CauseGuard,
 		Action: agent.Action{Kind: "run", Target: "send", Attrs: map[string]any{
 			"agent":  "alpha",
 			"tags":   []any{"outbound", map[string]any{"level": "high"}},
@@ -253,15 +316,15 @@ func TestMemoryStore_KeepsWhatItWasGivenWhateverTheCallerDoesNext(t *testing.T) 
 	t.Run("a run changed after it was stored", func(t *testing.T) {
 		store := agent.NewMemoryStore()
 		ctx := t.Context()
-		run := memoryRun("run-1", memoryStart)
-		want := memoryRun("run-1", memoryStart)
+		run := memoryRun(memoryRunID, memoryStart)
+		want := memoryRun(memoryRunID, memoryStart)
 		want.Rev = 1
 
 		_, _, err := store.CreateRun(ctx, run)
 		require.NoError(t, err)
 		scribbleRun(&run)
 
-		got, err := store.GetRun(ctx, "run-1")
+		got, err := store.GetRun(ctx, memoryRunID)
 		require.NoError(t, err)
 		assert.Equal(t, want, got)
 	})
@@ -290,7 +353,7 @@ func TestMemoryStore_KeepsWhatItWasGivenWhateverTheCallerDoesNext(t *testing.T) 
 	t.Run("an action and a time changed after the question was asked", func(t *testing.T) {
 		store := agent.NewMemoryStore()
 		ctx := t.Context()
-		_, _, err := store.CreateRun(ctx, memoryRun("run-1", memoryStart))
+		_, _, err := store.CreateRun(ctx, memoryRun(memoryRunID, memoryStart))
 		require.NoError(t, err)
 		held, err := store.Claim(ctx, agent.ClaimRequest{Owner: "worker-a", Agents: []string{"alpha"}, Now: memoryStart, TTL: time.Minute})
 		require.NoError(t, err)
@@ -370,7 +433,7 @@ func TestMemoryStore_HandsOutCopies(t *testing.T) {
 			return func() { scribbleRun(&runs[0]) }
 		}},
 		{"CreateRun, given a key already used", func(f *memoryFixture) func() {
-			run, created, err := f.store.CreateRun(f.ctx, memoryRun("run-2", f.tick()))
+			run, created, err := f.store.CreateRun(f.ctx, memoryRun(memoryOtherRunID, f.tick()))
 			require.NoError(f.t, err)
 			require.False(f.t, created)
 			return func() { scribbleRun(&run) }
@@ -468,7 +531,7 @@ func TestMemoryStore_IsSafeForConcurrentUse(t *testing.T) {
 	for i := range workers * runsPerWorker {
 		now := tick()
 		_, _, err := store.CreateRun(ctx, agent.Run{
-			ID: fmt.Sprintf("run-%03d", i), Agent: "alpha", Status: agent.StatusRunnable, CreatedAt: now, UpdatedAt: now,
+			ID: memoryID("a000", i), Agent: "alpha", Status: agent.StatusRunnable, CreatedAt: now, UpdatedAt: now,
 		})
 		require.NoError(t, err)
 	}
@@ -507,7 +570,7 @@ func TestMemoryStore_IsSafeForConcurrentUse(t *testing.T) {
 				if run == nil {
 					return
 				}
-				if err := liveOneLife(ctx, store, run.Lease(), tick); err != nil {
+				if err := liveOneLife(ctx, store, run.Lease(), strings.Replace(run.ID, "-a000-", "-b000-", 1), tick); err != nil {
 					errs <- fmt.Errorf("%s: %w", run.ID, err)
 					return
 				}
@@ -533,9 +596,9 @@ func TestMemoryStore_IsSafeForConcurrentUse(t *testing.T) {
 	}
 }
 
-// liveOneLife journals a reply with one call, has it approved, runs it, and
-// ends the run, all under lease.
-func liveOneLife(ctx context.Context, store agent.Store, lease agent.Lease, tick func() time.Time) error {
+// liveOneLife journals a reply with one call, has it approved under
+// approvalID, runs it, and ends the run, all under lease.
+func liveOneLife(ctx context.Context, store agent.Store, lease agent.Lease, approvalID string, tick func() time.Time) error {
 	if err := store.BeginModel(ctx, lease, 1, tick()); err != nil {
 		return err
 	}
@@ -545,7 +608,7 @@ func liveOneLife(ctx context.Context, store agent.Store, lease agent.Lease, tick
 		return err
 	}
 	approval, err := store.RequestApproval(ctx, lease, agent.ApprovalRequest{
-		ID: "approval-" + lease.RunID, Seq: 2, From: agent.StepProposed, Cause: agent.CauseGuard, Decision: agent.Ask, Now: tick(),
+		ID: approvalID, Seq: 2, From: agent.StepProposed, Cause: agent.CauseGuard, Decision: agent.Ask, Now: tick(),
 	})
 	if err != nil {
 		return err
