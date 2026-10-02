@@ -190,11 +190,73 @@ func TestInvoke_ATransientErrorAsksForAnotherTry(t *testing.T) {
 
 			got := invoke(context.Background(), tool, invokeCall(), invokeAmple, nil)
 
-			// The error comes back as the tool gave it, and nothing else:
-			// there is no result to record.
-			assert.Same(t, tc.err, got.retry)
+			// The error comes back and nothing else: there is no result to
+			// record. It is the tool's own underneath, with the tool's text.
+			require.Error(t, got.retry)
+			assert.ErrorIs(t, got.retry, ErrTransient)
+			assert.Same(t, tc.err, errors.Unwrap(got.retry))
+			assert.Equal(t, tc.err.Error(), got.retry.Error())
 			assert.Empty(t, got.result)
 			assert.False(t, got.isError)
+		})
+	}
+}
+
+// invokeCounted is a transient error that counts how often its text is read.
+type invokeCounted struct{ reads *int }
+
+func (e invokeCounted) Error() string {
+	*e.reads++
+	return "fetch: try again"
+}
+func (e invokeCounted) Unwrap() error { return ErrTransient }
+
+// What the executor does with a transient error is read its text, on its own
+// goroutine, where nothing recovers a panic. So the text is read once, in
+// the tool's goroutine, and carried.
+func TestInvoke_ATransientErrorsTextIsReadOnceBeforeItLeavesTheToolsGoroutine(t *testing.T) {
+	reads := 0
+	tool := invokeTool(func(context.Context, Invocation) (string, error) {
+		return "", invokeCounted{reads: &reads}
+	})
+
+	got := invoke(context.Background(), tool, invokeCall(), invokeAmple, nil)
+
+	require.Error(t, got.retry)
+	require.Equal(t, 1, reads)
+	assert.Equal(t, "fetch: try again", got.retry.Error())
+	assert.Equal(t, "fetch: try again", got.retry.Error())
+	assert.Equal(t, 1, reads, "reading the text again does not go back to the tool's error")
+	assert.ErrorIs(t, got.retry, ErrTransient)
+}
+
+func TestInvoke_ATransientErrorsTextIsMadeFitForTheJournal(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			"a NUL byte and bytes that are not UTF-8",
+			fmt.Errorf("fetch\x00 failed\xff: %w", ErrTransient),
+			"fetch failed\uFFFD: agent: transient failure",
+		},
+		{
+			"text the journal can hold is left alone",
+			fmt.Errorf("récupération 🙂: %w", ErrTransient),
+			"récupération 🙂: agent: transient failure",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tool := invokeTool(func(context.Context, Invocation) (string, error) { return "", tc.err })
+
+			got := invoke(context.Background(), tool, invokeCall(), invokeAmple, nil)
+
+			require.Error(t, got.retry)
+			assert.Equal(t, tc.want, got.retry.Error())
+			assert.ErrorIs(t, got.retry, ErrTransient)
+			assert.Same(t, tc.err, errors.Unwrap(got.retry))
 		})
 	}
 }
@@ -273,6 +335,12 @@ func TestInvoke_APanicOutsideTheToolsOwnBodyIsStillTheTools(t *testing.T) {
 			}),
 		},
 		{
+			name: "in the method that gives a transient error's text",
+			tool: invokeTool(func(context.Context, Invocation) (string, error) {
+				return "", invokeBrokenTransient{}
+			}),
+		},
+		{
 			// Only a tool with Run is ever invoked. One without is a fault in
 			// the caller, and is reported as one in the tool rather than
 			// ending the process.
@@ -291,6 +359,13 @@ func TestInvoke_APanicOutsideTheToolsOwnBodyIsStillTheTools(t *testing.T) {
 		})
 	}
 }
+
+// invokeBrokenTransient is a transient error that panics when asked for its
+// text.
+type invokeBrokenTransient struct{}
+
+func (invokeBrokenTransient) Error() string { panic("no text") }
+func (invokeBrokenTransient) Unwrap() error { return ErrTransient }
 
 // invokeUnwrapPanics is an error that panics when asked what it wraps.
 type invokeUnwrapPanics struct{}
@@ -431,8 +506,8 @@ func TestInvoke_ATimeoutOfZeroOrLessDoesNotRunTheTool(t *testing.T) {
 		timeout time.Duration
 		want    string
 	}{
-		{"zero", 0, "timed out after 0s"},
-		{"negative", -time.Second, "timed out after -1s"},
+		{"zero", 0, "tool was given no time to run"},
+		{"negative", -time.Second, "tool was given no time to run"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

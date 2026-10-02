@@ -50,6 +50,9 @@ type leaseBeat struct {
 	ttl   time.Duration
 	// bound is how long the call was given, and zero when it had no deadline.
 	bound time.Duration
+	// ended is the error of the call's context as the call arrived: nil for
+	// a context that was live.
+	ended error
 }
 
 // leaseStore is the store a keeper under test beats against. It notes every
@@ -68,7 +71,7 @@ type leaseStore struct {
 }
 
 func (s *leaseStore) Heartbeat(ctx context.Context, lease agent.Lease, now time.Time, ttl time.Duration) (bool, error) {
-	beat := leaseBeat{lease: lease, now: now, ttl: ttl}
+	beat := leaseBeat{lease: lease, now: now, ttl: ttl, ended: ctx.Err()}
 	if deadline, ok := ctx.Deadline(); ok {
 		beat.bound = time.Until(deadline)
 	}
@@ -202,6 +205,14 @@ func (f *leaseFixture) keep() (held context.Context, stop func()) {
 // keeper has done what that woke it to do and is blocked again.
 func (f *leaseFixture) wake() {
 	time.Sleep(leaseInterval)
+	synctest.Wait()
+}
+
+// pass moves the kit's clock and the keeper's timer on together by d, as
+// both move for a process running in real time.
+func (f *leaseFixture) pass(d time.Duration) {
+	f.clock.Advance(d)
+	time.Sleep(d)
 	synctest.Wait()
 }
 
@@ -512,12 +523,80 @@ func TestKeep_ACancelRequestEndsTheHoldAsCancelRequested(t *testing.T) {
 		run := f.run()
 		assert.Equal(t, leaseOwner, run.LeaseOwner)
 		assert.Equal(t, f.clock.Now().Add(leaseTTL), f.expiry())
-		requireLeaseQuiet(t, f)
+		require.Len(t, f.store.seen(), 2)
 
-		for _, entry := range f.logs.all() {
-			assert.Less(t, entry.level, slog.LevelWarn, "a cancel request is not a fault: %s", entry.msg)
+		// And it stays this worker's for as long as finishing takes, which
+		// may be longer than a TTL: the heartbeats go on until stop.
+		for i := 3; i <= 8; i++ {
+			f.clock.Advance(leaseInterval)
+			f.wake()
+			require.Len(t, f.store.seen(), i)
+			assert.Equal(t, f.clock.Now().Add(leaseTTL), f.expiry(), "after heartbeat %d", i)
+			requireLeaseEnded(t, held, agent.ErrCancelRequested, "while the heartbeats go on")
 		}
+
+		// A heartbeat made under the held context would arrive already
+		// cancelled, and a store that honours its context would refuse it.
+		for i, beat := range f.store.seen() {
+			assert.NoError(t, beat.ended, "heartbeat %d arrived with its context ended", i+1)
+		}
+
+		// Seven heartbeats carried the mark. It is logged once, and not as a
+		// fault.
+		logged := f.logs.all()
+		require.Len(t, logged, 1)
+		assert.Less(t, logged[0].level, slog.LevelWarn)
+		assert.Equal(t, leaseRunID, logged[0].attrs["run"])
+
+		stop()
+		requireLeaseEnded(t, held, agent.ErrCancelRequested, "after stop")
+		require.Len(t, f.store.seen(), 8)
+		requireLeaseQuiet(t, f)
 	})
+}
+
+func TestKeep_ALossAfterACancelRequestEndsTheHeartbeatsAndKeepsTheCause(t *testing.T) {
+	cases := []struct {
+		name string
+		// lose arranges for the lease to be lost at the next heartbeat.
+		lose func(f *leaseFixture)
+	}{
+		{"the lease is taken", func(f *leaseFixture) { f.takeOver() }},
+		{"the store fails for a whole TTL", func(f *leaseFixture) {
+			f.faults.Kill()
+			f.clock.Advance(leaseTTL)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newLeaseFixture(t)
+				held, stop := f.keep()
+				defer stop()
+
+				require.NoError(t, f.memory.RequestCancel(context.Background(), agent.CancelRequest{
+					RunID: leaseRunID, By: "operator", Now: f.clock.Now(),
+				}))
+				f.wake()
+				requireLeaseEnded(t, held, agent.ErrCancelRequested, "after the request")
+				f.wake()
+				require.Len(t, f.store.seen(), 2, "the heartbeats go on")
+
+				tc.lose(f)
+				f.wake()
+
+				// The caller was told to cancel and is doing so. That the
+				// lease then went does not change what it was told.
+				requireLeaseEnded(t, held, agent.ErrCancelRequested, "after the loss")
+				require.Len(t, f.store.seen(), 3)
+				requireLeaseQuiet(t, f)
+
+				logged := f.logs.all()
+				require.Len(t, logged, 2, "the request, then the loss")
+				assert.Equal(t, slog.LevelWarn, logged[1].level)
+			})
+		})
+	}
 }
 
 func TestKeep_AStoreThatFailsLosesTheLeaseAfterAWholeTTLAndNotBefore(t *testing.T) {
@@ -893,17 +972,25 @@ func TestKeep_StopIsSafeFromManyGoroutinesWhileTheLeaseIsBeingLost(t *testing.T)
 	})
 }
 
-func TestKeep_IntervalDefaultsToAThirdOfTheTTL(t *testing.T) {
+func TestKeep_AnIntervalThatCannotKeepTheLeaseIsReplacedByAThirdOfTheTTL(t *testing.T) {
 	cases := []struct {
 		name     string
 		interval time.Duration
 		ttl      time.Duration
-		want     time.Duration
+		// want is the interval the keeper beats at.
+		want time.Duration
+		// replaced is whether want is not the interval given.
+		replaced bool
 	}{
-		{"zero", 0, 30 * time.Second, 10 * time.Second},
-		{"negative", -time.Second, 30 * time.Second, 10 * time.Second},
-		{"a TTL too short to divide", 0, 2 * time.Nanosecond, time.Nanosecond},
-		{"a third that does not divide evenly is rounded up", 0, 10 * time.Nanosecond, 4 * time.Nanosecond},
+		{"one nanosecond below the TTL is used as given", 30*time.Second - time.Nanosecond, 30 * time.Second, 30*time.Second - time.Nanosecond, false},
+		{"a third of the TTL is used as given", 10 * time.Second, 30 * time.Second, 10 * time.Second, false},
+		{"one nanosecond is used as given", time.Nanosecond, 30 * time.Second, time.Nanosecond, false},
+		{"equal to the TTL", 30 * time.Second, 30 * time.Second, 10 * time.Second, true},
+		{"twice the TTL", time.Minute, 30 * time.Second, 10 * time.Second, true},
+		{"zero", 0, 30 * time.Second, 10 * time.Second, true},
+		{"negative", -time.Second, 30 * time.Second, 10 * time.Second, true},
+		{"a TTL too short to divide", 0, 2 * time.Nanosecond, time.Nanosecond, true},
+		{"a third that does not divide evenly is rounded up", 0, 10 * time.Nanosecond, 4 * time.Nanosecond, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -928,6 +1015,111 @@ func TestKeep_IntervalDefaultsToAThirdOfTheTTL(t *testing.T) {
 				assert.Equal(t, tc.want, f.store.seen()[0].bound)
 				assert.Equal(t, tc.ttl, f.store.seen()[0].ttl)
 				requireLeaseHeld(t, held, "after the first heartbeat")
+
+				// keep has no error to return, so a replaced interval is
+				// said once, as an error, with both values.
+				logged := f.logs.all()
+				if !tc.replaced {
+					assert.Empty(t, logged)
+					return
+				}
+				require.Len(t, logged, 1)
+				assert.Equal(t, slog.LevelError, logged[0].level)
+				assert.Equal(t, tc.interval.String(), logged[0].attrs["interval"])
+				assert.Equal(t, tc.ttl.String(), logged[0].attrs["ttl"])
+				assert.Equal(t, tc.want.String(), logged[0].attrs["using"])
+				assert.Equal(t, leaseRunID, logged[0].attrs["run"])
+			})
+		})
+	}
+}
+
+// An interval longer than the TTL would let the lease lapse between
+// heartbeats while the store was answering every one: a rival could take the
+// run with nothing to tell the holder for the rest of the interval.
+func TestKeep_AnIntervalLongerThanTheTTLDoesNotLetTheLeaseLapse(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newLeaseFixture(t)
+		opts := f.options()
+		opts.Interval = 2 * leaseTTL
+		held, stop := agent.Keep(context.Background(), f.lease, opts)
+		defer stop()
+
+		// Clock and timer together, a second at a time, for three TTLs, with
+		// a rival asking for the run at every one.
+		for range 3 * leaseTTL / time.Second {
+			f.pass(time.Second)
+			rival, err := f.memory.Claim(context.Background(), agent.ClaimRequest{
+				Owner: leaseRival, Agents: []string{leaseAgent}, RunID: leaseRunID, Now: f.clock.Now(), TTL: leaseTTL,
+			})
+			require.ErrorIs(t, err, agent.ErrNotClaimable, "%s after the claim", f.since())
+			require.Nil(t, rival)
+		}
+		requireLeaseHeld(t, held, "after three TTLs")
+		assert.Len(t, f.store.seen(), 9)
+	})
+}
+
+// The latest a store that fails is given up on. A heartbeat fails at once
+// one nanosecond short of the TTL, so the hold goes on; the next one hangs,
+// and its answer, an interval after it began, is the first at or after the
+// moment a rival may claim.
+func TestKeep_AStoreThatFailsIsGivenUpLessThanTwoIntervalsAfterARivalMayClaim(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newLeaseFixture(t)
+		held, stop := f.keep()
+		defer stop()
+		mayClaim := leaseStart.Add(leaseTTL)
+
+		// The clock runs one nanosecond behind the timer from here on.
+		f.faults.FailBefore("Heartbeat", 3)
+		f.clock.Advance(leaseInterval - time.Nanosecond)
+		f.wake()
+		f.pass(leaseInterval)
+		f.pass(leaseInterval)
+		require.Len(t, f.store.seen(), 3)
+		require.Equal(t, mayClaim.Add(-time.Nanosecond), f.clock.Now())
+		requireLeaseHeld(t, held, "after a failure one nanosecond short of the TTL")
+
+		f.store.holdWith(leaseHang)
+		f.pass(leaseInterval)
+		require.Len(t, f.store.seen(), 4, "the heartbeat that hangs has begun")
+		requireLeaseHeld(t, held, "an interval on, with that heartbeat unanswered")
+
+		f.pass(leaseInterval - time.Nanosecond)
+		requireLeaseHeld(t, held, "a nanosecond before it is cut off")
+
+		f.pass(time.Nanosecond)
+		requireLeaseEnded(t, held, agent.ErrLeaseLost, "when it is cut off")
+		late := f.clock.Now().Sub(mayClaim)
+		assert.Equal(t, 2*leaseInterval-time.Nanosecond, late)
+		assert.Less(t, late, 2*leaseInterval)
+		requireLeaseQuiet(t, f)
+	})
+}
+
+func TestKeep_PanicsAtTheCallWithoutAStoreOrAClock(t *testing.T) {
+	cases := []struct {
+		name string
+		drop func(opts *agent.KeepOptions)
+		want string
+	}{
+		{"no store", func(opts *agent.KeepOptions) { opts.Store = nil }, "agent: keep: Store is nil"},
+		{"no clock", func(opts *agent.KeepOptions) { opts.Clock = nil }, "agent: keep: Clock is nil"},
+		{"neither", func(opts *agent.KeepOptions) { opts.Store, opts.Clock = nil, nil }, "agent: keep: Store is nil"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// In a bubble, so that a goroutine started before the fault
+			// showed would fail the test when it was left behind.
+			synctest.Test(t, func(t *testing.T) {
+				f := newLeaseFixture(t)
+				opts := f.options()
+				tc.drop(&opts)
+
+				assert.PanicsWithValue(t, tc.want, func() {
+					agent.Keep(context.Background(), f.lease, opts)
+				})
 			})
 		})
 	}

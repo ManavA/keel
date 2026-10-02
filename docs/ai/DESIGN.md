@@ -3024,6 +3024,7 @@ every rebuild:
 | Tool returned an error | The error's text, made fit for the journal: bytes that are not UTF-8 replaced by U+FFFD, then NUL bytes removed | true |
 | Tool panicked | `tool panicked` (the value and the stack go to the log) | true |
 | Tool ran past its timeout | `timed out after <duration>` | true |
+| Tool given no time, a timeout of zero or less, and so not run | `tool was given no time to run` | true |
 | Result over 1 MiB | `result too large: <n> bytes` | true |
 | Result not valid UTF-8 | `result is not valid UTF-8` | true |
 | Result with a NUL byte | `result contains a NUL byte` | true |
@@ -3165,9 +3166,11 @@ contract types, so each compiles and is tested alone.
 var errCancelRequested = errors.New("agent: cancellation requested")
 
 type keepOptions struct {
-	Store    Store
-	Clock    Clock
-	TTL      time.Duration
+	Store Store
+	Clock Clock
+	TTL   time.Duration
+	// Interval must be more than zero and less than TTL. Any other value is
+	// replaced by a third of TTL and reported once in the log as an error.
 	Interval time.Duration
 	Logger   *slog.Logger
 }
@@ -3177,6 +3180,17 @@ type keepOptions struct {
 // the lease gone or no heartbeat has succeeded for a whole TTL, and with
 // cause errCancelRequested when a heartbeat reports the request.
 //
+// After a cancel request the heartbeats go on until stop, so the caller has
+// as long as it needs to finish the run as cancelled; a lease lost after
+// that ends the heartbeats and leaves the cause as it was.
+//
+// A lease another process took is noticed at most one Interval and one
+// round trip to the store after the takeover. With the store failing,
+// another process may claim the run from the last heartbeat that succeeded
+// plus the TTL, and the held context ends less than two Intervals after
+// that. Until a first heartbeat has succeeded the TTL is counted from the
+// call to keep.
+//
 // stop returns once the goroutine that makes the heartbeats has exited, and
 // releases the held context: one still live ends with context.Canceled as
 // its cause. Whatever is written after stop is written under ctx.
@@ -3185,7 +3199,10 @@ func keep(ctx context.Context, lease Lease, opts keepOptions) (held context.Cont
 // invoke.go
 
 // outcome is what one execution of a tool produced. retry is set, and the
-// rest empty, when the tool's error wraps ErrTransient.
+// rest empty, when the tool's error wraps ErrTransient. It is then an error
+// that unwraps to the tool's own and carries its text, read in the tool's
+// goroutine and made fit for the journal, so the caller can record it
+// without calling into the tool's code.
 //
 // retry is also set, and the rest empty, when the context invoke was given
 // ended before a result was taken: it is then that context's cause. Either
@@ -3202,9 +3219,9 @@ type outcome struct {
 // journal cannot hold refused: one over 1 MiB, one that is not valid UTF-8,
 // one with a NUL byte. The fixed result texts are those in 6.4.
 //
-// timeout is the whole bound: invoke does not read Tool.Timeout, and a
-// timeout of zero or less does not run the tool. A nil logger is
-// slog.Default.
+// timeout is the whole bound: invoke does not read Tool.Timeout. With a
+// timeout of zero or less the tool is not run, and the result says so. A
+// nil logger is slog.Default.
 func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration, logger *slog.Logger) outcome
 
 // actionFor is the Action the Guard is asked about: the tool's own, or the

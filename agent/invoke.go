@@ -16,7 +16,10 @@ import (
 const maxResultBytes = 1 << 20
 
 // outcome is what one execution of a tool produced. retry is set, and the
-// rest empty, when the tool's error wraps ErrTransient.
+// rest empty, when the tool's error wraps ErrTransient. It is then an error
+// that unwraps to the tool's own and carries its text, read in the tool's
+// goroutine and made fit for the journal, so the caller can record it
+// without calling into the tool's code.
 //
 // retry is also set, and the rest empty, when the context invoke was given
 // ended before a result was taken: it is then that context's cause. Either
@@ -34,7 +37,7 @@ type toolReturn struct {
 	// text is the tool's result, or its error's text when failed is set.
 	text   string
 	failed bool
-	// transient is the tool's error when it wraps ErrTransient.
+	// transient is the tool's error, wrapped, when it wraps ErrTransient.
 	transient error
 	// panicked is also set for a tool that ended its goroutine without
 	// returning.
@@ -48,9 +51,9 @@ type toolReturn struct {
 //
 // timeout is the whole bound. The tool's own Timeout, its default, and what
 // is left of the run's budget are the caller's to work out: invoke does not
-// read Tool.Timeout. A timeout of zero or less has already passed, so the
-// tool is not run and the result is the timed-out text. A nil logger is
-// slog.Default.
+// read Tool.Timeout. With a timeout of zero or less the tool is not run,
+// and the result says so: "tool was given no time to run", an error result.
+// A nil logger is slog.Default.
 //
 // What comes back, in the order the cases are tried:
 //
@@ -65,7 +68,10 @@ type toolReturn struct {
 //     an error result. The value and the stack go to logger, with the tool,
 //     the run, the step and the attempt. The call's arguments are not
 //     logged, and the value is not put in the result.
-//   - The tool's error wraps ErrTransient: retry is that error.
+//   - The tool's error wraps ErrTransient: retry is a transientError
+//     holding it. Its text was read where a panic is recovered and made fit
+//     for the journal by journalText, and errors.Is and errors.As see
+//     through it to the tool's error.
 //   - Any other error: its text, as an error result, made fit for the
 //     journal by journalText. Only then is it measured: over 1 MiB it is
 //     replaced by "result too large: <n> bytes".
@@ -90,7 +96,10 @@ type toolReturn struct {
 // what it returns is dropped, and a panic in it is still recovered and
 // logged. A tool that never returns therefore costs a goroutine for the
 // life of the process, and may still be doing its work after the model has
-// been told it timed out: honouring the context is the tool's part.
+// been told it timed out. After a takeover, such a tool runs on beside the
+// next worker's execution of the same call, for as long as it likes: the
+// two share the idempotency key and nothing else. Honouring the context is
+// the tool's part.
 func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration, logger *slog.Logger) outcome {
 	if logger == nil {
 		logger = slog.Default()
@@ -99,7 +108,7 @@ func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration
 		return outcome{retry: context.Cause(ctx)}
 	}
 	if timeout <= 0 {
-		return timedOut(timeout)
+		return outcome{result: "tool was given no time to run", isError: true}
 	}
 	bounded, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -131,7 +140,7 @@ func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration
 		case err == nil:
 			ret.text = result
 		case errors.Is(err, ErrTransient):
-			ret.transient = err
+			ret.transient = &transientError{text: journalText(err.Error()), err: err}
 		default:
 			ret.text, ret.failed = err.Error(), true
 		}
@@ -147,7 +156,7 @@ func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration
 	case ctx.Err() != nil:
 		return outcome{retry: context.Cause(ctx)}
 	case bounded.Err() != nil:
-		return timedOut(timeout)
+		return outcome{result: "timed out after " + timeout.String(), isError: true}
 	case ret.panicked:
 		return outcome{result: "tool panicked", isError: true}
 	case ret.transient != nil:
@@ -168,13 +177,21 @@ func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration
 	return outcome{result: ret.text}
 }
 
-func timedOut(timeout time.Duration) outcome {
-	return outcome{result: "timed out after " + timeout.String(), isError: true}
-}
-
 func tooLarge(bytes int) outcome {
 	return outcome{result: fmt.Sprintf("result too large: %d bytes", bytes), isError: true}
 }
+
+// transientError is a tool's transient error with its text already read.
+// Whatever records the error reads the text, and does so on the executor's
+// goroutine, where a panic in the tool's own Error method would not be
+// recovered.
+type transientError struct {
+	text string
+	err  error
+}
+
+func (e *transientError) Error() string { return e.text }
+func (e *transientError) Unwrap() error { return e.err }
 
 // journalText is text as the journal can hold it. Postgres refuses, in a
 // text column, bytes that are not UTF-8 and the NUL byte: the first are
