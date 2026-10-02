@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -84,6 +85,117 @@ func TestClient_Generate_ToolCallWithNoArguments(t *testing.T) {
 			assert.Equal(t, `{}`, string(resp.Message.ToolCalls[0].Input))
 			_, err := json.Marshal(resp.Message)
 			require.NoError(t, err, "the message must survive a journal's json.Marshal")
+		})
+	}
+}
+
+// The empty arguments of one reply are not the empty arguments of the next:
+// a caller that edits a call's input in place changes that call and no
+// other.
+func TestClient_Generate_EmptyArgumentsAreNotShared(t *testing.T) {
+	const body = `{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5",` +
+		`"content":[{"type":"tool_use","id":"toolu_1","name":"now","input":null},{"type":"tool_use","id":"toolu_2","name":"today"}],` +
+		`"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`
+	api := newFakeAPI(t, replyJSON(body))
+	c := api.client(t, anthropic.Options{})
+	ctx := context.Background()
+
+	first, err := c.Generate(ctx, llm.Request{Messages: hello()})
+	require.NoError(t, err)
+	require.Len(t, first.Message.ToolCalls, 2)
+	require.Equal(t, `{}`, string(first.Message.ToolCalls[0].Input))
+	// The caller writes over the bytes it was given.
+	copy(first.Message.ToolCalls[0].Input, `[]`)
+
+	assert.Equal(t, `{}`, string(first.Message.ToolCalls[1].Input), "the reply's other call")
+	second, err := c.Generate(ctx, llm.Request{Messages: hello()})
+	require.NoError(t, err)
+	assert.Equal(t, `{}`, string(second.Message.ToolCalls[0].Input), "the next reply")
+
+	// And a call with no arguments is still sent with an empty object.
+	_, err = c.Generate(ctx, llm.Request{Messages: []llm.Message{
+		userTurn("Hello"),
+		{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "now"}}},
+	}})
+	require.NoError(t, err)
+	assert.Contains(t, string(api.last(t).Body), `"name":"now","input":{}}`)
+
+	// The same of a streamed reply's.
+	events := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"now","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":9}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	streamed, _, err := stream(t, anthropic.Options{}, events)
+	require.NoError(t, err)
+	copy(streamed.Message.ToolCalls[0].Input, `[]`)
+	again, _, err := stream(t, anthropic.Options{}, events)
+	require.NoError(t, err)
+	assert.Equal(t, `{}`, string(again.Message.ToolCalls[0].Input))
+}
+
+// A thinking block with no signature cannot go back: the reference says one
+// sent back with an empty signature fails, and a run that replayed it would
+// be stuck there. It is left out of the provider's form of the turn, and so
+// is any thinking after it in the turn, since the reference also says a gap
+// in the run of thinking blocks invalidates the ones after it.
+func TestClient_Generate_ThinkingWithNoSignatureIsNotKept(t *testing.T) {
+	const (
+		signedA  = `{"type":"thinking","thinking":"","signature":"EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds"}`
+		unsigned = `{"type":"thinking","thinking":"left unsigned","signature":""}`
+		missing  = `{"type":"thinking","thinking":"left unsigned"}`
+		signedB  = `{"type":"thinking","thinking":"","signature":"ErUBCkYIBxgCIkDx8Yk3gYq0oSmJ7oQp1nZk2bWc9hV"}`
+		redacted = `{"type":"redacted_thinking","data":"EmwKAhgBEgy3va3pzix"}`
+		text     = `{"type":"text","text":"I'll check."}`
+		call     = `{"type":"tool_use","id":"toolu_1","name":"now","input":{"zone":"UTC"}}`
+	)
+	tests := []struct {
+		name     string
+		content  []string
+		want     []string
+		wantWarn bool
+	}{
+		{name: "every block signed: nothing is dropped", content: []string{signedA, redacted, signedB, text, call}, want: []string{signedA, redacted, signedB, text, call}},
+		{name: "an empty signature", content: []string{unsigned, text, call}, want: []string{text, call}, wantWarn: true},
+		{name: "no signature at all", content: []string{missing, text, call}, want: []string{text, call}, wantWarn: true},
+		{
+			name:    "the thinking after it goes too, and the thinking before it stays",
+			content: []string{signedA, unsigned, signedB, redacted, text, call},
+			want:    []string{signedA, text, call}, wantWarn: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, logged := captureLog()
+			api := newFakeAPI(t, replyJSON(`{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5",`+
+				`"content":`+jsonArray(tt.content)+`,"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`))
+			resp, err := api.client(t, anthropic.Options{Logger: logger}).Generate(context.Background(), llm.Request{Messages: hello()})
+			require.NoError(t, err)
+
+			require.NotNil(t, resp.Message.Opaque)
+			assert.JSONEq(t, jsonArray(tt.want), string(resp.Message.Opaque.Data))
+			assert.Equal(t, "I'll check.", resp.Message.Text)
+			require.Len(t, resp.Message.ToolCalls, 1)
+			if tt.wantWarn {
+				assert.Equal(t, 1, strings.Count(logged.String(), "level=WARN"), logged.String())
+				assert.Contains(t, logged.String(), "signature")
+			} else {
+				assert.Empty(t, logged.String())
+			}
 		})
 	}
 }
@@ -268,6 +380,13 @@ func TestClient_Generate_Billing(t *testing.T) {
 			wantUsage: llm.Usage{InputTokens: 412}, wantBilled: 412,
 		},
 		{
+			// The reference says the billed set may change. A category this
+			// package has not heard of is not one it knows to be free.
+			name:      "a refusal before any output, in a category this package does not know, is taken as billed",
+			body:      refusedHead + `"stop_details":{"type":"refusal","category":"a_category_from_the_future","explanation":"x"},"usage":{"input_tokens":412,"output_tokens":0}}`,
+			wantUsage: llm.Usage{InputTokens: 412}, wantBilled: 412,
+		},
+		{
 			name:      "a refusal after some output is billed whatever its category",
 			body:      refusedHead + `"stop_details":{"type":"refusal","category":"cyber","explanation":"x"},"usage":{"input_tokens":412,"output_tokens":37}}`,
 			wantUsage: llm.Usage{InputTokens: 412, OutputTokens: 37}, wantBilled: 449,
@@ -298,6 +417,26 @@ func TestClient_Generate_Billing(t *testing.T) {
 		{
 			name:      "the first model declined before any output, with no category",
 			body:      fallback("claude-sonnet-5-5", []string{fmt.Sprintf(toSonnet, `null`), answer}, opusDeclined, sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5"},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 803,
+		},
+		{
+			name:      "the first model declined before any output, in a category this package does not know",
+			body:      fallback("claude-sonnet-5-5", []string{fmt.Sprintf(toSonnet, `"a_category_from_the_future"`), answer}, opusDeclined, sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 535}},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 535 + 803,
+		},
+		{
+			name:      "the first model declined before any output, in the other category that is not billed",
+			body:      fallback("claude-sonnet-5-5", []string{fmt.Sprintf(toSonnet, `"general_harms"`), answer}, opusDeclined, sonnetServed),
 			wantUsage: served,
 			wantAttempts: []llm.Attempt{
 				{Model: "claude-opus-5-5"},
@@ -666,6 +805,11 @@ func TestClient_Generate_ReplyThatIsNotAMessage(t *testing.T) {
 		{name: "content that is null", body: `{"id":"msg_01","content":null,"stop_reason":"end_turn"}`},
 		{name: "no content", body: `{"id":"msg_01","stop_reason":"end_turn"}`},
 		{name: "a block that is not an object", body: `{"id":"msg_01","content":["text"],"stop_reason":"end_turn"}`},
+		{name: "a block that is null", body: `{"id":"msg_01","content":[null],"stop_reason":"end_turn"}`},
+		// The reference: "In non-streaming mode this value is always
+		// non-null." A reply without one is not a reply an engine can act on.
+		{name: "no stop reason", body: `{"id":"msg_01","content":[{"type":"text","text":"ok"}],"stop_reason":null}`},
+		{name: "no stop reason at all", body: `{"id":"msg_01","content":[{"type":"text","text":"ok"}]}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -682,6 +826,49 @@ func TestClient_Generate_ReplyThatIsNotAMessage(t *testing.T) {
 			assert.False(t, e.Retryable)
 		})
 	}
+}
+
+// The record of attempts is a few entries long: the hops of a fallback and
+// the turns of a server-side tool loop. Each entry costs a struct some fifty
+// times the size of the shortest JSON that makes one, so a record of
+// thousands is refused instead of held.
+func TestClient_UsageIterationsAreBounded(t *testing.T) {
+	entries := strings.TrimSuffix(strings.Repeat(`{},`, 5000), ",")
+	body := `{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],` +
+		`"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"iterations":[` + entries + `]}}`
+	events := strings.Replace(okStream, `"usage":{"output_tokens":1}}`, `"usage":{"output_tokens":1,"iterations":[`+entries+`]}}`, 1)
+	require.NotEqual(t, okStream, events)
+
+	api := newFakeAPI(t, replyEither(body, events))
+	c := api.client(t, anthropic.Options{})
+	check := func(t *testing.T, resp *llm.Response, err error) {
+		t.Helper()
+		require.Error(t, err)
+		assert.Nil(t, resp)
+		assert.Contains(t, err.Error(), "iterations")
+		assert.False(t, llm.Retryable(err))
+	}
+	resp, err := c.Generate(context.Background(), llm.Request{Messages: hello()})
+	check(t, resp, err)
+	resp, err = c.Stream(context.Background(), llm.Request{Messages: hello()}, func(llm.Delta) error { return nil })
+	check(t, resp, err)
+
+	for _, record := range []string{`5`, `[5]`, `{"type":"message"}`} {
+		t.Run("a record that is not a list of entries: "+record, func(t *testing.T) {
+			api := newFakeAPI(t, replyJSON(`{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],`+
+				`"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"iterations":`+record+`}}`))
+			resp, err := api.client(t, anthropic.Options{}).Generate(context.Background(), llm.Request{Messages: hello()})
+			check(t, resp, err)
+			var e *llm.Error
+			require.ErrorAs(t, err, &e)
+		})
+	}
+
+	t.Run("a null record is none", func(t *testing.T) {
+		resp := generate(t, `{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],`+
+			`"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"iterations":null}}`)
+		assert.Empty(t, resp.Attempts)
+	})
 }
 
 // An error object in a body that came with a 200 is still the API's error.

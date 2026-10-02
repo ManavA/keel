@@ -117,6 +117,18 @@ func (f *fakeAPI) clientWithin(t *testing.T, opts anthropic.Options, timeout tim
 	return c
 }
 
+// smallBound is the bound the size tests hold a reply to in place of 32 MiB,
+// so that a test of the bound need not move 33 MiB to pass it.
+const smallBound = 1 << 20
+
+// clientSmall is a client that holds a reply to smallBound.
+func (f *fakeAPI) clientSmall(t *testing.T) *anthropic.Client {
+	t.Helper()
+	c, err := anthropic.NewWithBound(anthropic.Options{APIKey: testKey, BaseURL: f.srv.URL}, smallBound)
+	require.NoError(t, err)
+	return c
+}
+
 // last returns the most recent request.
 func (f *fakeAPI) last(t *testing.T) received {
 	t.Helper()

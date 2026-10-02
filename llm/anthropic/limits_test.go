@@ -2,6 +2,7 @@ package anthropic_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -190,55 +191,66 @@ func TestClient_Stream_IdleLimit(t *testing.T) {
 		assert.Equal(t, "Hello!", resp.Message.Text)
 	})
 
+	// The next three must not fail because the machine was busy. The limit is
+	// three quarters of a second and the server sends every fifteen
+	// milliseconds, so the scheduler can lose half a second and the stream
+	// still be alive. They run side by side to keep the suite short.
+	const patient = 750 * time.Millisecond
+	const beat = patient / 50
+
 	t.Run("keep-alive pings inside a long gap keep the stream alive", func(t *testing.T) {
-		// Five times the limit passes between the two halves of the reply,
-		// and never the limit between two events.
-		parts := append(append([]string{head}, pings(50)...), tail)
-		api := newFakeAPI(t, replyPaced(limit/10, parts...))
-		c := api.client(t, anthropic.Options{IdleTimeout: limit})
+		t.Parallel()
+		// Twice the limit passes between the two halves of the reply, and
+		// never the limit between two events.
+		parts := append(append([]string{head}, pings(100)...), tail)
+		api := newFakeAPI(t, replyPaced(beat, parts...))
+		c := api.client(t, anthropic.Options{IdleTimeout: patient})
 
 		started := time.Now()
 		resp, err := c.Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
 		require.NoError(t, err)
 		assert.Equal(t, "Hello!", resp.Message.Text)
-		require.Greater(t, time.Since(started), limit, "the stream must outlast the limit it is being tested against")
+		require.Greater(t, time.Since(started), patient, "the stream must outlast the limit it is being tested against")
 	})
 
 	t.Run("comment lines are bytes from the server too", func(t *testing.T) {
-		// No event arrives for five times the limit. The server is plainly
-		// alive all the while, and that is what the limit is about.
-		comments := make([]string, 50)
+		t.Parallel()
+		// No event arrives for twice the limit. The server is plainly alive
+		// all the while, and that is what the limit is about.
+		comments := make([]string, 100)
 		for i := range comments {
 			comments[i] = ": keep-alive\n\n"
 		}
 		parts := append(append([]string{head}, comments...), tail)
-		api := newFakeAPI(t, replyPaced(limit/10, parts...))
-		c := api.client(t, anthropic.Options{IdleTimeout: limit})
+		api := newFakeAPI(t, replyPaced(beat, parts...))
+		c := api.client(t, anthropic.Options{IdleTimeout: patient})
 
 		started := time.Now()
 		resp, err := c.Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
 		require.NoError(t, err)
 		assert.Equal(t, "Hello!", resp.Message.Text)
-		require.Greater(t, time.Since(started), limit, "the stream must outlast the limit it is being tested against")
+		require.Greater(t, time.Since(started), patient, "the stream must outlast the limit it is being tested against")
 	})
 
 	t.Run("a callback slower than the limit is not the server's silence", func(t *testing.T) {
-		// Events arrive steadily. It is fn that takes twice the limit over
-		// each delta, and backpressure from the caller is not a stall.
+		t.Parallel()
+		// Events arrive steadily. It is fn that takes longer than the limit
+		// over a delta, twice, and backpressure from the caller is not a
+		// stall.
 		parts := strings.SplitAfter(fixture(t, "stream_tool_use.sse"), "\n\n")
-		api := newFakeAPI(t, replyPaced(limit/20, parts...))
-		c := api.client(t, anthropic.Options{IdleTimeout: limit})
+		api := newFakeAPI(t, replyPaced(beat, parts...))
+		c := api.client(t, anthropic.Options{IdleTimeout: patient})
 
 		slow := 0
 		resp, err := c.Stream(context.Background(), llm.Request{Messages: hello()}, func(llm.Delta) error {
-			if slow < 3 {
+			if slow < 2 {
 				slow++
-				time.Sleep(2 * limit)
+				time.Sleep(patient + patient/5)
 			}
 			return nil
 		})
 		require.NoError(t, err)
-		assert.Equal(t, 3, slow)
+		assert.Equal(t, 2, slow)
 		assert.Equal(t, llm.StopToolUse, resp.Stop)
 		assert.Equal(t, "Okay, let's check the weather for San Francisco, CA:", resp.Message.Text)
 	})
@@ -276,10 +288,13 @@ func TestClient_Stream_IdleLimit(t *testing.T) {
 }
 
 // megabyteDelta is a text delta one megabyte long.
-func megabyteDelta() string {
+func megabyteDelta() string { return textDeltaOf(1 << 20) }
+
+// textDeltaOf is a text delta for block 0 whose text is n bytes long.
+func textDeltaOf(n int) string {
 	return "event: content_block_delta\n" +
 		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"` +
-		strings.Repeat("a", 1<<20) + `"}}` + "\n\n"
+		strings.Repeat("a", n) + `"}}` + "\n\n"
 }
 
 // replyEvents answers with head, then count copies of event, then tail.
@@ -298,28 +313,33 @@ func replyEvents(head, event string, count int, tail string) reply {
 	}
 }
 
-func TestClient_Stream_SizeBounds(t *testing.T) {
+// sizeRefused asserts that a call failed for passing a size bound. That is a
+// plain error: the same request would pass the bound again, so there is
+// nothing to retry and nothing of the API's to report.
+func sizeRefused(t *testing.T, resp *llm.Response, err error) {
+	t.Helper()
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "larger than")
+	assert.False(t, llm.Retryable(err))
+	var e *llm.Error
+	assert.NotErrorAs(t, err, &e)
+}
+
+// The bounds as a caller meets them, at their real sizes.
+func TestClient_Stream_SizeBoundsAtFullSize(t *testing.T) {
 	head, tail := textStreamInTwo(t)
 
-	// Passing a size bound is a plain error: the same request would pass it
-	// again, so there is nothing to retry and nothing of the API's to report.
-	refused := func(t *testing.T, resp *llm.Response, err error) {
-		t.Helper()
-		require.Error(t, err)
-		assert.Nil(t, resp)
-		assert.Contains(t, err.Error(), "larger than")
-		assert.False(t, llm.Retryable(err))
-		var e *llm.Error
-		assert.NotErrorAs(t, err, &e)
-	}
+	t.Run("the bound is 32 MiB", func(t *testing.T) {
+		c, err := anthropic.New(anthropic.Options{APIKey: testKey})
+		require.NoError(t, err)
+		assert.Equal(t, int64(32<<20), c.Bound())
+	})
 
 	t.Run("one event over the event bound is refused", func(t *testing.T) {
-		huge := "event: content_block_delta\n" +
-			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"` +
-			strings.Repeat("a", 17<<20) + `"}}` + "\n\n"
-		api := newFakeAPI(t, replyEvents(head, huge, 1, tail))
+		api := newFakeAPI(t, replyEvents(head, textDeltaOf(17<<20), 1, tail))
 		resp, err := api.client(t, anthropic.Options{}).Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
-		refused(t, resp, err)
+		sizeRefused(t, resp, err)
 	})
 
 	t.Run("a reply that outgrows the body bound is refused", func(t *testing.T) {
@@ -327,87 +347,204 @@ func TestClient_Stream_SizeBounds(t *testing.T) {
 		// add up to that passes 32 MiB.
 		api := newFakeAPI(t, replyEvents(head, megabyteDelta(), 33, tail))
 		resp, err := api.client(t, anthropic.Options{}).Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
-		refused(t, resp, err)
+		sizeRefused(t, resp, err)
+	})
+}
+
+// What the bound counts. The bound here is one megabyte in place of 32, set
+// through a hook, so that these tests need not move 33 MiB each; the code
+// they run is the code that holds a reply to 32.
+func TestClient_Stream_SizeBounds(t *testing.T) {
+	const bound = smallBound
+	// piece is a thirty-second of the bound.
+	const piece = bound / 32
+	head, tail := textStreamInTwo(t)
+	closeBlock := "event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": 0}\n\n"
+	stop := "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+
+	run := func(t *testing.T, answer reply) (*llm.Response, error) {
+		t.Helper()
+		api := newFakeAPI(t, answer)
+		return api.clientSmall(t).Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
+	}
+
+	t.Run("a reply that outgrows the bound is refused", func(t *testing.T) {
+		resp, err := run(t, replyEvents(head, textDeltaOf(piece), 33, tail))
+		sizeRefused(t, resp, err)
+	})
+
+	t.Run("a reply just under the bound is read", func(t *testing.T) {
+		resp, err := run(t, replyEvents(head, textDeltaOf(piece), 31, tail))
+		require.NoError(t, err)
+		assert.Len(t, resp.Message.Text, len("Hello!")+31*piece)
 	})
 
 	t.Run("content that arrives in the start of a block counts too", func(t *testing.T) {
-		// Thirty-three text blocks, each a megabyte long as it starts and
-		// with no delta after.
-		megabyte := strings.Repeat("a", 1<<20)
+		// Thirty-three text blocks, each a piece long as it starts and with
+		// no delta after.
+		text := strings.Repeat("a", piece)
 		var blocks strings.Builder
 		for i := range 33 {
 			blocks.WriteString("event: content_block_start\n" +
-				`data: {"type":"content_block_start","index":` + strconv.Itoa(i+1) + `,"content_block":{"type":"text","text":"` + megabyte + `"}}` + "\n\n")
+				`data: {"type":"content_block_start","index":` + strconv.Itoa(i+1) + `,"content_block":{"type":"text","text":"` + text + `"}}` + "\n\n")
 		}
-		api := newFakeAPI(t, replyStream(head+blocks.String()+tail))
-		resp, err := api.client(t, anthropic.Options{}).Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
-		refused(t, resp, err)
+		resp, err := run(t, replyStream(head+blocks.String()+tail))
+		sizeRefused(t, resp, err)
 	})
 
 	t.Run("tool-call names and ids count as much as text does", func(t *testing.T) {
 		// Forty tool calls with no arguments at all, each with a name a
-		// megabyte long. A bound that counted only text and arguments would
-		// let all forty megabytes through.
-		megabyte := strings.Repeat("a", 1<<20)
+		// piece long. A bound that counted only text and arguments would let
+		// all forty through.
+		name := strings.Repeat("a", piece)
 		var blocks strings.Builder
 		for i := range 40 {
 			index := strconv.Itoa(i + 1)
 			blocks.WriteString("event: content_block_start\n" +
-				`data: {"type":"content_block_start","index":` + index + `,"content_block":{"type":"tool_use","id":"toolu_` + index + `","name":"` + megabyte + `","input":{}}}` + "\n\n" +
+				`data: {"type":"content_block_start","index":` + index + `,"content_block":{"type":"tool_use","id":"toolu_` + index + `","name":"` + name + `","input":{}}}` + "\n\n" +
 				"event: content_block_stop\n" + `data: {"type":"content_block_stop","index":` + index + `}` + "\n\n")
 		}
-		api := newFakeAPI(t, replyStream(head+blocks.String()+tail))
-		resp, err := api.client(t, anthropic.Options{}).Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
-		refused(t, resp, err)
+		resp, err := run(t, replyStream(head+blocks.String()+tail))
+		sizeRefused(t, resp, err)
 	})
 
 	t.Run("what the message itself carries counts too", func(t *testing.T) {
-		// An id fifteen megabytes long and eighteen megabytes of text: each
-		// under the bound, and the reply that keeps both over it.
+		// An id fifteen pieces long and eighteen pieces of text: each under
+		// the bound, and the reply that keeps both over it.
 		start, rest, ok := strings.Cut(head, `"id": "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY"`)
 		require.True(t, ok, "the fixture's message_start no longer has the id this test replaces")
-		long := start + `"id": "` + strings.Repeat("m", 15<<20) + `"` + rest
-		api := newFakeAPI(t, replyEvents(long, megabyteDelta(), 18, tail))
-		resp, err := api.client(t, anthropic.Options{}).Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
-		refused(t, resp, err)
+		long := start + `"id": "` + strings.Repeat("m", 15*piece) + `"` + rest
+		resp, err := run(t, replyEvents(long, textDeltaOf(piece), 18, tail))
+		sizeRefused(t, resp, err)
 	})
 
-	t.Run("how the reply ended counts too, and only as it last stood", func(t *testing.T) {
-		// A refusal whose explanation is twelve megabytes long.
-		ending := func(stop string) string {
-			return "event: message_delta\n" +
-				`data: {"type":"message_delta","delta":{"stop_reason":"` + stop + `","stop_sequence":null,"stop_details":{"type":"refusal","category":"bio","explanation":"` +
-				strings.Repeat("e", 12<<20) + `"}},"usage":{"output_tokens":15}}` + "\n\n"
+	t.Run("how the reply ended counts too", func(t *testing.T) {
+		// Twenty-one pieces of text and a refusal whose explanation is
+		// twelve pieces long.
+		ending := "event: message_delta\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"bio","explanation":"` +
+			strings.Repeat("e", 12*piece) + `"}},"usage":{"output_tokens":15}}` + "\n\n"
+		resp, err := run(t, replyEvents(head, textDeltaOf(piece), 21, closeBlock+ending+stop))
+		sizeRefused(t, resp, err)
+	})
+
+	t.Run("a block costs more than its JSON", func(t *testing.T) {
+		// Three thousand blocks of two bytes each, six kilobytes of JSON in
+		// all. Each one costs the process a struct, a map and their entries,
+		// and a stream of a million of them held four hundred megabytes
+		// while it was counted as two.
+		var blocks strings.Builder
+		for i := range 3000 {
+			blocks.WriteString("event: content_block_start\n" +
+				`data: {"type":"content_block_start","index":` + strconv.Itoa(i+1) + `,"content_block":{}}` + "\n\n")
 		}
-		stop := "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-		closeBlock := "event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": 0}\n\n"
-
-		// Twenty-one megabytes of text and twelve of explanation is too much.
-		api := newFakeAPI(t, replyEvents(head, megabyteDelta(), 21, closeBlock+ending("refusal")+stop))
-		resp, err := api.client(t, anthropic.Options{}).Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
-		refused(t, resp, err)
-
-		// Ten of text and two endings of twelve is not: the second ending
-		// replaces the first, and the reply keeps twenty-two.
-		api = newFakeAPI(t, replyEvents(head, megabyteDelta(), 10, closeBlock+ending("end_turn")+ending("refusal")+stop))
-		resp, err = api.client(t, anthropic.Options{}).Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
-		require.NoError(t, err)
-		assert.Equal(t, llm.StopRefusal, resp.Stop)
-		assert.Len(t, resp.Refusal.Explanation, 12<<20)
+		resp, err := run(t, replyStream(head+blocks.String()+tail))
+		sizeRefused(t, resp, err)
 	})
 
-	t.Run("an error status with a body past the body bound is still that status", func(t *testing.T) {
-		megabyte := strings.Repeat("a", 1<<20)
+	t.Run("text a block started with is held twice once a delta extends it", func(t *testing.T) {
+		// A block that starts with twenty pieces of text keeps them as it
+		// came and again in the text the deltas build on: forty pieces held.
+		open := "event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":"` + strings.Repeat("a", 20*piece) + `"}}` + "\n\n"
+		more := "event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"!"}}` + "\n\n"
+		resp, err := run(t, replyStream(head+open+more+tail))
+		sizeRefused(t, resp, err)
+
+		// With no delta it is held once, and twenty pieces fit.
+		resp, err = run(t, replyStream(head+open+tail))
+		require.NoError(t, err)
+		assert.Len(t, resp.Message.Text, len("Hello!")+20*piece)
+	})
+
+	t.Run("a block of many fields costs its bytes, and all of them are kept", func(t *testing.T) {
+		// One block of twenty thousand fields this package has never heard
+		// of. They are copied through one at a time, not held in a map, so
+		// the block costs what it weighs and comes out as it went in.
+		var fields strings.Builder
+		for i := range 20000 {
+			fields.WriteString(`,"f` + strconv.Itoa(i) + `":1`)
+		}
+		block := "event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""` + fields.String() + `}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" And more."}}` + "\n\n"
+		require.Less(t, len(block), bound/4)
+		resp, err := run(t, replyStream(head+block+tail))
+		require.NoError(t, err)
+
+		assert.Equal(t, "Hello! And more.", resp.Message.Text)
+		var kept []json.RawMessage
+		require.NoError(t, json.Unmarshal(resp.Message.Opaque.Data, &kept))
+		require.Len(t, kept, 2)
+		assert.Equal(t, `{"type":"text","text":" And more."`+fields.String()+`}`, string(kept[1]),
+			"every field, in the order it came, with the text the deltas added")
+	})
+
+	t.Run("a later ending that is smaller takes nothing back", func(t *testing.T) {
+		// A refusal with an explanation fifteen pieces long, then an ending
+		// that says nothing, then thirty pieces of text. The explanation is
+		// still held, and so the reply is forty-five pieces.
+		long := "event: message_delta\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"bio","explanation":"` +
+			strings.Repeat("e", 15*piece) + `"}},"usage":{"output_tokens":15}}` + "\n\n"
+		tiny := "event: message_delta\n" + `data: {"type":"message_delta","delta":{},"usage":{"output_tokens":16}}` + "\n\n"
+		resp, err := run(t, replyEvents(head+long+tiny, textDeltaOf(piece), 30, closeBlock+stop))
+		sizeRefused(t, resp, err)
+	})
+
+	t.Run("bytes are counted as they are kept, escapes and all", func(t *testing.T) {
+		// Each delta is ten pieces of the character U+0000 over twelve
+		// deltas: a third of a megabyte once decoded, and two megabytes in
+		// the provider's form of the turn, which holds it as it must be
+		// written, six bytes to the character.
+		nul := "event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"` +
+			strings.Repeat(`\u0000`, piece) + `"}}` + "\n\n"
+		resp, err := run(t, replyEvents(head, nul, 12, tail))
+		sizeRefused(t, resp, err)
+	})
+
+	t.Run("the same holds of tool arguments and of thinking", func(t *testing.T) {
+		for _, tt := range []struct{ name, block, delta string }{
+			{
+				name:  "tool arguments",
+				block: `{"type":"tool_use","id":"toolu_1","name":"now","input":{}}`,
+				delta: `{"type":"input_json_delta","partial_json":"` + strings.Repeat(`\u0000`, piece) + `"}`,
+			},
+			{
+				name:  "thinking",
+				block: `{"type":"thinking","thinking":"","signature":""}`,
+				delta: `{"type":"thinking_delta","thinking":"` + strings.Repeat(`\u0000`, piece) + `"}`,
+			},
+			{
+				name:  "a signature",
+				block: `{"type":"thinking","thinking":"","signature":""}`,
+				delta: `{"type":"signature_delta","signature":"` + strings.Repeat(`\u0000`, piece) + `"}`,
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				open := "event: content_block_start\n" + `data: {"type":"content_block_start","index":1,"content_block":` + tt.block + `}` + "\n\n"
+				delta := "event: content_block_delta\n" + `data: {"type":"content_block_delta","index":1,"delta":` + tt.delta + `}` + "\n\n"
+				resp, err := run(t, replyEvents(head+open, delta, 12, tail))
+				sizeRefused(t, resp, err)
+			})
+		}
+	})
+
+	t.Run("an error status with a body past the bound is still that status", func(t *testing.T) {
+		chunk := strings.Repeat("a", piece)
 		api := newFakeAPI(t, func(w http.ResponseWriter, _ received) {
 			w.Header().Set("request-id", requestID)
 			w.WriteHeader(http.StatusBadGateway)
 			for range 33 {
-				if _, err := io.WriteString(w, megabyte); err != nil {
+				if _, err := io.WriteString(w, chunk); err != nil {
 					return
 				}
 			}
 		})
-		c := api.client(t, anthropic.Options{})
+		c := api.clientSmall(t)
 		check := func(t *testing.T, resp *llm.Response, err error) {
 			t.Helper()
 			assert.Nil(t, resp)
@@ -424,21 +561,45 @@ func TestClient_Stream_SizeBounds(t *testing.T) {
 		check(t, resp, err)
 	})
 
+	t.Run("a 200 that is not a stream is held to the bound as well", func(t *testing.T) {
+		api := newFakeAPI(t, func(w http.ResponseWriter, _ received) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"padding":"`+strings.Repeat("a", bound)+`"}`)
+		})
+		resp, err := api.clientSmall(t).Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
+		sizeRefused(t, resp, err)
+	})
+
 	t.Run("the bound is on the reply and not on the stream", func(t *testing.T) {
-		// More than 32 MiB passes over the wire in events that add nothing
-		// to the reply, as a long stream's keep-alives do.
-		filler := "event: note\n" + `data: {"type":"note","text":"` + strings.Repeat("a", 1<<20) + `"}` + "\n\n"
-		api := newFakeAPI(t, replyEvents(head, filler, 33, tail))
-		resp, err := api.client(t, anthropic.Options{}).Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
+		// More than the bound passes over the wire in events that add
+		// nothing to the reply, as a long stream's keep-alives do.
+		filler := "event: note\n" + `data: {"type":"note","text":"` + strings.Repeat("a", piece) + `"}` + "\n\n"
+		resp, err := run(t, replyEvents(head, filler, 33, tail))
 		require.NoError(t, err)
 		assert.Equal(t, "Hello!", resp.Message.Text)
 	})
 
-	t.Run("a reply just under the body bound is read", func(t *testing.T) {
-		api := newFakeAPI(t, replyEvents(head, megabyteDelta(), 31, tail))
-		resp, err := api.client(t, anthropic.Options{}).Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
-		require.NoError(t, err)
-		assert.Len(t, resp.Message.Text, len("Hello!")+31<<20)
+	t.Run("a body read whole pays for its blocks too", func(t *testing.T) {
+		// Three thousand empty blocks are nine kilobytes of body, and three
+		// thousand structs to hold.
+		api := newFakeAPI(t, replyJSON(`{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[`+
+			strings.TrimSuffix(strings.Repeat(`{},`, 3000), ",")+`],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		resp, err := api.clientSmall(t).Generate(context.Background(), llm.Request{Messages: hello()})
+		sizeRefused(t, resp, err)
+	})
+
+	t.Run("a body read whole is held to the same bound", func(t *testing.T) {
+		// The bytes past the bound are in a field this package does not
+		// read, so it is the body that is too large and not the reply.
+		api := newFakeAPI(t, func(w http.ResponseWriter, _ received) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],`+
+				`"padding":"`+strings.Repeat("a", bound)+`","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+		})
+		resp, err := api.clientSmall(t).Generate(context.Background(), llm.Request{Messages: hello()})
+		sizeRefused(t, resp, err)
 	})
 }
 
@@ -472,13 +633,18 @@ func TestClient_Stream_ReusesTheConnection(t *testing.T) {
 
 	c, err := anthropic.New(anthropic.Options{APIKey: testKey, BaseURL: srv.URL})
 	require.NoError(t, err)
-	const calls = 5
+	const calls = 10
 	for range calls {
 		resp, err := c.Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
 		require.NoError(t, err)
 		require.Equal(t, llm.StopToolUse, resp.Stop)
 	}
-	assert.Equal(t, int64(1), opened.Load(), "%d streams, one after another, share one connection", calls)
+	// Without the drain every stream opens a connection of its own, ten in
+	// all. With it they share one, unless the machine stalls for longer than
+	// the drain waits and a connection is given up; two such stalls in ten
+	// streams are allowed for.
+	assert.LessOrEqual(t, opened.Load(), int64(3), "%d streams, one after another, share a connection", calls)
+	t.Logf("%d streams used %d connections", calls, opened.Load())
 }
 
 // The drain has bounds of its own. A server that sends the whole reply and
@@ -1022,11 +1188,22 @@ func TestClient_Stream_IdleLimitRacesTheLastEvent(t *testing.T) {
 	head, tail := textStreamInTwo(t)
 	const limit = 20 * time.Millisecond
 
+	// The gap before the last events sweeps across the limit, a millisecond
+	// or two either side of it. Every sixth run has no gap and every sixth a
+	// gap of three limits, so that both ways of ending are certain to be
+	// seen, which the test asserts: a sweep that only ever stalled, or never
+	// did, would have raced nothing.
+	gaps := []time.Duration{
+		0,
+		limit - 2*time.Millisecond,
+		limit - time.Millisecond,
+		limit,
+		limit + time.Millisecond,
+		3 * limit,
+	}
 	var whole, stalled int
 	for i := range 60 {
-		// The gap before the last events sweeps across the limit.
-		gap := limit - 3*time.Millisecond + time.Duration(i%7)*time.Millisecond
-		api := newFakeAPI(t, replyPaced(gap, head, tail))
+		api := newFakeAPI(t, replyPaced(gaps[i%len(gaps)], head, tail))
 		c := api.client(t, anthropic.Options{IdleTimeout: limit})
 
 		resp, err := c.Stream(context.Background(), llm.Request{Messages: hello()}, noDeltas)
@@ -1047,5 +1224,7 @@ func TestClient_Stream_IdleLimitRacesTheLastEvent(t *testing.T) {
 		require.NotErrorIs(t, err, context.DeadlineExceeded, "run %d", i)
 		require.Contains(t, e.Err.Error(), "sent nothing for", "run %d", i)
 	}
+	assert.Positive(t, whole, "no run ended with the whole reply")
+	assert.Positive(t, stalled, "no run ended with a stall")
 	t.Logf("%d whole, %d stalled", whole, stalled)
 }

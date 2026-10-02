@@ -48,14 +48,17 @@ func TestIdleWatch_Expiry(t *testing.T) {
 	})
 
 	t.Run("bytes from the server start the wait's time again", func(t *testing.T) {
+		// A limit long enough that a busy machine losing half a second
+		// between two bytes does not look like silence.
+		const patient = 750 * time.Millisecond
 		var expired atomic.Int64
-		w := watchIdle(limit, func() { expired.Add(1) })
+		w := watchIdle(patient, func() { expired.Add(1) })
 		defer w.close()
 
-		w.begin(limit)
-		// Five times the limit passes, and never the limit without a byte.
-		for range 50 {
-			time.Sleep(limit / 10)
+		w.begin(patient)
+		// Twice the limit passes, and never the limit without a byte.
+		for range 100 {
+			time.Sleep(patient / 50)
 			w.touch()
 		}
 		assert.False(t, w.end())

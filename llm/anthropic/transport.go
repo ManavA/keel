@@ -114,8 +114,8 @@ func contentType(resp *http.Response) string {
 	return "of no content type"
 }
 
-// errTooLarge is what a boundedReader returns for a body past the bound.
-var errTooLarge = fmt.Errorf("the response body is larger than %d bytes", maxBodyBytes)
+// errTooLarge is what a boundedReader returns for a body past its bound.
+var errTooLarge = errors.New("the response body is larger than this package reads")
 
 // boundedReader reads up to left bytes of r and fails if r holds more, so a
 // body past the bound is an error and not an allocation without limit.

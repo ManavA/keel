@@ -1,9 +1,12 @@
 package anthropic
 
 import (
+	"bytes"
 	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/ManavA/keel/llm"
 )
@@ -43,7 +46,42 @@ type wireUsage struct {
 	wireCounts
 	// Iterations is the record of every sampling pass behind the reply. The
 	// counts above are those of the model that answered.
-	Iterations []wireIteration `json:"iterations"`
+	Iterations wireIterations `json:"iterations"`
+}
+
+// maxIterations is the most entries of usage.iterations this package reads.
+// The record holds the hops of a fallback, three at most, and the turns of a
+// server-side tool loop. An entry costs a struct some fifty times the size
+// of the shortest JSON that makes one, so a record without a bound would
+// let a small body hold a great deal.
+const maxIterations = 4096
+
+// wireIterations is usage.iterations, read one entry at a time so that a
+// record past maxIterations is refused before it is held.
+type wireIterations []wireIteration
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (it *wireIterations) UnmarshalJSON(data []byte) error {
+	if absent(data) {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
+		return errors.New("usage.iterations is not an array")
+	}
+	entries := wireIterations{}
+	for dec.More() {
+		if len(entries) == maxIterations {
+			return fmt.Errorf("usage.iterations has more than %d entries", maxIterations)
+		}
+		var entry wireIteration
+		if err := dec.Decode(&entry); err != nil {
+			return fmt.Errorf("usage.iterations: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	*it = entries
+	return nil
 }
 
 // wireIteration is one entry of usage.iterations: one sampling pass, by one
@@ -118,6 +156,9 @@ type block struct {
 	// resultFor is the tool_use_id of a block that is a server tool's
 	// result.
 	resultFor string
+	// unsigned reports a thinking block with no signature, which the API
+	// will not take back.
+	unsigned bool
 	// toModel is the model a fallback block hands over to, and declined why
 	// the model before it handed over.
 	toModel  string
@@ -135,72 +176,125 @@ type decline struct {
 
 // unbilled reports whether an attempt that ended in d and produced output
 // tokens is one the API does not bill. The refusals reference: an attempt
-// that produced output is billed; one that declined before any output is
-// billed only in the categories bio, frontier_llm and reasoning_extraction
-// (as of September 2026), and "in any other category, or with a null
-// category, is not billed". A decline the API gave no reason for is taken as
-// billed, so that a cost is never understated for want of a field.
+// that produced output is billed, and one that declined before any output is
+// billed in some categories and not in others. As the page stood in
+// September 2026 the ones not billed are cyber, general_harms and a refusal
+// with no category. The page says the billed set may change, so a category
+// this package does not know is taken as billed, and so is a decline the API
+// gave no reason for: a cost may then be too high and is never too low.
 func (d decline) unbilled(output int64) bool {
 	if output > 0 || !d.known {
 		return false
 	}
 	switch d.category {
-	case "bio", "frontier_llm", "reasoning_extraction":
-		return false
+	case "", "cyber", "general_harms":
+		return true
 	}
-	return true
+	return false
 }
 
-// decodeContent splits a content array into its blocks.
-func decodeContent(content json.RawMessage) ([]block, error) {
+// errTooManyBlocks is decodeContent's error for a content array whose blocks
+// cost more to hold than the bound allows.
+var errTooManyBlocks = errors.New("the content has more blocks than this package holds")
+
+// decodeContent splits a content array into its blocks. The blocks are read
+// one at a time and each is counted as a stream counts it, its bytes and
+// blockOverhead, so that a body of very many very small blocks is refused
+// at the bound and not held as so many structs.
+func decodeContent(content json.RawMessage, bound int64) ([]block, error) {
 	if absent(content) {
 		return nil, errors.New("it has no content array")
 	}
-	var raws []json.RawMessage
-	if err := json.Unmarshal(content, &raws); err != nil {
-		return nil, err
+	dec := json.NewDecoder(bytes.NewReader(content))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
+		return nil, errors.New("its content is not an array")
 	}
-	blocks := make([]block, len(raws))
-	for i, raw := range raws {
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &fields); err != nil {
+	var blocks []block
+	var size int64
+	for dec.More() {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
 			return nil, err
 		}
-		blocks[i] = readBlock(raw, fields)
+		if size += blockOverhead + int64(len(raw)); size > bound {
+			return nil, errTooManyBlocks
+		}
+		b, err := readBlock(raw)
+		if err != nil {
+			return nil, err
+		}
+		blocks = append(blocks, b)
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
 	}
 	return blocks, nil
 }
 
-// readBlock picks out of a block's fields the ones this package reads. It
-// reads only those its type is documented to have, so a block of a type
-// added later cannot fail to decode.
-func readBlock(raw json.RawMessage, fields map[string]json.RawMessage) block {
-	b := block{raw: raw, typ: str(fields["type"]), resultFor: str(fields["tool_use_id"])}
+// blockFields is the fields of a content block that this package reads, each
+// as it was written. Every other field of a block is passed over without
+// being held, so what a block costs to read is its own bytes and not a map
+// of however many fields it has.
+type blockFields struct {
+	Type      json.RawMessage `json:"type"`
+	Text      json.RawMessage `json:"text"`
+	Thinking  json.RawMessage `json:"thinking"`
+	Signature json.RawMessage `json:"signature"`
+	ID        json.RawMessage `json:"id"`
+	Name      json.RawMessage `json:"name"`
+	Input     json.RawMessage `json:"input"`
+	ToolUseID json.RawMessage `json:"tool_use_id"`
+	To        json.RawMessage `json:"to"`
+	Trigger   json.RawMessage `json:"trigger"`
+}
+
+// fieldsOf reads the fields of a content block. A block that is not an
+// object is an error. The fields are raw so that one of a type added later,
+// whatever its fields hold, cannot fail to decode.
+func fieldsOf(raw json.RawMessage) (blockFields, error) {
+	var fields blockFields
+	if absent(raw) {
+		return fields, errors.New("a content block is null")
+	}
+	err := json.Unmarshal(raw, &fields)
+	return fields, err
+}
+
+// readBlock picks out of a block the fields this package reads. It reads
+// only those its type is documented to have.
+func readBlock(raw json.RawMessage) (block, error) {
+	fields, err := fieldsOf(raw)
+	if err != nil {
+		return block{}, err
+	}
+	b := block{raw: raw, typ: str(fields.Type), resultFor: str(fields.ToolUseID)}
 	switch b.typ {
 	case blockText:
-		b.text = str(fields["text"])
+		b.text = str(fields.Text)
+	case blockThinking:
+		b.unsigned = str(fields.Signature) == ""
 	case blockToolUse:
-		b.id, b.name, b.input = str(fields["id"]), str(fields["name"]), fields["input"]
+		b.id, b.name, b.input = str(fields.ID), str(fields.Name), fields.Input
 		if absent(b.input) {
-			b.input = emptyObject
+			b.input = emptyObject()
 		}
 	case blockServerToolUse:
-		b.id = str(fields["id"])
+		b.id = str(fields.ID)
 	case blockFallback:
 		var to struct {
 			Model string `json:"model"`
 		}
-		if json.Unmarshal(fields["to"], &to) == nil {
+		if json.Unmarshal(fields.To, &to) == nil {
 			b.toModel = to.Model
 		}
 		var trigger *struct {
 			Category string `json:"category"`
 		}
-		if json.Unmarshal(fields["trigger"], &trigger) == nil && trigger != nil {
+		if json.Unmarshal(fields.Trigger, &trigger) == nil && trigger != nil {
 			b.declined = decline{known: true, category: trigger.Category}
 		}
 	}
-	return b
+	return b, nil
 }
 
 // str reads raw as a JSON string, and is "" for anything else.
@@ -210,6 +304,34 @@ func str(raw json.RawMessage) string {
 		return ""
 	}
 	return s
+}
+
+// signed returns the blocks of a turn without the thinking the API would
+// not take back. A thinking block with no signature fails when it is sent
+// back, so it is dropped; and the reference says a gap in the run of
+// thinking blocks invalidates the ones after it, so every thinking block
+// after it in the turn is dropped too. What is left is a run with its end
+// removed, which the reference allows. dropped is how many blocks went.
+func signed(blocks []block) (kept []block, dropped int) {
+	from := -1
+	for i, b := range blocks {
+		if b.unsigned {
+			from = i
+			break
+		}
+	}
+	if from < 0 {
+		return blocks, 0
+	}
+	kept = make([]block, 0, len(blocks))
+	for i, b := range blocks {
+		if i >= from && (b.typ == blockThinking || b.typ == blockRedactedThinking) {
+			dropped++
+			continue
+		}
+		kept = append(kept, b)
+	}
+	return kept, dropped
 }
 
 // echo returns the blocks of a turn that the API takes back on the next
@@ -255,9 +377,10 @@ func echo(blocks []block) (kept []block, dropped bool) {
 
 // response builds the reply from the message's fields and its content
 // blocks. received is the content array as the bytes the API sent, or nil
-// for a reply rebuilt from a stream.
-func (m wireMessage) response(blocks []block, received json.RawMessage) *llm.Response {
-	resp := &llm.Response{
+// for a reply rebuilt from a stream. unsigned is how many thinking blocks
+// were left out of the provider's form of the turn for want of a signature.
+func (m wireMessage) response(blocks []block, received json.RawMessage) (resp *llm.Response, unsigned int) {
+	resp = &llm.Response{
 		ID:      m.ID,
 		Model:   m.Model,
 		Message: llm.Message{Role: llm.RoleAssistant},
@@ -275,21 +398,31 @@ func (m wireMessage) response(blocks []block, received json.RawMessage) *llm.Res
 			resp.Refusal.Explanation = m.StopDetails.Explanation
 		}
 	} else {
-		resp.Message = turn(blocks, received)
+		resp.Message, unsigned = turn(blocks, received)
 	}
 	resp.Usage, resp.Attempts = m.billed(blocks, resp.Stop == llm.StopRefusal)
-	return resp
+	return resp, unsigned
+}
+
+// warnUnsigned says that thinking was left out of a turn's provider form.
+func (c *Client) warnUnsigned(ctx context.Context, resp *llm.Response, dropped int) {
+	if dropped == 0 {
+		return
+	}
+	c.logger.WarnContext(ctx, "anthropic: a thinking block came with no signature, so it and the thinking after it in the turn are left out of what is replayed",
+		"blocks", dropped, "message_id", resp.ID, "model", resp.Model)
 }
 
 // turn builds the assistant turn from the content blocks of a reply.
-func turn(blocks []block, received json.RawMessage) llm.Message {
+func turn(blocks []block, received json.RawMessage) (msg llm.Message, unsigned int) {
 	// The echo rule runs first, so that the text, the tool calls and the
 	// provider's form of the turn all describe the same blocks. A tool call
 	// the rule drops must not be reported: its result would answer a block
 	// the next request no longer holds.
 	kept, dropped := echo(blocks)
+	kept, unsigned = signed(kept)
 	data := received
-	if dropped || received == nil {
+	if dropped || unsigned > 0 || received == nil {
 		raws := make([]json.RawMessage, len(kept))
 		for i, b := range kept {
 			raws[i] = b.raw
@@ -297,7 +430,7 @@ func turn(blocks []block, received json.RawMessage) llm.Message {
 		data = array(raws)
 	}
 
-	msg := llm.Message{Role: llm.RoleAssistant, Opaque: &llm.Opaque{Provider: Name, Data: data}}
+	msg = llm.Message{Role: llm.RoleAssistant, Opaque: &llm.Opaque{Provider: Name, Data: data}}
 	for _, b := range kept {
 		switch b.typ {
 		case blockText:
@@ -306,7 +439,7 @@ func turn(blocks []block, received json.RawMessage) llm.Message {
 			msg.ToolCalls = append(msg.ToolCalls, llm.ToolCall{ID: b.id, Name: b.name, Input: b.input, Malformed: b.malformed})
 		}
 	}
-	return msg
+	return msg, unsigned
 }
 
 // billed returns what the reply was billed for: the usage of the model that

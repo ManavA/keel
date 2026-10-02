@@ -143,9 +143,9 @@ func sendError(ctx context.Context, resp *http.Response, err error) error {
 }
 
 // readError reports a failure to read a response body that is read whole.
-func readError(ctx context.Context, resp *http.Response, err error) error {
+func (c *Client) readError(ctx context.Context, resp *http.Response, err error) error {
 	if errors.Is(err, errTooLarge) {
-		return sizeError(err)
+		return sizeError("the response body", c.bound)
 	}
 	return callError(ctx, requestID(resp), err)
 }
@@ -153,8 +153,8 @@ func readError(ctx context.Context, resp *http.Response, err error) error {
 // sizeError reports a reply past one of this package's size bounds. It is a
 // plain error: the API did not fail, and the same request would pass the
 // bound again.
-func sizeError(err error) error {
-	return fmt.Errorf("anthropic: %w", err)
+func sizeError(what string, bound int64) error {
+	return fmt.Errorf("anthropic: %s is larger than %d bytes", what, bound)
 }
 
 // streamFailure reports a streamed call that failed before its events began:
@@ -176,7 +176,7 @@ func (c *Client) streamFailure(ctx context.Context, id string, err error, stalle
 			Retryable: true,
 		}
 	case errors.Is(err, errTooLarge):
-		return sizeError(err)
+		return sizeError("the response body", c.bound)
 	default:
 		return callError(ctx, id, err)
 	}
@@ -198,8 +198,10 @@ func (c *Client) eventFailure(ctx context.Context, id string, err error, stalled
 		return callError(ctx, id, fmt.Errorf("the stream ended before message_stop: %w", io.ErrUnexpectedEOF))
 	default:
 		// The body was read and the event reader would not take it: an
-		// event past its bound.
-		return sizeError(err)
+		// event past its bound. This is an inference from what the error is
+		// not, until the reader's own error for it can be tested for, so the
+		// reader's words are kept. Like any size bound it is a plain error.
+		return fmt.Errorf("anthropic: %w", err)
 	}
 }
 

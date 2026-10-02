@@ -76,7 +76,9 @@ type Options struct {
 	HTTPClient *http.Client
 	// IdleTimeout is how long a stream may go without a byte from the
 	// server before Stream gives it up as stalled. Zero means two minutes,
-	// and a negative value no limit.
+	// and a negative value no limit. A server that sends keep-alives and
+	// nothing else is not silent: only the caller's context bounds such a
+	// stream.
 	IdleTimeout time.Duration
 	// Betas are extra anthropic-beta values to send.
 	Betas []string
@@ -107,6 +109,10 @@ type Client struct {
 	streamHTTP *http.Client
 	// idle is how long a stream may go without a byte, or zero for ever.
 	idle time.Duration
+	// bound is the most bytes of a body that is read whole, and the most a
+	// streamed reply may keep. It is maxBodyBytes outside this package's
+	// own tests.
+	bound int64
 	// betas is the anthropic-beta header, "" when there is none to send.
 	betas     string
 	fallbacks bool
@@ -147,6 +153,7 @@ func newClient(opts Options, timeout time.Duration) (*Client, error) {
 		maxTokens: opts.MaxTokens,
 		fallbacks: opts.RefusalFallback == refusalFallbackDefault,
 		logger:    cmp.Or(opts.Logger, slog.Default()),
+		bound:     maxBodyBytes,
 	}
 	if opts.HTTPClient == nil {
 		c.http = &http.Client{Timeout: timeout, CheckRedirect: noRedirect}
@@ -190,14 +197,14 @@ func (c *Client) Generate(ctx context.Context, req llm.Request) (*llm.Response, 
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	data, err := io.ReadAll(&boundedReader{r: resp.Body, left: maxBodyBytes})
+	data, err := io.ReadAll(&boundedReader{r: resp.Body, left: c.bound})
 	if !succeeded(resp) {
 		// The status is the answer. A body that could not be read whole
 		// only costs the error its message.
 		return nil, apiError(resp, data)
 	}
 	if err != nil {
-		return nil, readError(ctx, resp, err)
+		return nil, c.readError(ctx, resp, err)
 	}
 	if e := errorObject(resp, data); e != nil {
 		return nil, e
@@ -207,18 +214,35 @@ func (c *Client) Generate(ctx context.Context, req llm.Request) (*llm.Response, 
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return nil, replyError(resp, "the reply is not a message: %v", err)
 	}
-	blocks, err := decodeContent(msg.Content)
-	if err != nil {
+	if msg.StopReason == "" {
+		// The reference says the stop reason is never null in a reply that
+		// is not streamed. One without it says nothing of how the turn
+		// ended, and is not handed on as if it had ended.
+		return nil, replyError(resp, "the reply is not a message: it has no stop reason")
+	}
+	blocks, err := decodeContent(msg.Content, c.bound)
+	switch {
+	case errors.Is(err, errTooManyBlocks):
+		return nil, sizeError("the reply", c.bound)
+	case err != nil:
 		return nil, replyError(resp, "the reply is not a message: %v", err)
 	}
-	return msg.response(blocks, msg.Content), nil
+	out, unsigned := msg.response(blocks, msg.Content)
+	c.warnUnsigned(ctx, out, unsigned)
+	return out, nil
 }
 
 // Stream implements llm.Model.
 //
-// A delta is delivered as it arrives and cannot be taken back. When a reply
-// is refused part way, fn has already been given the text and tool calls
-// that came before the refusal; the Response carries none of them.
+// A delta is delivered as it arrives and cannot be taken back, so fn can be
+// given more than the Response then holds. When a reply is refused part way,
+// fn has already been given the text and tool calls that came before the
+// refusal, and the Response carries none of them. When the API falls back to
+// another model part way (Options.RefusalFallback), fn has been given what
+// the first model wrote, a tool call included, and the Response leaves out
+// what the API will not take back; a ToolCallDelta's Index counts the calls
+// as they streamed and then no longer indexes the Response's ToolCalls.
+// The Response is what to act on.
 //
 // A stream is as long as its reply: it is ended by ctx, or by the server
 // sending nothing for Options.IdleTimeout, and not by the time an unstreamed
@@ -251,7 +275,7 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, fn func(llm.Delta)
 
 	if !succeeded(resp) || !isEventStream(resp) {
 		watch.begin(c.idle)
-		data, err := io.ReadAll(&boundedReader{r: streamBody{r: resp.Body, watch: watch}, left: maxBodyBytes})
+		data, err := io.ReadAll(&boundedReader{r: streamBody{r: resp.Body, watch: watch}, left: c.bound})
 		stalled := watch.end()
 		switch {
 		case !succeeded(resp):

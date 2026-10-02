@@ -175,6 +175,62 @@ func TestClient_Stream_NilFn(t *testing.T) {
 	assert.Equal(t, "Hello!", resp.Message.Text)
 }
 
+// The text of a delta is kept as it will be written, escaped, and comes out
+// as the text it was.
+func TestClient_Stream_TextThatNeedsEscaping(t *testing.T) {
+	const text = "quote \" backslash \\ newline \n tab \t nul \x00 line separator \u2028 <b>&amp;</b> é 🐟"
+	part, err := json.Marshal(text)
+	require.NoError(t, err)
+	events := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Start: \"x\" "}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":` + string(part) + `}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":` + string(part) + `}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":` + string(part) + `}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":30}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	resp, _, err := stream(t, anthropic.Options{}, events)
+	require.NoError(t, err)
+
+	want := `Start: "x" ` + text + text
+	assert.Equal(t, want, resp.Message.Text)
+	require.True(t, json.Valid(resp.Message.Opaque.Data), "%s", resp.Message.Opaque.Data)
+	var blocks []struct {
+		Text     string `json:"text"`
+		Thinking string `json:"thinking"`
+	}
+	require.NoError(t, json.Unmarshal(resp.Message.Opaque.Data, &blocks))
+	require.Len(t, blocks, 2)
+	assert.Equal(t, want, blocks[0].Text)
+	assert.Equal(t, text, blocks[1].Thinking)
+}
+
 func TestClient_Stream_TwoToolCalls(t *testing.T) {
 	events := `event: message_start
 data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
@@ -873,8 +929,37 @@ data: {"type":"content_block_start","index":0,"content_block":{"type":"text","te
 `,
 		},
 		{
-			name:   "no message_start at all",
-			events: "",
+			name: "a stop for a block that never started",
+			events: start + `event: content_block_stop
+data: {"type":"content_block_stop","index":3}
+
+`,
+		},
+		{
+			name: "a delta for a block after its stop",
+			events: start + `event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"late"}}
+
+`,
+		},
+		{
+			name: "a block stopped twice",
+			events: start + `event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+`,
 		},
 		{
 			name: "a block that is null",
@@ -893,7 +978,9 @@ data: {"type":"content_block_start","index":0,"content_block":"text"}
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resp, _, err := stream(t, anthropic.Options{}, tt.events+"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+			resp, _, err := stream(t, anthropic.Options{}, tt.events+
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n"+
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 			require.Error(t, err)
 			assert.Nil(t, resp)
 
@@ -904,6 +991,152 @@ data: {"type":"content_block_start","index":0,"content_block":"text"}
 			assert.False(t, e.Retryable, "the same request would be answered the same way")
 		})
 	}
+}
+
+// The reference says stop_reason is non-null by the time a stream ends. A
+// message_stop with no reason before it, or with nothing before it at all,
+// is a stream that lost its ending: a failed call that may well succeed
+// asked again, and not a reply with an empty stop.
+func TestClient_Stream_StoppedWithoutAnEnding(t *testing.T) {
+	start := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+`
+	const stop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	tests := []struct {
+		name   string
+		events string
+	}{
+		{name: "message_stop and nothing before it", events: stop},
+		{name: "a reply with no message_delta", events: start + stop},
+		{
+			name: "a message_delta whose stop_reason is null",
+			events: start + "event: message_delta\n" +
+				`data: {"type":"message_delta","delta":{"stop_reason":null,"stop_sequence":null},"usage":{"output_tokens":3}}` + "\n\n" + stop,
+		},
+		{
+			name: "a message_delta with no stop_reason",
+			events: start + "event: message_delta\n" +
+				`data: {"type":"message_delta","delta":{},"usage":{"output_tokens":3}}` + "\n\n" + stop,
+		},
+		{
+			name: "a stop_reason that is empty",
+			events: start + "event: message_delta\n" +
+				`data: {"type":"message_delta","delta":{"stop_reason":""},"usage":{"output_tokens":3}}` + "\n\n" + stop,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, _, err := stream(t, anthropic.Options{}, tt.events)
+			require.Error(t, err)
+			assert.Nil(t, resp)
+			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+
+			var e *llm.Error
+			require.ErrorAs(t, err, &e)
+			assert.Equal(t, anthropic.Name, e.Provider)
+			assert.Zero(t, e.Status)
+			assert.Equal(t, requestID, e.RequestID)
+			assert.True(t, e.Retryable)
+			assert.True(t, llm.Retryable(err))
+		})
+	}
+
+	t.Run("a stop reason this package does not know is still a reason", func(t *testing.T) {
+		resp, _, err := stream(t, anthropic.Options{}, start+"event: message_delta\n"+
+			`data: {"type":"message_delta","delta":{"stop_reason":"a_reason_from_the_future"},"usage":{"output_tokens":3}}`+"\n\n"+stop)
+		require.NoError(t, err)
+		assert.Equal(t, llm.StopReason("a_reason_from_the_future"), resp.Stop)
+		assert.Equal(t, "ok", resp.Message.Text)
+	})
+}
+
+// A thinking block that closes with no signature is left out of the
+// provider's form of the turn, with the thinking after it, so that the turn
+// can be replayed.
+func TestClient_Stream_ThinkingWithNoSignatureIsNotKept(t *testing.T) {
+	events := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"This block never gets its signature."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"signature_delta","signature":"ErUBCkYIBxgCIkDx8Yk3gYq0oSmJ7oQp1nZk2bWc9hV"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":2}
+
+event: content_block_start
+data: {"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_1","name":"now","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"zone\": \"UTC\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":3}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":30}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	logger, logged := captureLog()
+	api := newFakeAPI(t, replyEither(okBody, events))
+	c := api.client(t, anthropic.Options{Logger: logger})
+	ctx := context.Background()
+
+	resp, err := c.Stream(ctx, llm.Request{Messages: hello()}, func(llm.Delta) error { return nil })
+	require.NoError(t, err)
+
+	require.NotNil(t, resp.Message.Opaque, "the turn can still be replayed in its own form")
+	assert.JSONEq(t, `[
+		{"type":"thinking","thinking":"","signature":"EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds"},
+		{"type":"tool_use","id":"toolu_1","name":"now","input":{"zone": "UTC"}}
+	]`, string(resp.Message.Opaque.Data))
+	require.Len(t, resp.Message.ToolCalls, 1)
+	assert.Equal(t, 1, strings.Count(logged.String(), "level=WARN"), logged.String())
+	assert.Contains(t, logged.String(), "signature")
+
+	// What goes back holds no block with an empty signature.
+	_, err = c.Generate(ctx, llm.Request{Messages: []llm.Message{
+		userTurn("What time is it?"),
+		resp.Message,
+		{Role: llm.RoleTool, ToolResults: []llm.ToolResult{{CallID: "toolu_1", Content: "12:00"}}},
+	}})
+	require.NoError(t, err)
+	sent := string(api.last(t).Body)
+	assert.NotContains(t, sent, `"signature":""`)
+	assert.NotContains(t, sent, "never gets its signature")
 }
 
 // replyCut writes head as the body of a chunked reply and then drops the

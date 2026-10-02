@@ -200,6 +200,23 @@ func TestClient_RequestBody(t *testing.T) {
 				`,{"role":"assistant","content":[{"type":"text","text":"Still here."}]}]}`,
 		},
 		{
+			// A refused reply, or one the model ended with nothing in it,
+			// comes back as an assistant turn with no content. The API
+			// refuses an empty content array, so the turn is not sent.
+			name: "an assistant turn with nothing in it is left out",
+			req: llm.Request{Messages: []llm.Message{
+				userTurn("Hello"),
+				{Role: llm.RoleAssistant},
+				userTurn("Again"),
+				{Role: llm.RoleAssistant, Opaque: &llm.Opaque{Provider: "anthropic", Data: json.RawMessage(` [ ] `)}},
+				{Role: llm.RoleAssistant, Opaque: &llm.Opaque{Provider: "openai", Data: json.RawMessage(`{"anything":true}`)}},
+				userTurn("And again"),
+			}},
+			want: `{"model":"claude-opus-5-5","max_tokens":16000,"messages":[` + helloContent +
+				`,{"role":"user","content":[{"type":"text","text":"Again"}]}` +
+				`,{"role":"user","content":[{"type":"text","text":"And again"}]}]}`,
+		},
+		{
 			name: "tool results share one user message with nothing else in it",
 			req: llm.Request{Messages: []llm.Message{
 				userTurn("Hello"),
@@ -452,6 +469,36 @@ func TestClient_RequestThatCannotBeSent(t *testing.T) {
 		want string
 	}{
 		{
+			name: "a user turn with no text",
+			req:  llm.Request{Messages: []llm.Message{userTurn("Hello"), {Role: llm.RoleAssistant, Text: "Hi."}, userTurn("")}},
+			want: "message 2",
+		},
+		{
+			name: "a tool turn with no results",
+			req: llm.Request{Messages: []llm.Message{
+				userTurn("Hello"),
+				{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "now", Input: json.RawMessage(`{}`)}}},
+				{Role: llm.RoleTool},
+			}},
+			want: "message 2",
+		},
+		{
+			name: "a provider form that is JSON and not an array",
+			req: llm.Request{Messages: []llm.Message{
+				userTurn("Hello"),
+				{Role: llm.RoleAssistant, Text: "Hi.", Opaque: &llm.Opaque{Provider: anthropic.Name, Data: json.RawMessage(`{"type":"text","text":"Hi."}`)}},
+			}},
+			want: "message 1",
+		},
+		{
+			name: "a provider form that is a JSON string",
+			req: llm.Request{Messages: []llm.Message{
+				userTurn("Hello"),
+				{Role: llm.RoleAssistant, Opaque: &llm.Opaque{Provider: anthropic.Name, Data: json.RawMessage(`"Hi."`)}},
+			}},
+			want: "message 1",
+		},
+		{
 			name: "a provider form that is not JSON",
 			req: llm.Request{Messages: []llm.Message{
 				userTurn("Hello"),
@@ -503,14 +550,23 @@ func TestClient_RequestThatCannotBeSent(t *testing.T) {
 			api := newFakeAPI(t, replyEither(okBody, okStream))
 			c := api.client(t, anthropic.Options{})
 
+			// A request this package will not send is an *llm.Error that
+			// says what is wrong with it, and is not worth another try.
+			check := func(t *testing.T, err error) {
+				t.Helper()
+				require.Error(t, err)
+				var e *llm.Error
+				require.ErrorAs(t, err, &e)
+				assert.Equal(t, anthropic.Name, e.Provider)
+				assert.Zero(t, e.Status)
+				assert.Contains(t, e.Message, tt.want)
+				assert.False(t, e.Retryable)
+				assert.False(t, llm.Retryable(err))
+			}
 			_, err := c.Generate(context.Background(), tt.req)
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.want)
-			assert.False(t, llm.Retryable(err))
-
+			check(t, err)
 			_, err = c.Stream(context.Background(), tt.req, func(llm.Delta) error { return nil })
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.want)
+			check(t, err)
 
 			assert.Zero(t, api.count(), "a request that cannot be built is not sent")
 		})

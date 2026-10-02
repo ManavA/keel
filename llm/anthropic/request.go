@@ -27,8 +27,17 @@ const (
 	blockFallback         = "fallback"
 )
 
-// emptyObject is the arguments of a tool call that has none.
-var emptyObject = json.RawMessage(`{}`)
+// emptyObject is the arguments of a tool call that has none. Each call gets
+// its own: the bytes are handed to callers, and one who edited a shared slice
+// in place would change every other call's arguments.
+func emptyObject() json.RawMessage { return json.RawMessage(`{}`) }
+
+// unsendable reports a request this package will not send, because the API
+// would refuse it or it cannot be written. No call was made, and the same
+// request would be refused again.
+func unsendable(format string, args ...any) *llm.Error {
+	return &llm.Error{Provider: Name, Message: fmt.Sprintf(format, args...)}
+}
 
 // field is one member of a JSON object written by object.
 type field struct {
@@ -108,14 +117,14 @@ func (c *Client) body(req llm.Request, stream bool) ([]byte, error) {
 
 	msgs, err := messages(req.Messages)
 	if err != nil {
-		return nil, err
+		return nil, unsendable("%v", err)
 	}
 	fields = append(fields, field{"messages", msgs})
 
 	if len(req.Tools) > 0 {
 		defs, err := tools(req.Tools)
 		if err != nil {
-			return nil, err
+			return nil, unsendable("%v", err)
 		}
 		fields = append(fields, field{"tools", defs})
 	}
@@ -128,7 +137,7 @@ func (c *Client) body(req llm.Request, stream bool) ([]byte, error) {
 			fields = append(fields, field{"tool_choice", object(field{"type", quote("none")})})
 		}
 	default:
-		return nil, fmt.Errorf("anthropic: unknown tool choice %q", req.ToolChoice)
+		return nil, unsendable("unknown tool choice %q", req.ToolChoice)
 	}
 
 	var config []field
@@ -137,7 +146,7 @@ func (c *Client) body(req llm.Request, stream bool) ([]byte, error) {
 	}
 	if req.Output != nil {
 		if !json.Valid(req.Output.JSON) {
-			return nil, errors.New("anthropic: the output schema is not valid JSON")
+			return nil, unsendable("the output schema is not valid JSON")
 		}
 		config = append(config, field{"format", object(
 			field{"type", quote("json_schema")},
@@ -151,7 +160,7 @@ func (c *Client) body(req llm.Request, stream bool) ([]byte, error) {
 	if req.Temperature != nil {
 		value, err := encode(*req.Temperature)
 		if err != nil {
-			return nil, fmt.Errorf("anthropic: temperature: %w", err)
+			return nil, unsendable("temperature: %v", err)
 		}
 		fields = append(fields, field{"temperature", value})
 	}
@@ -187,35 +196,60 @@ func set(fields []field, f field) []field {
 }
 
 // messages writes the conversation as the messages array.
+//
+// A turn the API would refuse is not sent. An assistant turn with nothing in
+// it is left out: a refused reply is one, and so is a reply the model ended
+// with no content, and an empty content array is an error to the API. The
+// user turns on either side of it then follow each other, which the API
+// reads as one turn. A user turn with no text and a tool turn with no
+// results cannot be left out without changing what the conversation says, so
+// they are errors here, before any call is made.
 func messages(msgs []llm.Message) (json.RawMessage, error) {
-	out := make([]json.RawMessage, len(msgs))
+	out := make([]json.RawMessage, 0, len(msgs))
 	for i, m := range msgs {
 		role, content, err := message(m)
 		if err != nil {
-			return nil, fmt.Errorf("anthropic: message %d: %w", i, err)
+			return nil, fmt.Errorf("message %d: %w", i, err)
 		}
-		out[i] = object(field{"role", quote(role)}, field{"content", content})
+		if content == nil {
+			continue
+		}
+		out = append(out, object(field{"role", quote(role)}, field{"content", content}))
 	}
 	return array(out), nil
 }
 
-// message gives one message's role and content array.
+// message gives one message's role and content array. The content is nil for
+// an assistant turn with nothing in it, which is not sent.
 func message(m llm.Message) (role string, content json.RawMessage, err error) {
 	switch m.Role {
 	case llm.RoleUser:
+		if m.Text == "" {
+			return "", nil, errors.New("a user turn has no text")
+		}
 		return roleUser, array([]json.RawMessage{textBlock(m.Text)}), nil
 
 	case llm.RoleAssistant:
 		if data, ok := replayable(m.Opaque); ok {
-			if !json.Valid(data) {
-				return "", nil, errors.New("the provider's form of the turn is not valid JSON")
+			empty, err := contentArray(data)
+			switch {
+			case err != nil:
+				return "", nil, err
+			case empty:
+				return roleAssistant, nil, nil
 			}
 			return roleAssistant, data, nil
+		}
+		if m.Text == "" && len(m.ToolCalls) == 0 {
+			return roleAssistant, nil, nil
 		}
 		content, err := rebuilt(m)
 		return roleAssistant, content, err
 
 	case llm.RoleTool:
+		if len(m.ToolResults) == 0 {
+			return "", nil, errors.New("a tool turn has no results")
+		}
 		// The API takes tool results as a user message and wants them ahead
 		// of anything else in it. This one holds nothing else.
 		results := make([]json.RawMessage, len(m.ToolResults))
@@ -235,6 +269,19 @@ func message(m llm.Message) (role string, content json.RawMessage, err error) {
 	default:
 		return "", nil, fmt.Errorf("unknown role %q", m.Role)
 	}
+}
+
+// contentArray checks that the provider's form of a turn is what the API
+// takes as content, a JSON array, and reports whether it is an empty one.
+func contentArray(data json.RawMessage) (empty bool, err error) {
+	data = bytes.TrimSpace(data)
+	switch {
+	case !json.Valid(data):
+		return false, errors.New("the provider's form of the turn is not valid JSON")
+	case data[0] != '[':
+		return false, errors.New("the provider's form of the turn is not a JSON array")
+	}
+	return len(bytes.TrimSpace(data[1:len(data)-1])) == 0, nil
 }
 
 func textBlock(text string) json.RawMessage {
@@ -269,7 +316,7 @@ func rebuilt(m llm.Message) (json.RawMessage, error) {
 		// The API takes an object here. Arguments that never parsed have
 		// none to offer, and a call with no arguments is an empty one.
 		if call.Malformed || absent(input) {
-			input = emptyObject
+			input = emptyObject()
 		}
 		if !json.Valid(input) {
 			return nil, fmt.Errorf("the arguments of tool call %q are not valid JSON", call.ID)
@@ -297,7 +344,7 @@ func tools(defs []llm.Tool) (json.RawMessage, error) {
 			schema = json.RawMessage(`{"type":"object"}`)
 		}
 		if !json.Valid(schema) {
-			return nil, fmt.Errorf("anthropic: tools: the schema of %q is not valid JSON", t.Name)
+			return nil, fmt.Errorf("tools: the schema of %q is not valid JSON", t.Name)
 		}
 		def = append(def, field{"input_schema", schema})
 		if t.Strict {

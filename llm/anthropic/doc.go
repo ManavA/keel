@@ -56,15 +56,32 @@
 // # Usage is what was billed
 //
 // The API reports the tokens of every attempt and does not bill all of them.
-// A model that declines before producing any output is billed only when its
-// refusal is in one of three categories (bio, frontier_llm and
-// reasoning_extraction, as the reference stood in September 2026). So a
-// reply refused that way in any other category has a zero Usage, and after a
-// fallback llm.Response.Attempts lists every attempt, in order, with no
-// usage against one that was not billed. The category of a declined attempt
-// comes from the trigger of its fallback block. Where the API does not give
-// one, the attempt is counted as billed: a cost may then be too high, and is
-// never too low.
+// A model that declines before producing any output is not billed when its
+// refusal is in the category cyber or general_harms, or has no category, as
+// the reference stood in September 2026. So a reply refused that way has a
+// zero Usage, and after a fallback llm.Response.Attempts lists every
+// attempt, in order, with no usage against one that was not billed. The
+// category of a declined attempt comes from the trigger of its fallback
+// block. The reference says the billed set may change, so a category this
+// package does not know is counted as billed, and so is an attempt the API
+// gives no category for: a cost may then be too high, and is never too low.
+//
+// # Turns that are not sent
+//
+// The API refuses a message with empty content, so this package does not
+// send one. An assistant turn with nothing in it is left out of the request:
+// a refused reply is such a turn, and so is a reply the model ended with no
+// content. The turns on either side of it then follow each other, which the
+// API reads as one. A user turn with no text, a tool turn with no results,
+// and a provider's form of a turn that is not a JSON array cannot be left
+// out without changing what the conversation says, so each is an error
+// before any call is made: an *llm.Error that names the message and is not
+// retryable, like every request this package will not send.
+//
+// A thinking block that arrives with no signature is not kept in Opaque,
+// since the API fails a turn that sends one back, and the thinking after it
+// in the same turn goes with it, since a gap in a run of thinking blocks
+// invalidates what follows the gap. A line is logged at Warn.
 //
 // # Streaming
 //
@@ -81,12 +98,22 @@
 // it: no event, no keep-alive ping, no comment line. That is a stalled
 // connection and a retryable failure, with no context error in its chain,
 // so it is not mistaken for the caller's own cancellation. The time the
-// caller's fn takes over a delta is not counted. One event may be 16 MiB,
-// and all that a reply keeps 32 MiB, the bound on an unstreamed body; past
-// either the call fails with a plain error, since the same request would
-// pass the bound again. A stream that stops before its message_stop event is
-// a failed call, retryable like any transport failure; one that is cut after
-// it is complete. Nothing Stream starts is still running when it returns.
+// caller's fn takes over a delta is not counted. Nothing Stream starts is
+// still running when it returns.
+//
+// One event may be 16 MiB, and all that a reply keeps 32 MiB, the bound on
+// an unstreamed body. What is counted is what is held: each block's bytes
+// and a fixed 512 for the block itself, each delta as it is written into the
+// turn, escapes and all, and each message_start and message_delta. The
+// count never falls. Past either bound the call fails with a plain error,
+// since the same request would pass the bound again.
+//
+// A stream that stops before its message_stop event is a failed call,
+// retryable like any transport failure, and so is one whose message_stop
+// comes with no stop reason before it. One that is cut after message_stop
+// is complete. A stream whose events are out of order, a delta for a block
+// that never started or has already stopped, is not one a reply can be put
+// together from, and is an error that is not retryable.
 //
 // # Errors
 //
@@ -128,6 +155,8 @@
 //	https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback
 //	https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
 //	https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
+//	https://platform.claude.com/docs/en/build-with-claude/thinking
+//	https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting
 //
 // No test here reaches the network or needs a key. One file of tests does,
 // and is built only with the live tag. It skips unless ANTHROPIC_API_KEY is
