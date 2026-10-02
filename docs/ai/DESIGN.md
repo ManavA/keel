@@ -1948,8 +1948,8 @@ type Run struct {
 	// Key is the caller's idempotency key for starting the run.
 	Key        string   `json:"key,omitempty"`
 	Definition Snapshot `json:"definition"`
-	// Metadata is the caller's own. A run started with none reads back with
-	// an empty map.
+	// Metadata is the caller's own. It reads back as JSON gives it, and as
+	// an empty map when the run was started with none.
 	Metadata map[string]string `json:"metadata,omitempty"`
 
 	Usage        Usage `json:"usage"`
@@ -2096,8 +2096,9 @@ type Approval struct {
 	// Input is the call's arguments: exactly what runs if approved.
 	Input json.RawMessage `json:"input"`
 	// Action is what the Guard was asked about. Its Attrs read back as JSON
-	// gives them, a number as a float64, and as an empty map when there
-	// were none.
+	// gives them, and as an empty map when there were none. A number comes
+	// back as a float64, so an integer above 2^53 is no longer exact: put
+	// one that must be in a string.
 	Action Action `json:"action"`
 	Rule   string `json:"rule"`
 
@@ -2711,27 +2712,28 @@ from the request; a store never reads a clock.
 
 | Method | Effect |
 |---|---|
+| Every method, in this order | First, what the request alone shows to be wrong is refused, before the store is touched: an id to be kept that is not a UUID in canonical form, a TTL of zero or less, a `To` that is no step status, a `Status` the method does not take, attributes JSON cannot hold, a claim with no owner. A Postgres store makes these checks in Go before it opens a transaction. Second, a run or an approval that does not exist is `ErrNotFound`. Third, for a method that takes a `Lease`, a lease that is not the run's is `ErrLeaseLost`. Fourth, and only then, whatever depends on the state of the run, its steps and its approvals: its status, a step's `From`, a parent that does not exist, an approval already recorded. So a call that is wrong in two ways gets the same error from every store: a lost lease with a bad argument is refused for the argument, and a lost lease with a step in the wrong status is `ErrLeaseLost` |
 | Every method that changes anything | Adds one to the run's `Rev`, stamps each step and approval it touched with the new `Rev`, and sets `UpdatedAt` to the request's time. One call adds one, however many steps and approvals it touches: they all carry the one new `Rev`. `Heartbeat` is the exception: it changes only the lease's expiry and leaves `Rev` and `UpdatedAt` alone. A call that changes nothing leaves them alone too: a call that is refused, a `Park` that reports false, a `RequestApproval` that returns an approval already recorded, a `RequestCancel` of a run already marked, an `ExpireApprovals` with nothing due |
-| Every method taking a `Lease` | Locks the run, and returns `ErrLeaseLost` without changing anything unless the run's owner and epoch equal the lease's. A lease with an empty `Owner` is never the run's, even when the run records no owner, so nothing writes to a run nobody holds. The hold is the epoch and not the time: under a lease that has lapsed and that no other claim has taken, a write goes through and `Heartbeat` extends the expiry. A run that does not exist is `ErrNotFound`, whatever the lease |
+| Every method taking a `Lease` | Once the request itself has passed, locks the run, and returns `ErrLeaseLost` without changing anything unless the run's owner and epoch equal the lease's. The fence comes before every check that reads the store, and after the checks of the request alone. A lease with an empty `Owner` is never the run's, even when the run records no owner, so nothing writes to a run nobody holds. The hold is the epoch and not the time: under a lease that has lapsed and that no other claim has taken, a write goes through and `Heartbeat` extends the expiry. A run that does not exist is `ErrNotFound`, whatever the lease |
 | Every method that makes a waiting run runnable | These are `DecideApproval`, `ExpireApprovals`, `RequestCancel`, and `Finish` for the run's parent. Each sets `Status` runnable and clears `Reason`, since the run no longer waits. A run that is not waiting keeps its status and its lease |
-| Every method that is given something to keep | Refuses, with an error that is none of the package's sentinels and with nothing changed, what a database could not keep or would keep as something else. An id to be stored must be a UUID in the form `uuid.NewString` writes: a run's `ID` and `ParentID`, an approval's `ID`, a step's `ChildRunID`. A `ParentID` must name a run that exists. The other refusals are in the rows below |
-| `CreateRun` | The run is stored as given, with `Rev` 1 whatever `Rev` it was given. `Status` must be `StatusRunnable`: any other is an error and stores nothing. `ID`, and `ParentID` when set, must be UUIDs, and the parent must exist. A create that finds its agent and key returns the run that has them, as it now stands, and stores nothing. Otherwise an id already in use is an error, and the run that has it is left alone. `Metadata` reads back as given, and as an empty map, not nil, when the run was given none |
+| Every method that is given something to keep | Refuses, with an error that is none of the package's sentinels and with nothing changed, what a database could not keep or would keep as something else. An id to be stored must be a UUID in the one form `uuid.NewString` writes, lower case with hyphens: a run's `ID` and `ParentID`, an approval's `ID`, a step's `ChildRunID`. Another spelling of a UUID, upper case or without hyphens, is refused, because a database would take it and hand back the canonical one, and the id would no longer be the one given. A `ParentID` must name a run that exists. The other refusals are in the rows below |
+| `CreateRun` | The run is stored as given, with `Rev` 1 whatever `Rev` it was given. `Status` must be `StatusRunnable`: any other is an error and stores nothing. `ID`, and `ParentID` when set, must be UUIDs in canonical form. These are judged from the request, so a create that would find its key is still refused for them. Then a create that finds its agent and key returns the run that has them, as it now stands, and stores nothing. Otherwise an id already in use is an error, and the run that has it is left alone, and a `ParentID` that names no run is an error. `Metadata` reads back as a JSON round trip gives it, so a byte that is not UTF-8 comes back as the replacement character, and as an empty map, not nil, when the run was given none |
 | `Claim` | 6.6. `Owner` must not be empty and `TTL` must be more than zero: otherwise an error. A claim leaves `NextAttemptAt` as it is, for the next `Yield` to set or clear. With `RunID`, the same conditions apply to that run alone, its agent being named in `Agents` among them, and `ErrNotClaimable` is returned when they do not hold. A claim by `RunID` locks the run and waits for a write in progress before it decides; only a claim without `RunID` passes over a run that is locked. A `RunID` that names no run is `ErrNotFound` |
 | `Heartbeat` | Sets the lease's expiry to `now` plus `ttl` and reports the cancel mark. `ttl` must be more than zero: otherwise an error, and the lease is as it was |
 | `Yield` | Owner cleared, expiry cleared, `NextAttemptAt` set as given, which clears it when none is given. With `Failed`: `Failures` plus one, `Error` recorded. Without it, `Failures` and `Error` stay as they were. `Error` is therefore the last failure: it stays through later executions that go well, until `Finish` |
 | `Park` | 6.10. Sets `Status` waiting and `Reason`, clears the lease |
-| `Finish` | `Status` must be completed, failed or cancelled: any other is an error and changes nothing. Sets `Status`, `Reason`, `Output`, `Error`, `FinishedAt`; clears the lease; sets every pending approval of the run `cancelled`; and when the run has a parent that is waiting, sets it runnable and adds one to its `Rev`. `Error` is set as given, so a run that ended well has none, whatever an earlier failure left. A cancelled approval gets that status, `DecidedAt` the request's time and the run's new `Rev`, and no `DecidedBy` or `Reason`, since nobody decided it |
+| `Finish` | `Status` must be completed, failed or cancelled: any other is an error and changes nothing, and is judged before the run is looked for and before the lease. Sets `Status`, `Reason`, `Output`, `Error`, `FinishedAt`; clears the lease; sets every pending approval of the run `cancelled`; and when the run has a parent that is waiting, sets it runnable and adds one to its `Rev`. `Error` is set as given, so a run that ended well has none, whatever an earlier failure left. A cancelled approval gets that status, `DecidedAt` the request's time and the run's new `Rev`, and no `DecidedBy` or `Reason`, since nobody decided it |
 | `BeginModel` | `seq` must be one past the last step, or name a model step that is `started`; otherwise `ErrConflict`. Inserts the step as `started` with `Attempts` 1, or adds one to `Attempts` and resets `StartedAt` |
 | `CompleteModel` | The step must be a `started` model step; otherwise `ErrConflict`, which is also the answer when `seq` names no step. Sets it `completed` with the message, stop, model name, usage and `FinishedAt`. On the run: adds the usage, adds one to `ModelCalls`, adds finish less start to `ActiveMillis`, sets `Failures` to 0. Appends one tool step per `Message.Calls` entry at `Seq+1`, `Seq+2`, …: `proposed`, `Turn` the model step's `seq`, `Name` and `Call` from the call, `Key` from `StepKey` |
 | `UpdateStep` | `To` must be one of the six step statuses, and `ChildRunID`, when set, a UUID: otherwise an error, and nothing changes. The step must be a tool step in `From`; otherwise `ErrConflict`, which is also the answer when `seq` names no step. Sets `Status` to `To` and records what the request carries: `Decision` and `Rule` only when `Decision` is not empty, `Result` and `IsError` only when `Result` is not nil, and `ChildRunID` only when it is not empty. A `Result` that points at an empty string is a result and is recorded. `To` of `started` adds one to `Attempts` and sets `StartedAt`. A final `To` sets `FinishedAt`, sets the run's `Failures` to 0, and when `From` is `started` adds finish less start to `ActiveMillis`. `Usage` is added to the step and the run. The store checks nothing else about the move; which moves are legal is the engine's business |
-| `RequestApproval` | `ID` must be a UUID, or an error. The step must be a tool step: a model step, or a `seq` that names no step, is `ErrConflict`. If an approval exists for the run, `Seq` and the step's current `Attempts`, it is returned and nothing changes. That lookup comes before the check of `From`, and looks at neither the approval's status nor the rest of the request, so a question asked again after its answer comes back answered. Otherwise the step must be in `From`, or `ErrConflict`; it becomes `waiting`, and an approval is inserted as pending with `Attempt` the step's `Attempts`, `Tool` its name and `Input` its call's arguments. The step's `Decision` and `Rule` are set only when the request's `Decision` is not empty, as in `UpdateStep`: the question about an interrupted call does not replace the guard's answer on the step. The approval's `Rule` is the request's either way. `Action.Attrs` reads back as a JSON round trip gives it: a number as a `float64`, an object as a `map[string]any`, a list as a `[]any`, and an empty map, not nil, when there were none. Attributes JSON cannot hold are an error |
+| `RequestApproval` | `ID` must be a UUID, or an error. The step must be a tool step: a model step, or a `seq` that names no step, is `ErrConflict`. If an approval exists for the run, `Seq` and the step's current `Attempts`, it is returned and nothing changes. That lookup comes before the check of `From`, and looks at neither the approval's status nor the rest of the request, so a question asked again after its answer comes back answered. Otherwise the step must be in `From`, or `ErrConflict`; it becomes `waiting`, and an approval is inserted as pending with `Attempt` the step's `Attempts`, `Tool` its name and `Input` its call's arguments. The step's `Decision` and `Rule` are set only when the request's `Decision` is not empty, as in `UpdateStep`: the question about an interrupted call does not replace the guard's answer on the step. The approval's `Rule` is the request's either way. `Action.Attrs` reads back as a JSON round trip gives it: a number as a `float64`, an object as a `map[string]any`, a list as a `[]any`, a byte that is not UTF-8 as the replacement character, and an empty map, not nil, when there were none. An integer above 2^53 is therefore no longer exact when it is read back, as it would not be from a database; one that must be exact goes in a string. Attributes JSON cannot hold, a channel or a function, are an error, judged before the lease |
 | `DecideApproval` | Locks the run. A pending approval becomes approved or declined with who, why and when; a waiting run becomes runnable. Anything but pending, an expired or a cancelled approval included, is returned as it stands with `ErrAlreadyDecided` |
 | `ExpireApprovals` | The same as a decline, for every pending approval whose `ExpiresAt` is not after `now`, with status `expired`: `DecidedAt` is `now`, and `DecidedBy` and `Reason` stay empty, since nobody decided. Approvals of one run that lapse in one call change the run once and carry the one new `Rev`. With `DecideApproval` and `Finish` this keeps one rule: an approval's `DecidedAt` is nil exactly while it is pending |
 | `RequestCancel` | Locks the run. Sets the mark, who and why; a waiting run becomes runnable. A run already marked is left exactly as it is: the first request's who and why stand and `Rev` does not move. `ErrFinished` for a run that has ended |
 | `Changes` | The run as it stands, always. With it, the steps in `Seq` order and the approvals in the order `ListApprovals` gives, whatever order they changed in. A reader that passes each answer's `Run.Rev` as the next call's `since` misses no change, whatever is being written meanwhile. A step or approval may be newer than the run it is returned with; the next call then returns it again |
 | `ListRuns` | Newest first by `CreatedAt`, then `ID` descending. A `Limit` of zero or less is 50, and one over 200 is 200. A `ParentID` that names no run, or is not a UUID, lists nothing |
 | `ListApprovals` | Oldest first by `RequestedAt`, then `ID`. `Limit` as for `ListRuns`. A `RunID` that names no run, or is not a UUID, lists nothing |
-| Any method given an id that does not exist | `ErrNotFound`. An id that is not a UUID does not exist either: it is `ErrNotFound` like any other, and never the database's complaint about its form. A filter is not a lookup, and lists nothing. A `seq` is not an id: a step that does not exist is `ErrConflict`, as the rows above say |
+| Any method given an id that does not exist | `ErrNotFound`. An id that is not a UUID does not exist either: it is `ErrNotFound` like any other, and never the database's complaint about its form. Nor does another spelling of an id that does exist: a store knows a run or an approval by the one string it was given, so its id in upper case or without hyphens is `ErrNotFound`, though a database would find the row. A filter is not a lookup, and lists nothing, for an id nothing has, one that is not a UUID, and another spelling of one that exists. A `seq` is not an id: a step that does not exist is `ErrConflict`, as the rows above say |
 
 `agenttest.RunStoreSuite` has a case for each of these, and both stores
 pass it.
@@ -3163,7 +3165,10 @@ written.
 
 **Fencing.** `lease_epoch` rises by one on every claim. Every journal write
 is one transaction that begins by locking the run's row and comparing its
-owner and epoch with the caller's `Lease`:
+owner and epoch with the caller's `Lease`. What the request alone shows to
+be wrong is refused before the transaction is opened; inside it the fence
+comes before every check that reads the run's state, as the table in 6.2
+orders them:
 
 ```sql
 select lease_owner, lease_epoch from agent_runs where id = $1 for update
@@ -4206,3 +4211,19 @@ lead confirmed its choices, and the table now states each of them.
     `Run.Error` is the last failure and stays until `Finish` (rejected:
     clearing it when a later step completes, which loses why a run that
     recovered had been retried).
+
+    A second review fixed the order of the checks, the same in every
+    method: the request's own arguments, then whether the run exists,
+    then the lease, then the run's state (rejected: the fence before
+    everything, as the table first read, which a Postgres store cannot do
+    for an argument it refuses in Go before it opens a transaction, so
+    that the two stores would answer a call wrong in two ways with
+    different errors). It also made the form of an id part of the
+    contract: a store knows an id by one string, the canonical spelling,
+    refuses another spelling of a UUID where an id is to be kept, and
+    does not find a run by one (rejected: leaving the form to
+    `MemoryStore` alone, where a Postgres store would find a run by the
+    upper-case spelling of its id and keep a new one under a string it
+    was not given). `Metadata` goes through JSON as `Action.Attrs` does.
+    What a NUL character inside a string of either does is left to the
+    Postgres store to settle with its column types in front of it.
