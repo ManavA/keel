@@ -1,0 +1,40 @@
+{
+  "id": "msg_01XFUDYJgAACzvnptvVoYEL",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-5-5",
+  "content": [
+    {
+      "type": "fallback",
+      "from": { "model": "claude-opus-5-5" },
+      "to": { "model": "claude-sonnet-5-5" }
+    },
+    { "type": "text", "text": "Hi! How can I help you today?" }
+  ],
+  "stop_reason": "end_turn",
+  "stop_details": null,
+  "usage": {
+    "input_tokens": 412,
+    "output_tokens": 264,
+    "cache_read_input_tokens": 96,
+    "cache_creation_input_tokens": 31,
+    "iterations": [
+      {
+        "type": "message",
+        "model": "claude-opus-5-5",
+        "input_tokens": 535,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0
+      },
+      {
+        "type": "fallback_message",
+        "model": "claude-sonnet-5-5",
+        "input_tokens": 412,
+        "output_tokens": 264,
+        "cache_read_input_tokens": 96,
+        "cache_creation_input_tokens": 31
+      }
+    ]
+  }
+}
