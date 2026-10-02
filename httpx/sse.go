@@ -31,7 +31,17 @@ type EventStreamOptions struct {
 	// Retry is sent once as the delay a client should wait before
 	// reconnecting. Zero sends none.
 	Retry time.Duration
+
+	// SendTimeout bounds each Send, SendJSON and Comment, so that a client
+	// that stays connected and stops reading cannot hold the handler in a
+	// write for ever. Zero means 30 seconds, and a negative value means no
+	// bound. A send that passes it returns an error, and the stream is
+	// unusable afterwards. Time between sends does not count.
+	SendTimeout time.Duration
 }
+
+// defaultSendTimeout is what a zero EventStreamOptions.SendTimeout means.
+const defaultSendTimeout = 30 * time.Second
 
 // EventStream writes server-sent events to one response. It is not safe
 // for concurrent use.
@@ -39,17 +49,27 @@ type EventStreamOptions struct {
 // It does not outlive the request: once the request's context ends, Send,
 // SendJSON and Comment write nothing and return an error wrapping the
 // context's, and the handler should return. A write to a connection the client
-// has closed often succeeds, and the router's middleware discards flush
-// errors, so the context is the one dependable sign that the client is gone.
+// has closed often succeeds, and middleware that wraps the writer may discard
+// a flush error, so the context is the one dependable sign that the client is
+// gone.
+//
+// A send that fails ends the stream: the failed write may have left part of an
+// event on the wire, so every later call returns that same error.
 type EventStream struct {
-	w   http.ResponseWriter
-	rc  *http.ResponseController
-	ctx context.Context // the request's, checked before every write
-	buf []byte
+	w     http.ResponseWriter
+	rc    *http.ResponseController
+	ctx   context.Context // the request's, checked before every write
+	limit time.Duration   // the bound on each send; zero for none
+	err   error           // the error that ended the stream, if one did
+	buf   []byte
 }
 
 // NewEventStream starts an event stream on w: it sets the headers, lifts
 // the server's write deadline for this response, and flushes.
+//
+// The write deadline stays lifted between sends, so the stream outlives the
+// server's WriteTimeout; each send sets one of its own, EventStreamOptions
+// SendTimeout, for the length of that write.
 //
 // The router's timeout is not lifted: it ends the request's context, and the
 // stream with it. A service that wants one long connection builds its router
@@ -63,8 +83,20 @@ func NewEventStream(w http.ResponseWriter, r *http.Request, opts EventStreamOpti
 		return nil, ErrStreamUnsupported
 	}
 	rc := http.NewResponseController(w)
-	if err := rc.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
-		return nil, fmt.Errorf("httpx: lift write deadline: %w", err)
+	limit := opts.SendTimeout
+	switch {
+	case limit == 0:
+		limit = defaultSendTimeout
+	case limit < 0:
+		limit = 0
+	}
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		if !errors.Is(err, http.ErrNotSupported) {
+			return nil, fmt.Errorf("httpx: lift write deadline: %w", err)
+		}
+		// Nothing here can carry a deadline, so there is nothing to bound a
+		// send with.
+		limit = 0
 	}
 
 	// Set before the status is written: a compressing middleware reads the
@@ -75,7 +107,7 @@ func NewEventStream(w http.ResponseWriter, r *http.Request, opts EventStreamOpti
 	h.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	s := &EventStream{w: w, rc: rc, ctx: r.Context()}
+	s := &EventStream{w: w, rc: rc, ctx: r.Context(), limit: limit}
 	if opts.Retry > 0 {
 		// Under a millisecond it would read as zero, a reconnect with no wait.
 		s.buf = fmt.Appendf(nil, "retry: %d\n\n", max(opts.Retry.Milliseconds(), 1))
@@ -105,16 +137,19 @@ func canFlush(w http.ResponseWriter) bool {
 	}
 }
 
-// Send writes one event and flushes it.
+// Send writes one event and flushes it. It refuses, and writes nothing for, an
+// ID containing a line break or a NUL character, which a browser's EventSource
+// ignores along with the resume point it carries, and a Type containing a line
+// break.
 func (s *EventStream) Send(ev ServerEvent) error {
-	if strings.ContainsAny(ev.ID, "\r\n") {
-		return errors.New("httpx: event id contains a line break")
+	if strings.ContainsAny(ev.ID, "\r\n\x00") {
+		return errors.New("httpx: event id contains a line break or a NUL")
 	}
 	if strings.ContainsAny(ev.Type, "\r\n") {
 		return errors.New("httpx: event type contains a line break")
 	}
-	if err := s.ctx.Err(); err != nil {
-		return fmt.Errorf("httpx: send event: %w", err)
+	if err := s.usable(); err != nil {
+		return err
 	}
 
 	buf := s.buf[:0]
@@ -145,16 +180,47 @@ func (s *EventStream) Comment(text string) error {
 	if strings.ContainsAny(text, "\r\n") {
 		return errors.New("httpx: comment contains a line break")
 	}
-	if err := s.ctx.Err(); err != nil {
-		return fmt.Errorf("httpx: send comment: %w", err)
+	if err := s.usable(); err != nil {
+		return err
 	}
 	s.buf = append(appendField(s.buf[:0], "", text), '\n')
 	return s.write()
 }
 
-// write sends s.buf as one Write, so a failure never leaves half an event on
-// the wire, and flushes it.
+// usable is the reason a send would be pointless, if there is one: the stream
+// has failed, or the request is over.
+func (s *EventStream) usable() error {
+	if s.err != nil {
+		return s.err
+	}
+	if err := s.ctx.Err(); err != nil {
+		return fmt.Errorf("httpx: send: %w", err)
+	}
+	return nil
+}
+
+// write sends s.buf and ends the stream if that fails.
 func (s *EventStream) write() error {
+	err := s.writeBounded()
+	if err != nil {
+		s.err = err
+	}
+	return err
+}
+
+// writeBounded sends s.buf as one Write, so a failure never leaves half an
+// event on the wire without the stream knowing, and flushes it, all under the
+// send's own deadline.
+func (s *EventStream) writeBounded() error {
+	if s.limit > 0 {
+		if err := s.rc.SetWriteDeadline(time.Now().Add(s.limit)); err != nil {
+			return fmt.Errorf("httpx: bound send: %w", err)
+		}
+		// Lifted again after the send. Left to run out, the deadline would
+		// expire while the stream sat idle, and the write that ends the
+		// response would be the one to fail.
+		defer func() { _ = s.rc.SetWriteDeadline(time.Time{}) }()
+	}
 	if _, err := s.w.Write(s.buf); err != nil {
 		return fmt.Errorf("httpx: write event: %w", err)
 	}

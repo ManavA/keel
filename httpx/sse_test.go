@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -89,12 +92,58 @@ func (w *spyWriter) Flush() {
 type deadlineWriter struct {
 	*spyWriter
 	deadlines []time.Time
-	err       error
+	errs      []error // the result of the nth call; nil once they run out
 }
 
 func (w *deadlineWriter) SetWriteDeadline(t time.Time) error {
+	n := len(w.deadlines)
 	w.deadlines = append(w.deadlines, t)
-	return w.err
+	if n < len(w.errs) {
+		return w.errs[n]
+	}
+	return nil
+}
+
+// breakableWriter fails its writes or its flushes on demand, and counts the
+// writes it was asked for.
+type breakableWriter struct {
+	*spyWriter
+	writeErr, flushErr error
+	writes             int
+}
+
+func (w *breakableWriter) Write(b []byte) (int, error) {
+	w.writes++
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return w.spyWriter.Write(b)
+}
+
+func (w *breakableWriter) FlushError() error {
+	if w.flushErr != nil {
+		return w.flushErr
+	}
+	w.Flush()
+	return nil
+}
+
+// syncBuffer is a buffer the server's goroutines and the test can share.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func getRequest() *http.Request { return httptest.NewRequest(http.MethodGet, "/stream", nil) }
@@ -308,6 +357,9 @@ func TestEventStreamRefusesAnEventItCannotFrameAndWritesNothing(t *testing.T) {
 		{"an id with a carriage return", func(s *httpx.EventStream) error {
 			return s.Send(httpx.ServerEvent{ID: "1\rx", Data: []byte("a")})
 		}},
+		{"an id with a NUL, which a browser would drop along with the resume point", func(s *httpx.EventStream) error {
+			return s.Send(httpx.ServerEvent{ID: "1\x002", Data: []byte("a")})
+		}},
 		{"a type with a line feed", func(s *httpx.EventStream) error {
 			return s.Send(httpx.ServerEvent{Type: "a\nb", Data: []byte("a")})
 		}},
@@ -316,6 +368,9 @@ func TestEventStreamRefusesAnEventItCannotFrameAndWritesNothing(t *testing.T) {
 		}},
 		{"SendJSON with a line feed in the id", func(s *httpx.EventStream) error {
 			return s.SendJSON("1\n2", "t", 1)
+		}},
+		{"SendJSON with a NUL in the id", func(s *httpx.EventStream) error {
+			return s.SendJSON("1\x002", "t", 1)
 		}},
 		{"SendJSON with a line feed in the type", func(s *httpx.EventStream) error {
 			return s.SendJSON("1", "t\nx", 1)
@@ -421,7 +476,7 @@ func TestNewEventStreamLiftsTheWriteDeadline(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			dw := &deadlineWriter{spyWriter: newSpyWriter(), err: tc.err}
+			dw := &deadlineWriter{spyWriter: newSpyWriter(), errs: []error{tc.err}}
 			var w http.ResponseWriter = dw
 			if tc.wrap {
 				w = unwrapper{dw}
@@ -443,6 +498,93 @@ func TestNewEventStreamLiftsTheWriteDeadline(t *testing.T) {
 				assert.Empty(t, dw.statuses, "a refused stream writes no status")
 				assert.Empty(t, dw.Header(), "and sets no header")
 			}
+		})
+	}
+}
+
+func TestEventStreamBoundsEachSend(t *testing.T) {
+	tests := []struct {
+		name      string
+		limit     time.Duration
+		errs      []error
+		wantLimit time.Duration // zero: no deadline is set around a send
+	}{
+		{name: "the default is thirty seconds", wantLimit: 30 * time.Second},
+		{name: "a limit set", limit: 5 * time.Second, wantLimit: 5 * time.Second},
+		{name: "a negative limit sets none", limit: -time.Second},
+		{name: "a writer that does not support deadlines is not asked again", errs: []error{http.ErrNotSupported}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dw := &deadlineWriter{spyWriter: newSpyWriter(), errs: tc.errs}
+			s, err := httpx.NewEventStream(dw, getRequest(), httpx.EventStreamOptions{SendTimeout: tc.limit})
+			require.NoError(t, err)
+
+			before := time.Now()
+			require.NoError(t, s.Send(httpx.ServerEvent{Data: []byte("a")}))
+			require.NoError(t, s.Comment("c"))
+			after := time.Now()
+
+			if tc.wantLimit == 0 {
+				assert.Len(t, dw.deadlines, 1, "only the deadline lifted at the start")
+				return
+			}
+			// Lifted at the start, then for each send: set, and lifted again so
+			// that the time between sends does not count against the next one.
+			require.Len(t, dw.deadlines, 5)
+			for _, i := range []int{0, 2, 4} {
+				assert.True(t, dw.deadlines[i].IsZero(), "deadline %d should be lifted", i)
+			}
+			for _, i := range []int{1, 3} {
+				assert.WithinRange(t, dw.deadlines[i], before.Add(tc.wantLimit), after.Add(tc.wantLimit))
+			}
+		})
+	}
+}
+
+func TestASendWhoseDeadlineCannotBeSetFailsAndEndsTheStream(t *testing.T) {
+	boom := errors.New("connection is gone")
+	dw := &deadlineWriter{spyWriter: newSpyWriter(), errs: []error{nil, boom}}
+	s := newStream(t, dw)
+
+	require.ErrorIs(t, s.Send(httpx.ServerEvent{Data: []byte("a")}), boom)
+	assert.Empty(t, dw.Body.String(), "nothing is written under a deadline that was not set")
+	asked := len(dw.deadlines)
+
+	require.ErrorIs(t, s.Comment("c"), boom)
+	assert.Len(t, dw.deadlines, asked, "the stream is over, so nothing asks again")
+}
+
+func TestEventStreamIsUnusableAfterAFailedSend(t *testing.T) {
+	// A write that failed partway leaves half an event on the wire, so no later
+	// event could be framed after it.
+	boom := errors.New("broken pipe")
+	tests := []struct {
+		name string
+		fail func(*breakableWriter)
+	}{
+		{"a write that fails", func(w *breakableWriter) { w.writeErr = boom }},
+		{"a flush that fails", func(w *breakableWriter) { w.flushErr = boom }},
+	}
+	later := map[string]func(*httpx.EventStream) error{
+		"Send":     func(s *httpx.EventStream) error { return s.Send(httpx.ServerEvent{Data: []byte("b")}) },
+		"SendJSON": func(s *httpx.EventStream) error { return s.SendJSON("", "", 2) },
+		"Comment":  func(s *httpx.EventStream) error { return s.Comment("c") },
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bw := &breakableWriter{spyWriter: newSpyWriter()}
+			s := newStream(t, bw)
+			tc.fail(bw)
+
+			require.ErrorIs(t, s.Send(httpx.ServerEvent{Data: []byte("a")}), boom)
+			writes, written := bw.writes, bw.Body.Len()
+
+			for name, send := range later {
+				assert.ErrorIs(t, send(s), boom, name)
+			}
+			assert.Equal(t, writes, bw.writes, "a broken stream is not written to again")
+			assert.Equal(t, written, bw.Body.Len())
 		})
 	}
 }
@@ -506,12 +648,19 @@ func TestLastEventID(t *testing.T) {
 // test, and a handler still running then fails it.
 func serve(t *testing.T, writeTimeout time.Duration, handler http.Handler) string {
 	t.Helper()
+	return serveLogging(t, writeTimeout, handler, log.New(log.Options{Output: io.Discard}))
+}
+
+// serveLogging is serve with the server's logger given, which is also where
+// net/http reports what it dislikes: through ErrorLog, at warning level.
+func serveLogging(t *testing.T, writeTimeout time.Duration, handler http.Handler, logger *slog.Logger) string {
+	t.Helper()
 	srv := httpx.NewServer(httpx.ServerOptions{
 		Addr:            "127.0.0.1:0",
 		Handler:         handler,
 		WriteTimeout:    writeTimeout,
 		ShutdownTimeout: 2 * time.Second,
-		Logger:          log.New(log.Options{Output: io.Discard}),
+		Logger:          logger,
 	})
 	require.NoError(t, srv.Listen())
 	done := make(chan error, 1)
@@ -712,14 +861,16 @@ func tickingHandler(open func(http.ResponseWriter, *http.Request) (func(id int) 
 	}
 }
 
-func viaEventStream(w http.ResponseWriter, r *http.Request) (func(int) error, error) {
-	s, err := httpx.NewEventStream(w, r, httpx.EventStreamOptions{})
-	if err != nil {
-		return nil, err
+func viaEventStream(opts httpx.EventStreamOptions) func(http.ResponseWriter, *http.Request) (func(int) error, error) {
+	return func(w http.ResponseWriter, r *http.Request) (func(int) error, error) {
+		s, err := httpx.NewEventStream(w, r, opts)
+		if err != nil {
+			return nil, err
+		}
+		return func(id int) error {
+			return s.Send(httpx.ServerEvent{ID: strconv.Itoa(id), Data: []byte("tick")})
+		}, nil
 	}
-	return func(id int) error {
-		return s.Send(httpx.ServerEvent{ID: strconv.Itoa(id), Data: []byte("tick")})
-	}, nil
 }
 
 func viaPlainWrites(w http.ResponseWriter, _ *http.Request) (func(int) error, error) {
@@ -736,20 +887,36 @@ func viaPlainWrites(w http.ResponseWriter, _ *http.Request) (func(int) error, er
 func TestEventStreamOutlivesTheServersWriteTimeout(t *testing.T) {
 	// The router's own timeout is off, as the design says a long stream's must
 	// be; only the server's write timeout is left, and a stream five times as
-	// long as it must still arrive whole.
-	router := newTestRouter(t, httpx.RouterOptions{Timeout: -1})
-	router.Get("/stream", tickingHandler(viaEventStream))
-	base := serve(t, shortWriteTimeout, router)
+	// long as it must still arrive whole. Each send has its own limit, so a
+	// limit shorter than the whole stream must not end it either.
+	tests := []struct {
+		name string
+		opts httpx.EventStreamOptions
+	}{
+		{"with the default send limit", httpx.EventStreamOptions{}},
+		{"with a send limit shorter than the stream", httpx.EventStreamOptions{SendTimeout: 3 * tickEvery}},
+		{"with no send limit", httpx.EventStreamOptions{SendTimeout: -1}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			router := newTestRouter(t, httpx.RouterOptions{Timeout: -1})
+			router.Get("/stream", tickingHandler(viaEventStream(tc.opts)))
+			base := serve(t, shortWriteTimeout, router)
 
-	start := time.Now()
-	events, err := collectEvents(streamContext(t), t, base+"/stream")
-	elapsed := time.Since(start)
+			start := time.Now()
+			events, err := collectEvents(streamContext(t), t, base+"/stream")
+			elapsed := time.Since(start)
 
-	require.NoError(t, err)
-	assert.Len(t, events, tickCount)
-	assert.Equal(t, "id: 1\ndata: tick\n\n", events[0])
-	assert.Equal(t, "id: 10\ndata: tick\n\n", events[tickCount-1])
-	assert.Greater(t, elapsed, 3*shortWriteTimeout, "the stream must have run past the write timeout")
+			require.NoError(t, err)
+			assert.Len(t, events, tickCount)
+			assert.Equal(t, "id: 1\ndata: tick\n\n", events[0])
+			assert.Equal(t, "id: 10\ndata: tick\n\n", events[tickCount-1])
+			assert.Greater(t, elapsed, 3*shortWriteTimeout, "the stream must have run past the write timeout")
+			if tc.opts.SendTimeout > 0 {
+				assert.Greater(t, elapsed, tc.opts.SendTimeout, "and past the limit on a send")
+			}
+		})
+	}
 }
 
 func TestPlainWritesAreCutOffByTheWriteTimeoutWhichTheFixtureMustShow(t *testing.T) {
@@ -786,19 +953,127 @@ func TestPlainWritesAreCutOffByTheWriteTimeoutWhichTheFixtureMustShow(t *testing
 func TestEventStreamEndsWithTheRoutersTimeout(t *testing.T) {
 	// The helper does not outlive the request context, and the router's
 	// timeout ends that context: a deployment that wants one long connection
-	// builds its router with Timeout -1.
-	sendErr := make(chan error, 1)
-	router := newTestRouter(t, httpx.RouterOptions{Timeout: 150 * time.Millisecond})
+	// builds its router with Timeout -1. Ending a stream this way is ordinary,
+	// since the client reconnects, so it must not be logged as a problem: the
+	// logger here keeps only warnings and above, which is also where net/http
+	// reports a second status written to a response already sent.
+	type ending struct {
+		err  error
+		sent int
+	}
+	problems := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(problems, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	ended := make(chan ending, 1)
+	router := newTestRouter(t, httpx.RouterOptions{Timeout: 150 * time.Millisecond, Logger: logger})
 	router.Get("/stream", func(w http.ResponseWriter, r *http.Request) {
 		s, err := httpx.NewEventStream(w, r, httpx.EventStreamOptions{})
 		if !assert.NoError(t, err) {
 			return
 		}
+		sent := 0
+		send := func() error {
+			err := s.Send(httpx.ServerEvent{Data: []byte("tick")})
+			if err == nil {
+				sent++
+			}
+			return err
+		}
 		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
-		for range ticker.C {
-			if err := s.Send(httpx.ServerEvent{Data: []byte("tick")}); err != nil {
-				sendErr <- err
+		err = send()
+		for err == nil {
+			<-ticker.C
+			err = send()
+		}
+		ended <- ending{err, sent}
+	})
+	base := serveLogging(t, 0, router, logger)
+
+	events, err := collectEvents(streamContext(t), t, base+"/stream")
+
+	require.NoError(t, err, "the stream ends cleanly, which is what lets EventSource reconnect")
+	select {
+	case end := <-ended:
+		assert.ErrorIs(t, end.err, context.DeadlineExceeded)
+		assert.Len(t, events, end.sent, "the client received every event the handler sent")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler was still sending after the router's timeout")
+	}
+	assert.Empty(t, problems.String(), "a stream ended by the router's timeout logged a warning")
+}
+
+func TestASendToAClientThatStopsReadingIsBounded(t *testing.T) {
+	// The write deadline is lifted for the stream, so without a limit on each
+	// send a client that stays connected and stops reading holds the handler in
+	// its write once the socket buffers are full, whatever the context says.
+	const limit = 200 * time.Millisecond
+	type result struct {
+		err     error
+		elapsed time.Duration
+		again   error
+	}
+	tests := []struct {
+		name string
+		size int
+	}{
+		{"large events block a write", 256 << 10},
+		{"small events block a flush", 1500},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ended := make(chan result, 1)
+			router := newTestRouter(t, httpx.RouterOptions{})
+			router.Get("/stream", func(w http.ResponseWriter, r *http.Request) {
+				s, err := httpx.NewEventStream(w, r, httpx.EventStreamOptions{SendTimeout: limit})
+				if !assert.NoError(t, err) {
+					return
+				}
+				event := httpx.ServerEvent{Data: bytes.Repeat([]byte("x"), tc.size)}
+				for {
+					start := time.Now()
+					if err := s.Send(event); err != nil {
+						ended <- result{err, time.Since(start), s.Comment("anyone there")}
+						return
+					}
+				}
+			})
+			base := serve(t, 0, router)
+			// The client reads the headers and then nothing, so its socket
+			// buffers fill and stay full.
+			openStream(streamContext(t), t, base+"/stream", nil)
+
+			select {
+			case res := <-ended:
+				require.ErrorIs(t, res.err, os.ErrDeadlineExceeded)
+				// The send that fails is the one that was held up, not a later one
+				// that found the connection already broken: a flush error lost on
+				// the way up would show as a failure that came at once.
+				assert.GreaterOrEqual(t, res.elapsed, limit, "the send that failed was not the one held up")
+				assert.Less(t, res.elapsed, 2*time.Second, "the send that hit the limit took far longer than it")
+				assert.ErrorIs(t, res.again, res.err, "the stream is unusable afterwards")
+			case <-time.After(4 * time.Second):
+				t.Fatal("a send to a client that stopped reading was still blocked after four seconds")
+			}
+		})
+	}
+}
+
+func TestAnIdleStreamStillEndsCleanlyAfterItsSendLimit(t *testing.T) {
+	// The deadline around a send is lifted again once the event is out. Left in
+	// place it would run out while the stream sat idle, and the write that ends
+	// the response would be the one to fail: the client would see a cut stream.
+	const limit = 50 * time.Millisecond
+	router := newTestRouter(t, httpx.RouterOptions{Timeout: -1})
+	router.Get("/stream", func(w http.ResponseWriter, r *http.Request) {
+		s, err := httpx.NewEventStream(w, r, httpx.EventStreamOptions{SendTimeout: limit})
+		if !assert.NoError(t, err) {
+			return
+		}
+		for _, data := range []string{"first", "second"} {
+			assert.NoError(t, s.Send(httpx.ServerEvent{Data: []byte(data)}))
+			select {
+			case <-time.After(4 * limit):
+			case <-r.Context().Done():
 				return
 			}
 		}
@@ -807,14 +1082,8 @@ func TestEventStreamEndsWithTheRoutersTimeout(t *testing.T) {
 
 	events, err := collectEvents(streamContext(t), t, base+"/stream")
 
-	require.NoError(t, err, "the stream ends cleanly, which is what lets EventSource reconnect")
-	assert.NotEmpty(t, events)
-	select {
-	case err := <-sendErr:
-		assert.ErrorIs(t, err, context.DeadlineExceeded)
-	case <-time.After(2 * time.Second):
-		t.Fatal("the handler was still sending after the router's timeout")
-	}
+	require.NoError(t, err, "the stream was cut instead of ending")
+	assert.Equal(t, []string{"data: first\n\n", "data: second\n\n"}, events)
 }
 
 func TestAClientThatGoesAwayEndsTheHandlerThroughTheRequestContext(t *testing.T) {
