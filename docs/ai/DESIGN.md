@@ -4539,8 +4539,9 @@ chose them.
     comments of any number or length do not reach it. The check is made
     while a line is being read, so a line that never ends is refused at the
     bound. Rejected: checking the assembled event, which allocates first
-    and checks after. The error is not exported, since no caller has a
-    decision to make about it.
+    and checks after. The error is exported, `ErrEventTooLarge`, since a
+    provider has a decision to make about it: a retry meets the same event,
+    so it is not a transport failure.
 
 40. **A send on an event stream is bounded, though the stream is not.**
     `NewEventStream` lifts the write deadline so that a stream can outlive

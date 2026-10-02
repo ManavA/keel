@@ -158,7 +158,7 @@ func (c *Client) endOfStream(ctx context.Context, st *streamState, requested str
 		return c.response(st.assembled(), requested), nil
 	case cause == nil:
 		cause = fmt.Errorf("stream ended with [DONE] and no reply before it: %w", io.ErrUnexpectedEOF)
-	case eventTooLarge(cause):
+	case errors.Is(cause, sse.ErrEventTooLarge):
 		return nil, fmt.Errorf("openai: a stream event is larger than %d bytes", sse.MaxEventBytes)
 	case errors.Is(cause, io.EOF):
 		cause = fmt.Errorf("stream ended before a finish reason or [DONE]: %w", io.ErrUnexpectedEOF)
@@ -166,14 +166,6 @@ func (c *Client) endOfStream(ctx context.Context, st *streamState, requested str
 		cause = fmt.Errorf("stream ended before a finish reason or [DONE]: %w", cause)
 	}
 	return nil, failed(ctx, cause)
-}
-
-// eventTooLarge reports whether err is the reader's refusal of an event over
-// its bound. Of the reader's errors it is the one that wraps no cause: a
-// failed read wraps the failure, and a stream cut short wraps
-// io.ErrUnexpectedEOF.
-func eventTooLarge(err error) bool {
-	return !errors.Is(err, io.EOF) && errors.Unwrap(err) == nil && strings.HasPrefix(err.Error(), "sse:")
 }
 
 // streamState accumulates the chunks of one stream.

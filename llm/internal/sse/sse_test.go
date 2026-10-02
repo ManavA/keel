@@ -358,8 +358,9 @@ func TestReader_EventOverTheBound(t *testing.T) {
 		r := sse.NewReader(strings.NewReader(field + payload + "\n\ndata: next\n\n"))
 
 		_, err := r.Next()
-		require.Error(t, err)
+		require.ErrorIs(t, err, sse.ErrEventTooLarge)
 		assert.NotErrorIs(t, err, io.EOF)
+		assert.NotErrorIs(t, err, io.ErrUnexpectedEOF, "a provider must not read it as a stream cut short")
 		assert.Contains(t, err.Error(), "16777216")
 
 		_, again := r.Next()
