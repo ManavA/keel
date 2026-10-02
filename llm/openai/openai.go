@@ -29,14 +29,22 @@
 //
 // # Streams
 //
-// A stream is complete once a chunk has carried a finish reason. The usage
+// A reply is complete once a chunk has carried a finish reason. The usage
 // arrives after it, on a chunk with no choices, so the reply waits for that
 // chunk and for the end of the stream. If the connection is cut after the
 // finish reason the reply is returned as it stands, with zero usage when the
-// usage chunk was lost, whether or not the closing data: [DONE] arrived. A
-// cut before it is a failure of the connection: an [*llm.Error] with Err set
-// and Retryable true, unless the context ended. Whatever was delivered to the
-// callback before the cut stays delivered.
+// usage chunk was lost, whether or not the closing data: [DONE] arrived.
+//
+// Some servers never send a finish reason. A stream that ends cleanly with
+// data: [DONE] and no finish reason is complete too, and its stop reason is
+// read from what the reply holds: [llm.StopToolUse] when it made tool calls,
+// [llm.StopRefusal] for a refusal, [llm.StopEnd] otherwise. The Response has no
+// field for the missing reason, so it is logged at debug level.
+//
+// A stream that stops with neither a finish reason nor [DONE], whether it is
+// cut or simply ends, is a failure of the connection: an [*llm.Error] with Err
+// set and Retryable true, unless the context ended. Whatever was delivered to
+// the callback before the cut stays delivered.
 //
 // # Errors
 //

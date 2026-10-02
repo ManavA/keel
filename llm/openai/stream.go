@@ -64,7 +64,7 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, fn func(llm.Delta)
 		case len(data) == 0:
 			continue
 		case string(data) == doneMarker:
-			return c.endOfStream(ctx, st, c.modelFor(req), io.EOF)
+			return c.endOfStream(ctx, st, c.modelFor(req), nil)
 		}
 
 		var ch wireChunk
@@ -80,23 +80,32 @@ func (c *Client) Stream(ctx context.Context, req llm.Request, fn func(llm.Delta)
 	}
 }
 
-// endOfStream settles a stream that has stopped, cleanly or not. A reply is
-// complete once a chunk has carried a finish reason, and what stops after
-// that, a dropped connection or a missing [DONE], is of no consequence beyond
-// a usage chunk that may not have arrived. Any earlier stop is a failure of
-// the connection, which the same request may get past.
+// endOfStream settles a stream that has stopped. cause is why the reader
+// stopped, or nil when the stream ended with [DONE].
+//
+// There are three ways it ends well or badly. A chunk carried a finish reason:
+// the reply is complete, and what stops after it, a dropped connection or a
+// missing [DONE], matters only for a usage chunk that may not have arrived.
+// No chunk did but [DONE] arrived: some servers never send a finish reason, so
+// the reply is complete and its stop reason is read from what it holds. Neither:
+// the connection failed, which the same request may get past.
 func (c *Client) endOfStream(ctx context.Context, st *streamState, requested string, cause error) (*llm.Response, error) {
-	if st.finished {
-		if !errors.Is(cause, io.EOF) {
+	switch {
+	case st.finished:
+		if cause != nil && !errors.Is(cause, io.EOF) {
 			c.log.Warn("openai: stream cut after its finish reason; its usage may be missing", "error", cause)
 		}
 		return c.response(st.reply(), requested), nil
+	case cause == nil:
+		c.log.Debug("openai: stream ended with [DONE] and no finish_reason; the stop reason is read from the reply")
+		return c.response(st.reply(), requested), nil
 	}
+
 	if errors.Is(cause, io.EOF) {
 		cause = io.ErrUnexpectedEOF
 	}
 	if errors.Is(cause, io.ErrUnexpectedEOF) {
-		cause = fmt.Errorf("stream ended before a finish reason: %w", cause)
+		cause = fmt.Errorf("stream ended before a finish reason or [DONE]: %w", cause)
 	}
 	return nil, transportError(ctx, cause)
 }

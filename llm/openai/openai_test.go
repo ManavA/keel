@@ -213,7 +213,7 @@ func TestNew_DoesNotShareTheCallersHeader(t *testing.T) {
 func logged() (*slog.Logger, func() string) {
 	var buf bytes.Buffer
 	var mu sync.Mutex
-	h := slog.NewTextHandler(&lockedWriter{mu: &mu, w: &buf}, &slog.HandlerOptions{Level: slog.LevelWarn})
+	h := slog.NewTextHandler(&lockedWriter{mu: &mu, w: &buf}, &slog.HandlerOptions{Level: slog.LevelDebug})
 	return slog.New(h), func() string {
 		mu.Lock()
 		defer mu.Unlock()

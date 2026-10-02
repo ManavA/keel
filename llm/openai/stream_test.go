@@ -302,6 +302,36 @@ func TestStream_BuildsWhatGenerateBuilds(t *testing.T) {
 			wantDeltas: []llm.Delta{{Text: "hi"}},
 		},
 		{
+			name: "no finish reason, ended by DONE: a reply of text is an end",
+			events: []string{
+				chunk(textDelta("Hel"), ""),
+				chunk(textDelta("lo"), ""),
+				usageChunk(finalUsage),
+			},
+			equivalent: completion(`{"role":"assistant","content":"Hello"}`, `null`, finalUsage),
+			wantDeltas: []llm.Delta{{Text: "Hel"}, {Text: "lo"}},
+		},
+		{
+			name: "no finish reason, ended by DONE: a reply that made calls is a tool use",
+			events: []string{
+				chunk(callsDelta(callPiece(0, "c1", "f", `{"a":`)), ""),
+				chunk(callsDelta(callPiece(0, "", "", `1}`)), ""),
+			},
+			equivalent: completion(`{"role":"assistant","content":null,"tool_calls":[`+
+				`{"id":"c1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]}`, `null`, ""),
+			wantDeltas: []llm.Delta{
+				{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "c1", Name: "f", InputJSON: `{"a":`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 0, InputJSON: `1}`}},
+			},
+		},
+		{
+			name: "no finish reason, ended by DONE: a refusal is a refusal",
+			events: []string{
+				chunk(`{"refusal":"I can't help."}`, ""),
+			},
+			equivalent: completion(`{"role":"assistant","content":null,"refusal":"I can't help."}`, `null`, ""),
+		},
+		{
 			name: "a finish reason this package does not know, with text",
 			events: []string{
 				chunk(textDelta("hi"), ""),
@@ -516,9 +546,10 @@ func TestStream_ErrorChunk(t *testing.T) {
 	}
 }
 
-// Each case is a stream cut at one point. A cut after the finish chunk comes
-// too late to matter and the reply is complete, whether or not DONE arrived;
-// any earlier cut is a failure of the connection.
+// Each case is a stream stopped at one point. A reply is complete once a chunk
+// has carried a finish reason, whatever follows, and also when the stream ends
+// with a clean DONE even though no chunk did, since some servers never send
+// one. A stream that stops with neither is a failure of the connection.
 func TestStream_CutShort(t *testing.T) {
 	head := "data: " + chunk(`{"role":"assistant","content":""}`, "") + "\n\n" +
 		"data: " + chunk(textDelta("Hel"), "") + "\n\n"
@@ -544,11 +575,15 @@ func TestStream_CutShort(t *testing.T) {
 		{name: "before the finish chunk, in the middle of a data line", body: head + `data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"lo`},
 		{name: "in the middle of the finish chunk itself, before its blank line", body: head + "data: " + chunk(`{}`, "stop") + "\n"},
 		{name: "in the middle of the finish chunk's name", body: head + "dat"},
-		{name: "DONE with no finish chunk before it", body: head + "data: [DONE]\n\n"},
+		{name: "in the middle of DONE, with no finish chunk", body: head + "data: [DO"},
+		{name: "DONE with no blank line, so the event is never delivered, and no finish chunk", body: head + "data: [DONE]\n"},
+		{name: "after the usage chunk, with neither a finish chunk nor DONE", body: head + usage},
 		{name: "an empty stream", body: ""},
 		{name: "only comments", body: ": keep-alive\n\n"},
 
 		{name: "after the finish chunk, between events, no usage, no DONE", body: head + finish, want: partial},
+		{name: "no finish chunk, but a clean DONE: the server sends none", body: head + "data: [DONE]\n\n", want: partial},
+		{name: "no finish chunk, a usage chunk and then a clean DONE", body: head + usage + "data: [DONE]\n\n", want: &withUsage},
 		{name: "after the finish chunk, in the middle of the usage chunk", body: head + finish + `data: {"id":"chatcmpl-1","choices":[],"usage":{"prompt_tok`, want: partial},
 		{name: "after the finish chunk, in the middle of DONE", body: head + finish + "data: [DO", want: partial},
 		{name: "after the finish chunk, DONE arrived cleanly, no usage", body: head + finish + "data: [DONE]\n\n", want: partial},
@@ -652,4 +687,56 @@ func TestStream_ACleanEndIsNotLogged(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Empty(t, written())
+}
+
+func TestStream_NoFinishReasonButACleanDone(t *testing.T) {
+	t.Run("a reply of text ends as an end", func(t *testing.T) {
+		resp, _, err := stream(t, serveStream(sseBody(chunk(textDelta("hi"), ""))))
+		require.NoError(t, err)
+		assert.Equal(t, llm.StopEnd, resp.Stop)
+		assert.Equal(t, "hi", resp.Message.Text)
+	})
+	t.Run("a reply that made calls ends as a tool use, from the calls assembled", func(t *testing.T) {
+		resp, _, err := stream(t, serveStream(sseBody(chunk(callsDelta(callPiece(0, "c1", "f", `{}`)), ""))))
+		require.NoError(t, err)
+		assert.Equal(t, llm.StopToolUse, resp.Stop)
+		require.Len(t, resp.Message.ToolCalls, 1)
+	})
+	t.Run("a stream of nothing but DONE is an empty reply, as the server said", func(t *testing.T) {
+		resp, deltas, err := stream(t, serveStream("data: [DONE]\n\n"))
+		require.NoError(t, err)
+		assert.Equal(t, llm.StopEnd, resp.Stop)
+		assert.Empty(t, resp.Message.Text)
+		assert.Empty(t, deltas)
+	})
+}
+
+// The reply carries no field for it, so the missing finish reason is a debug
+// line, and a finish reason that did arrive logs nothing.
+func TestStream_NoFinishReasonIsLoggedAtDebug(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantLog string
+	}{
+		{name: "none sent", body: sseBody(chunk(textDelta("hi"), "")), wantLog: "no finish_reason"},
+		{name: "one sent", body: sseBody(chunk(textDelta("hi"), ""), chunk(`{}`, "stop"))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, written := logged()
+			srv, _ := newServer(t, serveStream(tt.body))
+
+			_, err := newClient(t, srv, func(o *openai.Options) { o.Logger = logger }).
+				Stream(t.Context(), llm.Request{Messages: userMsg("hi")}, func(llm.Delta) error { return nil })
+
+			require.NoError(t, err)
+			if tt.wantLog == "" {
+				assert.Empty(t, written())
+				return
+			}
+			assert.Contains(t, written(), tt.wantLog)
+			assert.Contains(t, written(), "level=DEBUG")
+		})
+	}
 }
