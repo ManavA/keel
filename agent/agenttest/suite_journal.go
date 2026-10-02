@@ -613,6 +613,21 @@ func updateStepCases() []storeCase {
 			require.Error(k.t, err)
 			k.unchanged(before)
 		}},
+		{"another spelling of a UUID is refused as a child run's id", func(k *kit) {
+			run, lease := k.proposed(agentAlpha)
+			k.update(lease, 2, agent.StepProposed, agent.StepStarted)
+			child := k.createChild(run)
+			before := k.snapshot(run.ID)
+
+			for _, other := range otherSpellings {
+				err := k.store.UpdateStep(k.ctx, lease, agent.StepUpdate{
+					Seq: 2, From: agent.StepStarted, To: agent.StepWaiting, ChildRunID: other.spell(child.ID), Now: k.tick(),
+				})
+
+				require.Error(k.t, err, other.name)
+				k.unchanged(before)
+			}
+		}},
 		{"a move made twice is refused the second time", func(k *kit) {
 			run, lease := k.proposed(agentAlpha)
 			k.update(lease, 2, agent.StepProposed, agent.StepStarted)

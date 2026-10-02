@@ -81,22 +81,6 @@ func TestMemoryStore_TakesAUUIDInItsCanonicalFormOnly(t *testing.T) {
 	}
 }
 
-func TestMemoryStore_RefusesAttributesJSONCannotHold(t *testing.T) {
-	f := newMemoryFixture(t)
-	require.NoError(t, f.store.UpdateStep(f.ctx, f.lease, agent.StepUpdate{
-		Seq: 3, From: agent.StepWaiting, To: agent.StepStarted, Now: f.tick(),
-	}))
-	before := f.state()
-	req := memoryQuestion(f.tick())
-	req.ID, req.From = memoryID("9000", 2), agent.StepStarted
-	req.Action.Attrs = map[string]any{"reply": make(chan string)}
-
-	_, err := f.store.RequestApproval(f.ctx, f.lease, req)
-
-	require.Error(t, err)
-	assert.Equal(t, before, f.state(), "nothing was recorded")
-}
-
 var memoryStart = time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)
 
 // The ids the fixtures use. A store keeps a run or an approval only under a

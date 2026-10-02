@@ -35,6 +35,11 @@ const (
 // on the other: an id must be a UUID in its canonical form, a child's parent
 // must exist, and metadata and an action's attributes come back as a JSON
 // round trip gives them.
+//
+// Every method makes its checks in one order. First what the request alone
+// shows to be wrong, before the store is looked at; then whether the run
+// exists; then, for a method that takes a Lease, whether the lease is the
+// run's; and only then the state of the run, its steps and its approvals.
 type MemoryStore struct {
 	mu   sync.Mutex
 	runs map[string]*memoryRun
@@ -78,8 +83,15 @@ func (s *MemoryStore) CreateRun(_ context.Context, run Run) (Run, bool, error) {
 	if !isUUID(run.ID) {
 		return Run{}, false, fmt.Errorf("agent: create run: id %q is not a UUID", run.ID)
 	}
+	if run.ParentID != "" && !isUUID(run.ParentID) {
+		return Run{}, false, fmt.Errorf("agent: create run: parent id %q is not a UUID", run.ParentID)
+	}
 	if run.Status != StatusRunnable {
 		return Run{}, false, fmt.Errorf("agent: create run: status is %q, not %q", run.Status, StatusRunnable)
+	}
+	metadata, err := storedMetadata(run.Metadata)
+	if err != nil {
+		return Run{}, false, fmt.Errorf("agent: create run: %w", err)
 	}
 
 	s.mu.Lock()
@@ -99,17 +111,14 @@ func (s *MemoryStore) CreateRun(_ context.Context, run Run) (Run, bool, error) {
 	if run.ParentID != "" {
 		named, ok := s.runs[run.ParentID]
 		if !ok {
-			// An id that is not a UUID names no run either.
-			return Run{}, false, fmt.Errorf("agent: create run: parent %q does not exist", run.ParentID)
+			return Run{}, false, fmt.Errorf("agent: create run: parent %s does not exist", run.ParentID)
 		}
 		parent = named
 	}
 
 	r := &memoryRun{run: cloneRun(run)}
 	r.run.Rev = 1
-	if r.run.Metadata == nil {
-		r.run.Metadata = map[string]string{}
-	}
+	r.run.Metadata = metadata
 	s.runs[run.ID] = r
 	s.order = append(s.order, r)
 	if run.Key != "" {
@@ -352,15 +361,16 @@ func hasPending(r *memoryRun) bool {
 
 // Finish implements Store.
 func (s *MemoryStore) Finish(_ context.Context, lease Lease, req FinishRequest) error {
+	if !(Run{Status: req.Status}).Terminal() {
+		return fmt.Errorf("agent: finish: status %q does not end a run", req.Status)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	r, err := s.held(lease)
 	if err != nil {
 		return err
-	}
-	if !(Run{Status: req.Status}).Terminal() {
-		return fmt.Errorf("agent: finish: status %q does not end a run", req.Status)
 	}
 
 	finished := req.Now
@@ -841,10 +851,28 @@ func cloneApproval(a Approval) Approval {
 	return a
 }
 
+// storedMetadata is metadata as it reads back from a store: through JSON,
+// so a byte that is no UTF-8 is the replacement character, and none is an
+// empty map.
+func storedMetadata(metadata map[string]string) (map[string]string, error) {
+	text, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("metadata: %w", err)
+	}
+	var stored map[string]string
+	if err := json.Unmarshal(text, &stored); err != nil {
+		return nil, fmt.Errorf("metadata: %w", err)
+	}
+	if stored == nil {
+		stored = map[string]string{}
+	}
+	return stored, nil
+}
+
 // storedAction is a as it reads back from a store: its attributes through
-// JSON, so a number is a float64, an object a map[string]any and a list a
-// []any, and no attributes are an empty map. It fails for attributes JSON
-// cannot hold.
+// JSON, so a number is a float64 (and an integer past 2^53 is no longer
+// exact), an object a map[string]any and a list a []any, and no attributes
+// are an empty map. It fails for attributes JSON cannot hold.
 func storedAction(a Action) (Action, error) {
 	text, err := json.Marshal(a.Attrs)
 	if err != nil {

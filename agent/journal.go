@@ -65,8 +65,8 @@ type Run struct {
 	// Key is the caller's idempotency key for starting the run.
 	Key        string   `json:"key,omitempty"`
 	Definition Snapshot `json:"definition"`
-	// Metadata is the caller's own. A run started with none reads back with
-	// an empty map.
+	// Metadata is the caller's own. It reads back as JSON gives it, and as
+	// an empty map when the run was started with none.
 	Metadata map[string]string `json:"metadata,omitempty"`
 
 	Usage        Usage `json:"usage"`
@@ -213,8 +213,9 @@ type Approval struct {
 	// Input is the call's arguments: exactly what runs if approved.
 	Input json.RawMessage `json:"input"`
 	// Action is what the Guard was asked about. Its Attrs read back as JSON
-	// gives them, a number as a float64, and as an empty map when there
-	// were none.
+	// gives them, and as an empty map when there were none. A number comes
+	// back as a float64, so an integer above 2^53 is no longer exact: put
+	// one that must be in a string.
 	Action Action `json:"action"`
 	Rule   string `json:"rule"`
 

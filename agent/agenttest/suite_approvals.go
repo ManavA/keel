@@ -85,9 +85,11 @@ func requestApprovalCases() []storeCase {
 				"nested":        map[string]any{"to": "a", "n": 2},
 				"list":          []any{"x", 1, false},
 				"names":         []string{"a", "b"},
+				"text":          "caf\xff",
 			}
 			// A number is a float64, an object a map[string]any and a list
-			// a []any, whatever Go type they were given as.
+			// a []any, whatever Go type they were given as, and a byte that
+			// is no UTF-8 is the replacement character.
 			want := map[string]any{
 				agent.AttrAgent: agentAlpha,
 				agent.AttrSeq:   float64(2),
@@ -97,6 +99,7 @@ func requestApprovalCases() []storeCase {
 				"nested":        map[string]any{"to": "a", "n": float64(2)},
 				"list":          []any{"x", float64(1), false},
 				"names":         []any{"a", "b"},
+				"text":          "caf\ufffd",
 			}
 
 			got, err := k.store.RequestApproval(k.ctx, lease, req)
@@ -126,6 +129,37 @@ func requestApprovalCases() []storeCase {
 			assert.Equal(k.t, agent.StepWaiting, step.Status)
 			assert.Equal(k.t, agent.Allow, step.Decision)
 			assert.Equal(k.t, suiteRule, step.Rule)
+		}},
+		{"attributes JSON cannot hold are refused", func(k *kit) {
+			run, lease := k.proposed(agentAlpha)
+			before := k.snapshot(run.ID)
+			req := k.askRequest(2)
+			req.Action.Attrs = map[string]any{agent.AttrTool: toolSend, "reply": make(chan string)}
+
+			_, err := k.store.RequestApproval(k.ctx, lease, req)
+
+			require.Error(k.t, err)
+			assert.NotErrorIs(k.t, err, agent.ErrConflict)
+			k.unchanged(before)
+			_, err = k.store.GetApproval(k.ctx, req.ID)
+			assert.ErrorIs(k.t, err, agent.ErrNotFound)
+		}},
+		{"another spelling of a UUID is refused as an approval's id", func(k *kit) {
+			run, lease := k.proposed(agentAlpha)
+			before := k.snapshot(run.ID)
+
+			for _, other := range otherSpellings {
+				req := k.askRequest(2)
+				canonical := req.ID
+				req.ID = other.spell(canonical)
+
+				_, err := k.store.RequestApproval(k.ctx, lease, req)
+
+				require.Error(k.t, err, other.name)
+				k.unchanged(before)
+				_, err = k.store.GetApproval(k.ctx, canonical)
+				assert.ErrorIs(k.t, err, agent.ErrNotFound, "it was not recorded under the form a database would keep")
+			}
 		}},
 		{"an approval id that is not a UUID is refused", func(k *kit) {
 			run, lease := k.proposed(agentAlpha)
@@ -842,6 +876,14 @@ func listApprovalsCases() []storeCase {
 			}
 			for _, tt := range tests {
 				assert.Equal(k.t, tt.want, list(k, tt.filter), tt.name)
+			}
+		}},
+		{"a run's id in another spelling lists nothing", func(k *kit) {
+			run, pending := k.parked(agentAlpha, nil)
+			require.Equal(k.t, []string{pending.ID}, list(k, agent.ApprovalFilter{RunID: run.ID}))
+
+			for _, other := range otherSpellings {
+				assert.Empty(k.t, list(k, agent.ApprovalFilter{RunID: other.spell(run.ID)}), other.name)
 			}
 		}},
 		{"returns 50 by default and never more than 200", func(k *kit) {

@@ -160,6 +160,41 @@ func createRunCases() []storeCase {
 			valid.ParentID = parent.ID
 			k.insert(valid)
 		}},
+		{"another spelling of a UUID is refused, as the run's id and as its parent's", func(k *kit) {
+			parent := k.create(agentAlpha)
+			for _, other := range otherSpellings {
+				asID := k.newRun(agentBeta)
+				canonical := asID.ID
+				asID.ID = other.spell(canonical)
+				_, created, err := k.store.CreateRun(k.ctx, asID)
+				require.Error(k.t, err, "the run's id %s", other.name)
+				assert.False(k.t, created)
+				_, err = k.store.GetRun(k.ctx, canonical)
+				assert.ErrorIs(k.t, err, agent.ErrNotFound, "it was not stored under the form a database would keep")
+
+				// The parent exists, under the one spelling of its id.
+				asParent := k.newRun(agentBeta)
+				asParent.ParentID = other.spell(parent.ID)
+				_, created, err = k.store.CreateRun(k.ctx, asParent)
+				require.Error(k.t, err, "the parent's id %s", other.name)
+				assert.False(k.t, created)
+				_, err = k.store.GetRun(k.ctx, asParent.ID)
+				assert.ErrorIs(k.t, err, agent.ErrNotFound, "the child was not stored")
+			}
+		}},
+		{"reads metadata back as JSON gives it", func(k *kit) {
+			run := k.newRun(agentAlpha)
+			// A byte that is no UTF-8 cannot be kept as text, and comes
+			// back as the replacement character JSON writes for it.
+			run.Metadata = map[string]string{"note": "caf\xff", "markup": "<a href=\"x\">&</a>", "empty": ""}
+			want := map[string]string{"note": "caf\ufffd", "markup": "<a href=\"x\">&</a>", "empty": ""}
+
+			stored, _, err := k.store.CreateRun(k.ctx, run)
+
+			require.NoError(k.t, err)
+			assert.Equal(k.t, want, stored.Metadata, "as returned")
+			assert.Equal(k.t, want, k.run(run.ID).Metadata, "as read")
+		}},
 		{"an id already taken is refused, and the run that has it is left alone", func(k *kit) {
 			first := k.create(agentAlpha)
 
@@ -248,6 +283,15 @@ func listRunsCases() []storeCase {
 				assert.Equal(k.t, tt.want, list(k, tt.filter), tt.name)
 			}
 		}},
+		{"a parent's id in another spelling lists nothing", func(k *kit) {
+			parent := k.create(agentAlpha)
+			child := k.createChild(parent)
+			require.Equal(k.t, []string{child.ID}, list(k, agent.RunFilter{ParentID: parent.ID}))
+
+			for _, other := range otherSpellings {
+				assert.Empty(k.t, list(k, agent.RunFilter{ParentID: other.spell(parent.ID)}), other.name)
+			}
+		}},
 		{"returns 50 by default and never more than 200", func(k *kit) {
 			const total = 205
 			all := make([]string, total)
@@ -329,77 +373,95 @@ func notFoundCases() []storeCase {
 	// store would accept.
 	calls := []struct {
 		name string
-		call func(k *kit, id string) error
+		// approval says the id names an approval, where the others name a
+		// run.
+		approval bool
+		call     func(k *kit, id string) error
 	}{
-		{"GetRun", func(k *kit, id string) error {
+		{"GetRun", false, func(k *kit, id string) error {
 			_, err := k.store.GetRun(k.ctx, id)
 			return err
 		}},
-		{"Claim", func(k *kit, id string) error {
+		{"Claim", false, func(k *kit, id string) error {
 			run, err := k.store.Claim(k.ctx, agent.ClaimRequest{
 				Owner: workerA, Agents: suiteAgents, RunID: id, Now: k.tick(), TTL: suiteTTL,
 			})
 			assert.Nil(k.t, run)
 			return err
 		}},
-		{"Heartbeat", func(k *kit, id string) error {
+		{"Heartbeat", false, func(k *kit, id string) error {
 			_, err := k.store.Heartbeat(k.ctx, agent.Lease{RunID: id, Owner: workerA, Epoch: 1}, k.tick(), suiteTTL)
 			return err
 		}},
-		{"Yield", func(k *kit, id string) error {
+		{"Yield", false, func(k *kit, id string) error {
 			return k.store.Yield(k.ctx, agent.Lease{RunID: id, Owner: workerA, Epoch: 1}, agent.YieldRequest{Now: k.tick()})
 		}},
-		{"Park", func(k *kit, id string) error {
+		{"Park", false, func(k *kit, id string) error {
 			parked, err := k.store.Park(k.ctx, agent.Lease{RunID: id, Owner: workerA, Epoch: 1},
 				agent.ParkRequest{Reason: agent.ReasonApproval, Now: k.tick()})
 			assert.False(k.t, parked)
 			return err
 		}},
-		{"Finish", func(k *kit, id string) error {
+		{"Finish", false, func(k *kit, id string) error {
 			return k.store.Finish(k.ctx, agent.Lease{RunID: id, Owner: workerA, Epoch: 1},
 				agent.FinishRequest{Status: agent.StatusCompleted, Now: k.tick()})
 		}},
-		{"Steps", func(k *kit, id string) error {
+		{"Steps", false, func(k *kit, id string) error {
 			_, err := k.store.Steps(k.ctx, id)
 			return err
 		}},
-		{"BeginModel", func(k *kit, id string) error {
+		{"BeginModel", false, func(k *kit, id string) error {
 			return k.store.BeginModel(k.ctx, agent.Lease{RunID: id, Owner: workerA, Epoch: 1}, 1, k.tick())
 		}},
-		{"CompleteModel", func(k *kit, id string) error {
+		{"CompleteModel", false, func(k *kit, id string) error {
 			return k.store.CompleteModel(k.ctx, agent.Lease{RunID: id, Owner: workerA, Epoch: 1},
 				agent.CompleteModelRequest{Seq: 1, Message: Say("done").Message, Stop: agent.StopEnd, Now: k.tick()})
 		}},
-		{"UpdateStep", func(k *kit, id string) error {
+		{"UpdateStep", false, func(k *kit, id string) error {
 			return k.store.UpdateStep(k.ctx, agent.Lease{RunID: id, Owner: workerA, Epoch: 1},
 				agent.StepUpdate{Seq: 2, From: agent.StepProposed, To: agent.StepStarted, Now: k.tick()})
 		}},
-		{"RequestApproval", func(k *kit, id string) error {
+		{"RequestApproval", false, func(k *kit, id string) error {
 			_, err := k.store.RequestApproval(k.ctx, agent.Lease{RunID: id, Owner: workerA, Epoch: 1}, k.askRequest(2))
 			return err
 		}},
-		{"GetApproval", func(k *kit, id string) error {
+		{"GetApproval", true, func(k *kit, id string) error {
 			_, err := k.store.GetApproval(k.ctx, id)
 			return err
 		}},
-		{"DecideApproval", func(k *kit, id string) error {
+		{"DecideApproval", true, func(k *kit, id string) error {
 			_, err := k.store.DecideApproval(k.ctx, agent.DecideRequest{ID: id, Approved: true, By: personA, Now: k.tick()})
 			return err
 		}},
-		{"RequestCancel", func(k *kit, id string) error {
+		{"RequestCancel", false, func(k *kit, id string) error {
 			return k.store.RequestCancel(k.ctx, agent.CancelRequest{RunID: id, By: personA, Now: k.tick()})
 		}},
-		{"Changes", func(k *kit, id string) error {
+		{"Changes", false, func(k *kit, id string) error {
 			_, err := k.store.Changes(k.ctx, id, 0)
 			return err
 		}},
 	}
+	// Each id names nothing. The last two would name the run, or the
+	// approval, to a database, which reads a UUID in any spelling: a store
+	// knows an id by the one string it was given.
 	ids := []struct {
 		name string
-		id   func() string
+		id   func(run agent.Run, approval agent.Approval, forApproval bool) string
 	}{
-		{"an id nothing has", uuid.NewString},
-		{"an id no store could have issued", func() string { return malformedID }},
+		{"an id nothing has", func(agent.Run, agent.Approval, bool) string { return newID() }},
+		{"an id no store could have issued", func(agent.Run, agent.Approval, bool) string { return malformedID }},
+		{"the upper-case spelling of an id that exists", func(run agent.Run, approval agent.Approval, forApproval bool) string {
+			if forApproval {
+				return upperCase(approval.ID)
+			}
+			return upperCase(run.ID)
+		}},
+		{"the spelling without hyphens of an id that exists", func(run agent.Run, approval agent.Approval, forApproval bool) string {
+			if forApproval {
+				return noHyphens(approval.ID)
+			}
+			return noHyphens(run.ID)
+		}},
 	}
 
 	var cases []storeCase
@@ -408,10 +470,10 @@ func notFoundCases() []storeCase {
 			cases = append(cases, storeCase{c.name + ", given " + id.name, func(k *kit) {
 				// A store that holds something, so that not found is about
 				// the id and not about an empty store.
-				run, _ := k.parked(agentAlpha, nil)
+				run, approval := k.parked(agentAlpha, nil)
 				before := k.snapshot(run.ID)
 
-				err := c.call(k, id.id())
+				err := c.call(k, id.id(run, approval, c.approval))
 
 				require.ErrorIs(k.t, err, agent.ErrNotFound)
 				k.unchanged(before)

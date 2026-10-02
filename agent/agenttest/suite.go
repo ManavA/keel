@@ -3,6 +3,7 @@ package agenttest
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,7 @@ func RunStoreSuite(t *testing.T, newStore func(t *testing.T) agent.Store) {
 		{"ListRuns", listRunsCases()},
 		{"ListApprovals", listApprovalsCases()},
 		{"NotFound", notFoundCases()},
+		{"Order", orderCases()},
 	}
 	for _, group := range groups {
 		t.Run(group.name, func(t *testing.T) {
@@ -134,7 +136,7 @@ func (k *kit) lapse() { k.clock.Advance(suiteTTL) }
 func (k *kit) newRun(agentName string) agent.Run {
 	now := k.tick()
 	return agent.Run{
-		ID:         uuid.NewString(),
+		ID:         newID(),
 		Agent:      agentName,
 		Status:     agent.StatusRunnable,
 		Input:      "input",
@@ -258,7 +260,7 @@ func (k *kit) update(lease agent.Lease, seq int, from, to agent.StepStatus) {
 // seq.
 func (k *kit) askRequest(seq int) agent.ApprovalRequest {
 	return agent.ApprovalRequest{
-		ID:       uuid.NewString(),
+		ID:       newID(),
 		Seq:      seq,
 		From:     agent.StepProposed,
 		Cause:    agent.CauseGuard,
@@ -475,3 +477,31 @@ func stepSeqs(steps []agent.Step) []int {
 }
 
 func raw(s string) json.RawMessage { return json.RawMessage(s) }
+
+// newID makes an id as a store wants one: a UUID in its canonical form. It
+// always holds a letter, so that its upper-case spelling is another string.
+func newID() string {
+	for {
+		id := uuid.NewString()
+		if upperCase(id) != id {
+			return id
+		}
+	}
+}
+
+// The spellings below name the same UUID as id does, and a database would
+// take either for it. A store takes neither: an id is the string it was
+// given, in the one form.
+
+func upperCase(id string) string { return strings.ToUpper(id) }
+
+func noHyphens(id string) string { return strings.ReplaceAll(id, "-", "") }
+
+// otherSpellings are what the cases about an id's form try.
+var otherSpellings = []struct {
+	name  string
+	spell func(id string) string
+}{
+	{"in upper case", upperCase},
+	{"without hyphens", noHyphens},
+}
