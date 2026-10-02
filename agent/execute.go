@@ -286,6 +286,7 @@ func (x *execution) loop(run Run) (ending, error) {
 		// Claim took a run of an agent registered here, and no agent is ever
 		// unregistered.
 		def, _ := x.e.definition(run.Agent)
+		def = offered(def, run.Definition)
 
 		a := next(run, def, changes.Steps, changes.Approvals, children)
 		if end, err := x.perform(a, run, def, changes, children); end != going {
@@ -1032,4 +1033,22 @@ func journalMessage(msg Message) Message {
 		msg.Opaque = nil
 	}
 	return msg
+}
+
+// offered is def with only the tools the run was offered when it started. A
+// tool a later deploy registered is not the run's to call, whatever name the
+// model guesses: a call to it is answered as a tool that is not available.
+func offered(def Definition, snap Snapshot) Definition {
+	names := make(map[string]bool, len(snap.Tools))
+	for _, spec := range snap.Tools {
+		names[spec.Name] = true
+	}
+	tools := make([]Tool, 0, len(def.Tools))
+	for _, tool := range def.Tools {
+		if names[tool.Name] {
+			tools = append(tools, tool)
+		}
+	}
+	def.Tools = tools
+	return def
 }

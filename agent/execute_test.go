@@ -3504,6 +3504,29 @@ func TestExecute_AnApprovalHandedBackThatIsNotTheOneAskedForEndsTheExecutionAsFa
 	})
 }
 
+func TestExecute_AToolAddedAfterTheRunStartedIsNotRun(t *testing.T) {
+	// The model names a tool the run was never offered; a later deploy has
+	// registered one by that name. The run keeps to the tools of its snapshot.
+	script := agenttest.Replies(
+		agenttest.Use(agenttest.Call("call-1", "refund", `{"order":7}`)),
+		agenttest.Say("it could not be refunded"),
+	)
+	synctest.Test(t, func(t *testing.T) {
+		calls := &execCalls{}
+		first := newExecFixture(t, execConfig{defs: []agent.Definition{execClerk()}, script: script})
+		started := first.start("clerk", "refund order 7")
+
+		later := first.rival(execConfig{defs: []agent.Definition{execClerk(calls.tool("refund", nil))}})
+		got := later.execute(started.ID)
+
+		assert.Equal(t, agent.StatusCompleted, got.Status)
+		step := first.steps(started.ID)[1]
+		assert.Equal(t, "tool is not available", step.Result)
+		assert.True(t, step.IsError)
+		assert.Empty(t, calls.of("refund"), "a tool outside the run's snapshot never runs")
+	})
+}
+
 func TestExecute_AToolThisBuildNoLongerHas(t *testing.T) {
 	script := agenttest.Replies(
 		agenttest.Use(agenttest.Call("call-1", "refund", `{"order":7}`)),
