@@ -65,20 +65,28 @@ func TestDecode(t *testing.T) {
 // is the stop reason and nothing else: a refused or truncated reply need not
 // match the schema, and a reply that happens to parse still did not end.
 func TestDecode_RefusesAReplyThatDidNotEnd(t *testing.T) {
-	stops := []llm.StopReason{
-		llm.StopToolUse, llm.StopMaxTokens, llm.StopSequence, llm.StopRefusal, llm.StopPause, llm.StopContextWindow,
-		"", // a response that was never given a stop reason
+	tests := []struct {
+		name string
+		stop llm.StopReason
+	}{
+		{name: "tool use", stop: llm.StopToolUse},
+		{name: "max tokens", stop: llm.StopMaxTokens},
+		{name: "stop sequence", stop: llm.StopSequence},
+		{name: "refusal", stop: llm.StopRefusal},
+		{name: "pause", stop: llm.StopPause},
+		{name: "context window", stop: llm.StopContextWindow},
+		{name: "a response that was never given a stop reason", stop: ""},
 	}
-	for _, stop := range stops {
-		t.Run("stop "+string(stop), func(t *testing.T) {
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			resp := ended(`{"name":"batch","count":3}`)
-			resp.Stop = stop
+			resp.Stop = tt.stop
 
 			got, err := llm.Decode[verdict](resp)
 			require.Error(t, err)
 			assert.Zero(t, got, "nothing is returned with the error")
 			assert.Contains(t, err.Error(), "llm: decode")
-			assert.Contains(t, err.Error(), `"`+string(stop)+`"`, "the error names the stop reason")
+			assert.Contains(t, err.Error(), `"`+string(tt.stop)+`"`, "the error names the stop reason")
 		})
 	}
 
@@ -124,6 +132,89 @@ func TestDecode_RefusesText(t *testing.T) {
 		_, err = llm.Decode[verdict](ended(`{"count":"three"}`))
 		var typ *json.UnmarshalTypeError
 		assert.True(t, errors.As(err, &typ))
+	})
+}
+
+// encoding/json reads null into any type and reports nothing, which for a
+// structured reply is a model that answered with no answer.
+func TestDecode_RefusesNull(t *testing.T) {
+	texts := []struct {
+		name string
+		text string
+	}{
+		{name: "bare", text: "null"},
+		{name: "spaces around it", text: "  null  "},
+		{name: "newlines and tabs around it", text: "\n\t null\r\n"},
+	}
+	for _, tt := range texts {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Run("into a struct", func(t *testing.T) {
+				got, err := llm.Decode[verdict](ended(tt.text))
+				require.Error(t, err)
+				assert.Zero(t, got)
+				assert.Contains(t, err.Error(), "llm: decode")
+				assert.Contains(t, err.Error(), "null")
+			})
+			t.Run("into a pointer", func(t *testing.T) {
+				got, err := llm.Decode[*verdict](ended(tt.text))
+				require.Error(t, err)
+				assert.Nil(t, got, "not a nil pointer handed back as if it were an answer")
+				assert.Contains(t, err.Error(), "null")
+			})
+			t.Run("into a map", func(t *testing.T) {
+				got, err := llm.Decode[map[string]any](ended(tt.text))
+				require.Error(t, err)
+				assert.Nil(t, got)
+				assert.Contains(t, err.Error(), "null")
+			})
+			t.Run("into a slice", func(t *testing.T) {
+				got, err := llm.Decode[[]int](ended(tt.text))
+				require.Error(t, err)
+				assert.Nil(t, got)
+				assert.Contains(t, err.Error(), "null")
+			})
+			t.Run("into any", func(t *testing.T) {
+				got, err := llm.Decode[any](ended(tt.text))
+				require.Error(t, err)
+				assert.Nil(t, got)
+				assert.Contains(t, err.Error(), "null")
+			})
+		})
+	}
+
+	t.Run("the error says the output was null", func(t *testing.T) {
+		_, err := llm.Decode[verdict](ended("null"))
+		assert.EqualError(t, err, "llm: decode: the model's output was null")
+	})
+
+	// Only a reply that is null as a whole is refused; null inside a value, or
+	// as the text of a JSON string, is an answer.
+	t.Run("null that is not the whole reply is read", func(t *testing.T) {
+		got, err := llm.Decode[verdict](ended(`{"name":null,"count":1,"tags":null}`))
+		require.NoError(t, err)
+		assert.Equal(t, verdict{Count: 1}, got)
+
+		list, err := llm.Decode[[]*verdict](ended(`[null]`))
+		require.NoError(t, err)
+		assert.Equal(t, []*verdict{nil}, list)
+
+		s, err := llm.Decode[string](ended(`"null"`))
+		require.NoError(t, err)
+		assert.Equal(t, "null", s)
+	})
+
+	t.Run("a word that only starts with null is not JSON at all", func(t *testing.T) {
+		_, err := llm.Decode[verdict](ended("nullable"))
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "was null")
+	})
+
+	t.Run("a null reply that did not end is refused for that", func(t *testing.T) {
+		resp := ended("null")
+		resp.Stop = llm.StopMaxTokens
+		_, err := llm.Decode[verdict](resp)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "max_tokens")
 	})
 }
 

@@ -45,15 +45,16 @@ func Replies(replies ...Reply) Script {
 }
 
 // Route is a Script that picks another by Request.Model. The "" entry is
-// used for a model the map does not name.
+// used for a model the map does not name. A model with no script to use, or
+// whose entry is nil, gets ErrScriptExhausted.
 func Route(byModel map[string]Script) Script {
 	byModel = maps.Clone(byModel)
 	return func(req Request, turn int) (Reply, error) {
 		script, ok := byModel[req.Model]
 		if !ok {
-			script, ok = byModel[""]
+			script = byModel[""]
 		}
-		if !ok {
+		if script == nil {
 			return Reply{}, fmt.Errorf("%w (no script for model %q)", ErrScriptExhausted, req.Model)
 		}
 		return script(req, turn)
@@ -80,8 +81,12 @@ type Scripted struct {
 
 var _ Model = (*Scripted)(nil)
 
-// NewScripted builds a Scripted over script.
+// NewScripted builds a Scripted over script. A nil script has no replies, so
+// every call fails with ErrScriptExhausted.
 func NewScripted(script Script, opts ScriptedOptions) *Scripted {
+	if script == nil {
+		script = Replies()
+	}
 	name := opts.Name
 	if name == "" {
 		name = defaultScriptedName

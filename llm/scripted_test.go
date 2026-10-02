@@ -177,6 +177,26 @@ func TestScripted_ATurnPastTheEndIsExhausted(t *testing.T) {
 	})
 }
 
+// A nil Script is a script with no replies, so the first call fails with an
+// error that says so, where it would otherwise dereference nil inside
+// whatever worker made the call.
+func TestScripted_ANilScriptIsAnEmptyOne(t *testing.T) {
+	s := llm.NewScripted(nil, llm.ScriptedOptions{})
+
+	resp, err := s.Generate(t.Context(), llm.Request{})
+	require.ErrorIs(t, err, llm.ErrScriptExhausted)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "turn 0")
+
+	deltas := 0
+	resp, err = s.Stream(t.Context(), conversationOf(2), func(llm.Delta) error { deltas++; return nil })
+	assert.ErrorIs(t, err, llm.ErrScriptExhausted)
+	assert.Nil(t, resp)
+	assert.Zero(t, deltas)
+
+	assert.Len(t, s.Requests(), 2, "the calls were received, and failed")
+}
+
 func TestScripted_ReturnsTheErrorItWasGiven(t *testing.T) {
 	boom := errors.New("boom")
 	overloaded := &llm.Error{Provider: "anthropic", Status: 529, Type: "overloaded_error", Retryable: true}
@@ -260,6 +280,27 @@ func TestRoute(t *testing.T) {
 		_, err := s.Generate(t.Context(), llm.Request{Model: "other"})
 		require.ErrorIs(t, err, llm.ErrScriptExhausted)
 		assert.Contains(t, err.Error(), `"other"`)
+	})
+
+	t.Run("a nil entry is an empty script and does not fall to the empty entry", func(t *testing.T) {
+		route := llm.Route(map[string]llm.Script{"big": nil, "": llm.Replies(llm.Reply{Text: "from the default"})})
+		s := llm.NewScripted(route, llm.ScriptedOptions{})
+
+		resp, err := s.Generate(t.Context(), llm.Request{Model: "big"})
+		require.ErrorIs(t, err, llm.ErrScriptExhausted)
+		assert.Nil(t, resp)
+		assert.Contains(t, err.Error(), `"big"`)
+
+		resp, err = s.Generate(t.Context(), llm.Request{Model: "other"})
+		require.NoError(t, err)
+		assert.Equal(t, "from the default", resp.Message.Text)
+	})
+
+	t.Run("a nil empty entry is an empty script too", func(t *testing.T) {
+		route := llm.Route(map[string]llm.Script{"": nil})
+		s := llm.NewScripted(route, llm.ScriptedOptions{})
+		_, err := s.Generate(t.Context(), llm.Request{Model: "other"})
+		assert.ErrorIs(t, err, llm.ErrScriptExhausted)
 	})
 
 	t.Run("a nil map has no scripts", func(t *testing.T) {

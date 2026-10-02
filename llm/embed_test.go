@@ -155,9 +155,19 @@ func TestHashEmbedder_NonEmptyVectorsHaveLengthOne(t *testing.T) {
 }
 
 func TestHashEmbedder_EmptyTextIsTheZeroVector(t *testing.T) {
-	for _, text := range []string{"", " ", "\n\t  \r\n", "!!! --- ???", "…"} {
-		t.Run(text, func(t *testing.T) {
-			v := embedText(t, llm.NewHashEmbedder(0), text)
+	tests := []struct {
+		name string
+		text string
+	}{
+		{name: "no text", text: ""},
+		{name: "one space", text: " "},
+		{name: "white space of every kind", text: "\n\t  \r\n"},
+		{name: "punctuation only", text: "!!! --- ???"},
+		{name: "an ellipsis", text: "…"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := embedText(t, llm.NewHashEmbedder(0), tt.text)
 			assert.Equal(t, make([]float32, 256), v, "all zero, and not a NaN")
 		})
 	}
