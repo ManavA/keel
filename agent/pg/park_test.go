@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ManavA/keel/agent"
+	"github.com/ManavA/keel/agent/agenttest"
 	agentpg "github.com/ManavA/keel/agent/pg"
 )
 
@@ -283,4 +284,162 @@ func TestStore_DoesNotDependOnTheDatabasesDefaultIsolation(t *testing.T) {
 	require.NoError(t, got.err)
 	assert.False(t, got.parked)
 	assert.Equal(t, agent.StatusRunnable, k.run(parent.ID).Status)
+}
+
+// A run with two questions pending, one of which is answered as its execution
+// parks. The execution read the journal before the answer, so it does not
+// know there is an approved call to run; parked on the other question, the
+// call would wait for an answer that has nothing to do with it. Park and the
+// answer take the run's row, so they meet in one of two orders, each made to
+// happen here with two real transactions.
+func TestPark_WithTwoQuestionsAndOneAnswerMeetInEitherOrder(t *testing.T) {
+	type world struct {
+		k        *kit
+		pool     *pgxpool.Pool
+		run      agent.Run
+		lease    agent.Lease
+		answered agent.Approval
+		pending  agent.Approval
+	}
+	setup := func(t *testing.T) world {
+		pool := newDatabase(t).pool(t)
+		k := kitOver(t, agentpg.New(pool))
+		run, lease := k.held()
+		k.reply(lease, agenttest.Call("call-1", toolSend, sendInput), agenttest.Call("call-2", toolSend, sendInput))
+		return world{k: k, pool: pool, run: run, lease: lease, answered: k.ask(lease, 2, nil), pending: k.ask(lease, 3, nil)}
+	}
+
+	t.Run("the answer holds the row first: the park waits, and leaves the run with its execution", func(t *testing.T) {
+		w := setup(t)
+		k := w.k
+
+		holding := newGate(t)
+		answering := agentpg.New(stepped{Beginner: w.pool, before: afterLock(holding)})
+		answered := make(chan error, 1)
+		now := k.tick()
+		go func() {
+			_, err := answering.DecideApproval(k.ctx, agent.DecideRequest{ID: w.answered.ID, Approved: true, By: person, Now: now})
+			answered <- err
+		}()
+		holding.arrived(t)
+
+		type parkResult struct {
+			parked bool
+			err    error
+		}
+		parked := make(chan parkResult, 1)
+		go func() {
+			ok, err := k.store.Park(k.ctx, w.lease, agent.ParkRequest{Reason: agent.ReasonApproval, Now: now})
+			parked <- parkResult{ok, err}
+		}()
+		waits(t, w.pool, parked)
+
+		holding.release()
+		require.NoError(t, result(t, answered))
+		got := result(t, parked)
+		require.NoError(t, got.err)
+		assert.False(t, got.parked, "one question has its answer, though the other is still pending")
+		after := k.run(w.run.ID)
+		assert.Equal(t, agent.StatusRunnable, after.Status)
+		assert.Equal(t, w.lease.Owner, after.LeaseOwner, "the execution still holds the run")
+		assert.Equal(t, agent.ApprovalPending, k.approval(w.pending.ID).Status)
+
+		// It carries out the approved call, and only then is there nothing
+		// left but the question nobody has answered.
+		require.NoError(t, k.store.UpdateStep(k.ctx, w.lease, agent.StepUpdate{
+			Seq: 2, From: agent.StepWaiting, To: agent.StepStarted, Now: k.tick(),
+		}))
+		done := "sent"
+		require.NoError(t, k.store.UpdateStep(k.ctx, w.lease, agent.StepUpdate{
+			Seq: 2, From: agent.StepStarted, To: agent.StepCompleted, Result: &done, Now: k.tick(),
+		}))
+		k.park(w.lease, agent.ReasonApproval)
+		assert.Equal(t, agent.StatusWaiting, k.run(w.run.ID).Status)
+	})
+
+	t.Run("the park holds the row first: the answer waits, and wakes the run", func(t *testing.T) {
+		w := setup(t)
+		k := w.k
+
+		holding := newGate(t)
+		parking := agentpg.New(stepped{Beginner: w.pool, before: afterLock(holding)})
+		parked := make(chan error, 1)
+		now := k.tick()
+		go func() {
+			ok, err := parking.Park(k.ctx, w.lease, agent.ParkRequest{Reason: agent.ReasonApproval, Now: now})
+			if err == nil && !ok {
+				err = assert.AnError
+			}
+			parked <- err
+		}()
+		holding.arrived(t)
+
+		answered := make(chan error, 1)
+		go func() {
+			_, err := k.store.DecideApproval(k.ctx, agent.DecideRequest{ID: w.answered.ID, Approved: true, By: person, Now: now})
+			answered <- err
+		}()
+		waits(t, w.pool, answered)
+
+		holding.release()
+		require.NoError(t, result(t, parked), "both questions were pending when the park looked")
+		require.NoError(t, result(t, answered))
+		after := k.run(w.run.ID)
+		assert.Equal(t, agent.StatusRunnable, after.Status, "the answer found the run waiting, and woke it")
+		assert.Empty(t, after.LeaseOwner)
+	})
+}
+
+// The same for two children: one ends as its parent parks on both. The parent
+// is not parked on the other with the first one's result uncollected.
+func TestPark_WithTwoChildrenAndOneEndingLeavesTheRunWithItsExecution(t *testing.T) {
+	pool := newDatabase(t).pool(t)
+	k := kitOver(t, agentpg.New(pool))
+	parent, lease := k.held()
+	k.reply(lease, agenttest.Call("call-1", toolSend, sendInput), agenttest.Call("call-2", toolSend, sendInput))
+	var children []agent.Run
+	for _, seq := range []int{2, 3} {
+		require.NoError(t, k.store.UpdateStep(k.ctx, lease, agent.StepUpdate{
+			Seq: seq, From: agent.StepProposed, To: agent.StepStarted, Now: k.tick(),
+		}))
+		child := k.newRun(agentBeta)
+		child.ParentID, child.ParentSeq, child.Depth = parent.ID, seq, parent.Depth+1
+		child = k.insert(child)
+		require.NoError(t, k.store.UpdateStep(k.ctx, lease, agent.StepUpdate{
+			Seq: seq, From: agent.StepStarted, To: agent.StepWaiting, ChildRunID: child.ID, Now: k.tick(),
+		}))
+		children = append(children, child)
+	}
+	childLease := k.claim(workerB, children[0].ID)
+
+	// Stopped with all its work done and none of it committed.
+	holding := newGate(t)
+	ending := agentpg.New(stepped{Beginner: pool, before: beforeCommit(holding)})
+	ended := make(chan error, 1)
+	now := k.tick()
+	go func() {
+		ended <- ending.Finish(k.ctx, childLease, agent.FinishRequest{Status: agent.StatusCompleted, Output: "summary", Now: now})
+	}()
+	holding.arrived(t)
+
+	type parkResult struct {
+		parked bool
+		err    error
+	}
+	parked := make(chan parkResult, 1)
+	go func() {
+		ok, err := k.store.Park(k.ctx, lease, agent.ParkRequest{Reason: agent.ReasonChildren, Now: now})
+		parked <- parkResult{ok, err}
+	}()
+	waits(t, pool, parked)
+
+	holding.release()
+	require.NoError(t, result(t, ended))
+	got := result(t, parked)
+	require.NoError(t, got.err)
+	assert.False(t, got.parked, "one child had ended by the time the park looked, though the other runs on")
+	after := k.run(parent.ID)
+	assert.Equal(t, agent.StatusRunnable, after.Status)
+	assert.Equal(t, lease.Owner, after.LeaseOwner)
+	assert.False(t, k.run(children[1].ID).Terminal())
 }

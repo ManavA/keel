@@ -385,7 +385,7 @@ func (s *MemoryStore) Park(_ context.Context, lease Lease, req ParkRequest) (boo
 	if err != nil {
 		return false, err
 	}
-	if r.run.CancelRequested || !hasPending(r) {
+	if r.run.CancelRequested || !hasPending(r) || s.hasWork(r) {
 		return false, nil
 	}
 	r.run.Status = StatusWaiting
@@ -403,6 +403,30 @@ func hasPending(r *memoryRun) bool {
 	}) || slices.ContainsFunc(r.children, func(c *memoryRun) bool {
 		return !c.run.Terminal()
 	})
+}
+
+// hasWork reports whether a waiting step of r has what it waited for: its
+// child has ended, or the approval for its current attempt has its answer.
+// The execution that holds r has something to do about it, so r is not
+// parked, whatever else it still waits for.
+func (s *MemoryStore) hasWork(r *memoryRun) bool {
+	for _, st := range r.steps {
+		if st.Kind != StepTool || st.Status != StepWaiting {
+			continue
+		}
+		if st.ChildRunID != "" {
+			if child, ok := s.runs[st.ChildRunID]; ok && child.run.Terminal() {
+				return true
+			}
+			continue
+		}
+		for _, a := range r.approvals {
+			if a.approval.Seq == st.Seq && a.approval.Attempt == st.Attempts && a.approval.Status != ApprovalPending {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Finish implements Store.

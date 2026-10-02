@@ -398,9 +398,13 @@ type Store interface {
 	// Yield releases the lease and leaves the run runnable.
 	Yield(ctx context.Context, lease Lease, req YieldRequest) error
 	// Park sets the run waiting and releases the lease, but only while it
-	// has something to wait for: a pending approval, or a child run that
-	// has not ended. Otherwise, or when cancellation has been requested,
-	// it changes nothing and reports false.
+	// has something to wait for, a pending approval or a child run that has
+	// not ended, and nothing to do: no waiting step whose approval for its
+	// current attempt has its answer, and none whose child has ended.
+	// Otherwise, or when cancellation has been requested, it changes
+	// nothing and reports false. So an answer or a child's end that lands
+	// after the caller read the journal is never left for whatever else the
+	// run waits for.
 	Park(ctx context.Context, lease Lease, req ParkRequest) (parked bool, err error)
 	// Finish ends the run, releases the lease, cancels its pending
 	// approvals, and makes a waiting parent runnable.
