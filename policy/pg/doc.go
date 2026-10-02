@@ -19,6 +19,17 @@
 // whose empty effect no caller may read as an allow. That covers an
 // unreachable database and a cancelled context as much as the refusals below.
 //
+// What the store refuses for good is told from a database that is down. An
+// error for a record that can never be stored, whatever is retried, wraps
+// [policy.ErrUnrecordable]: the refusals below that Record makes itself, and
+// what the server refuses of the record's own content or size (SQLSTATE class
+// 22, a data exception, such as a number past numeric's range; and class 54, a
+// program limit, such as a value nested too deeply or a name too large for its
+// index). A refused connection, a cancelled context, a failed transaction and a
+// server that is shutting down do not wrap it. Whoever retries a failed step
+// retries on the second kind only; the server's own error stays in the chain
+// for [errors.As].
+//
 // # What a reader gets
 //
 // Attributes, the matched rules and the uncertain attributes are stored as
@@ -26,6 +37,9 @@
 // them back as empty and never as nil: a record written with a nil Attrs, a nil
 // Matched and a nil Uncertain comes back with an empty map and two empty lists.
 // List itself returns an empty list, not nil, when nothing matches.
+//
+// Each record carries its ID, the log's own number for it, which with its time
+// is its place in the log and is what a [Cursor] is made of.
 //
 // A time is stored and read in UTC. The column keeps microseconds: Record drops
 // what is finer, and a time read back equals the one written truncated to the
@@ -64,18 +78,36 @@
 // a backslash followed by u0000 is not a NUL and is stored.
 //
 // Record also refuses, without sending anything, a decision whose effect is not
-// allow, ask or block (the table would refuse it) and attributes that JSON
-// cannot hold: NaN, an infinity, a function, a channel, a value that contains
-// itself. Anything else Postgres refuses, such as a number past its range,
-// is its own error, wrapped. Text that is not valid UTF-8 is refused by a text
-// column, and in a name or an attribute written as JSON it is replaced by
-// U+FFFD, as encoding/json does.
+// allow, ask or block (the table would refuse it), attributes that JSON cannot
+// hold (NaN, an infinity, a function, a channel, a value that contains itself),
+// and an empty json.Number anywhere encoding/json would write it, since it
+// would write 0 and nobody sent a zero. Each wraps [policy.ErrUnrecordable].
+// Anything else Postgres refuses, such as a number past its range, is its own
+// error, wrapped, and is unrecordable when the server says the fault is in the
+// record.
+//
+// Text that is not valid UTF-8 is not refused in a rule name, an attribute name
+// or an attribute value: encoding/json replaces each bad byte with U+FFFD, so
+// the log holds the replacement character and not the bytes. A text column (the
+// kind, the target, the rule and the version) does refuse it, and the record
+// fails as unrecordable.
 //
 // # Reading the log
 //
-// List returns the newest decisions first, by the time each was decided. Of
-// decisions decided at the same instant the one recorded later comes first, so
-// the order does not change from one call to the next. A call returns at most
-// 1000, and 100 when the filter sets no limit. Apply [MigrationsFS] with keel's
-// pg/migrate package before use; the migration is safe to run twice.
+// List returns a page of decisions, newest first, by the time each was decided.
+// Of decisions decided at the same instant the one recorded later comes first,
+// so the order does not change from one call to the next. A page is at most
+// 1000 decisions, and 100 when the filter sets no limit: a larger limit is read
+// as 1000, and the cursor reaches what a page leaves behind.
+//
+// To read the whole log, or all of it that matches a filter, set Filter.Before
+// to the [Cursor] of the last record of each page, {At: rec.At, ID: rec.ID},
+// and stop at an empty page. A cursor is a position: it returns what is older
+// than it by time and then by ID, so records that share a time are each on one
+// page and only one, however the pages fall among them, and, unlike an offset,
+// it does not move when records are added. A cursor whose ID is below 1 is an
+// error and no query is made.
+//
+// Apply [MigrationsFS] with keel's pg/migrate package before use; the migration
+// is safe to run twice.
 package pg

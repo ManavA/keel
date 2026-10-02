@@ -2,9 +2,13 @@ package pg_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -33,6 +37,9 @@ func (f *fakeDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error
 
 func (f *fakeDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	f.queries++
+	if f.rows == nil && f.err == nil {
+		return nil, errors.New("the fake has no rows to give")
+	}
 	return f.rows, f.err
 }
 
@@ -104,6 +111,7 @@ func TestStore_RecordRefusesWhatPostgresCannotStoreBeforeAskingIt(t *testing.T) 
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "NUL")
 			assert.Contains(t, err.Error(), tt.want)
+			assert.ErrorIs(t, err, policy.ErrUnrecordable, "no retry will make a NUL storable")
 			assert.Zero(t, db.execs, "nothing is sent")
 		})
 	}
@@ -132,6 +140,7 @@ func TestStore_RecordRefusesWhatCannotBeRecordedAtAll(t *testing.T) {
 		{"an attribute that is a channel", func(r *policy.Record) { r.Action.Attrs["c"] = make(chan int) }, "attributes"},
 		{"an attribute that holds itself", func(r *policy.Record) { r.Action.Attrs["c"] = cyclic }, "attributes"},
 		{"a number that is not a number", func(r *policy.Record) { r.Action.Attrs["n"] = json.Number("12abc") }, "attributes"},
+		{"a number with no digits", func(r *policy.Record) { r.Action.Attrs["n"] = json.Number("") }, "empty json.Number"},
 		{"no effect, the zero Decision", func(r *policy.Record) { r.Decision = policy.Decision{} }, "effect"},
 		{"an effect that is not one of the three", func(r *policy.Record) { r.Decision.Effect = "approve" }, "effect"},
 		{"an effect in capitals", func(r *policy.Record) { r.Decision.Effect = "ALLOW" }, "effect"},
@@ -142,6 +151,7 @@ func TestStore_RecordRefusesWhatCannotBeRecordedAtAll(t *testing.T) {
 			err := policypg.New(db).Record(t.Context(), recordWith(tt.change))
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.want)
+			assert.ErrorIs(t, err, policy.ErrUnrecordable, "no retry will make it storable")
 			assert.Zero(t, db.execs, "nothing is sent")
 		})
 	}
@@ -168,6 +178,7 @@ func TestStore_RecordIsAnErrorUnlessOneRowWasWritten(t *testing.T) {
 			}
 			assert.Contains(t, err.Error(), tt.wantMsg)
 			assert.Contains(t, err.Error(), "policy/pg")
+			assert.NotErrorIs(t, err, policy.ErrUnrecordable, "a database that failed, or did not write, is one a retry may find well")
 		})
 	}
 }
@@ -256,6 +267,10 @@ func TestStore_ANumberPostgresCannotHoldIsAnErrorAndLeavesNothing(t *testing.T) 
 	err := store.Record(ctx, recordWith(func(r *policy.Record) { r.Action.Attrs["n"] = json.Number("1e131072") }))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "policy/pg")
+	assert.ErrorIs(t, err, policy.ErrUnrecordable, "no retry will make the number smaller")
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr, "the server's own error is still in the chain")
+	assert.Equal(t, "22003", pgErr.Code)
 
 	var n int
 	require.NoError(t, pool.QueryRow(ctx, `select count(*) from `+policypg.Table).Scan(&n))
@@ -283,4 +298,187 @@ func TestStore_ARecordThatIsRefusedLeavesNothingInTheLog(t *testing.T) {
 	require.NoError(t, store.Record(ctx, sample("after", base)))
 	require.NoError(t, pool.QueryRow(ctx, `select count(*) from `+policypg.Table).Scan(&n))
 	assert.Equal(t, 1, n)
+}
+
+// An empty json.Number is not a number, and encoding/json writes one as 0: a
+// zero nobody sent. Record refuses it wherever encoding/json would write it, and
+// takes what encoding/json would not write.
+func TestStore_RecordRefusesAnEmptyNumberWhereverItWouldBeWritten(t *testing.T) {
+	var empty json.Number
+	tests := []struct {
+		name    string
+		attrs   map[string]any
+		refused bool
+	}{
+		{"in an attribute", map[string]any{"n": json.Number("")}, true},
+		{"in a nested object", map[string]any{"a": map[string]any{"b": map[string]any{"n": json.Number("")}}}, true},
+		{"in a list", map[string]any{"a": []any{"x", json.Number("")}}, true},
+		{"in a list of numbers", map[string]any{"a": []json.Number{"1", ""}}, true},
+		{"in an array", map[string]any{"a": [2]json.Number{"1", ""}}, true},
+		{"behind a pointer", map[string]any{"a": &empty}, true},
+		{"behind a pointer in a list", map[string]any{"a": []any{&empty}}, true},
+		{"in a map of numbers", map[string]any{"a": map[string]json.Number{"k": ""}}, true},
+		{"in a field of a struct", map[string]any{"a": numbered{}}, true},
+		{"in a field of a struct behind a pointer", map[string]any{"a": &numbered{}}, true},
+		{"in a field of an embedded struct", map[string]any{"a": embedsNumbered{}}, true},
+		{"in a written field of a struct that skips others", map[string]any{"a": tagged{Shown: ""}}, true},
+		{"deep in a mixture", map[string]any{"a": []any{map[string]any{"b": []any{&numbered{}}}}}, true},
+		{"after numbers that are fine", map[string]any{"a": json.Number("1"), "b": []any{json.Number("2"), json.Number("")}}, true},
+
+		{"zero, which was sent", map[string]any{"n": json.Number("0")}, false},
+		{"a number with digits", map[string]any{"n": json.Number("1.50"), "m": []json.Number{"1", "-2e3"}}, false},
+		{"a nil pointer to one", map[string]any{"n": (*json.Number)(nil)}, false},
+		{"a string with nothing in it", map[string]any{"n": ""}, false},
+		{"a list with nothing in it", map[string]any{"n": []any{}, "m": []json.Number{}, "o": map[string]json.Number{}}, false},
+		{"bytes", map[string]any{"n": []byte("abc")}, false},
+		{"a struct field encoding/json does not write", map[string]any{"a": tagged{Shown: "1", hidden: ""}}, false},
+		{"a struct that writes itself", map[string]any{"a": selfWriting{}}, false},
+		{"a struct that writes itself, behind a pointer", map[string]any{"a": &selfWriting{}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &fakeDB{tag: pgconn.NewCommandTag("INSERT 0 1")}
+			err := policypg.New(db).Record(t.Context(), recordWith(func(r *policy.Record) { r.Action.Attrs = tt.attrs }))
+			if !tt.refused {
+				require.NoError(t, err)
+				assert.Equal(t, 1, db.execs)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "empty json.Number")
+			assert.ErrorIs(t, err, policy.ErrUnrecordable)
+			assert.Zero(t, db.execs, "nothing is sent")
+		})
+	}
+}
+
+type numbered struct{ N json.Number }
+
+type embedsNumbered struct{ numbered }
+
+// tagged has fields encoding/json writes and fields it does not, each of them
+// empty.
+type tagged struct {
+	Shown   json.Number `json:"shown"`
+	Skipped json.Number `json:"-"`
+	Omitted json.Number `json:"omitted,omitempty"`
+	Zeroed  json.Number `json:"zeroed,omitzero"`
+	hidden  json.Number
+}
+
+// selfWriting writes itself, whatever it holds.
+type selfWriting struct{ N json.Number }
+
+func (selfWriting) MarshalJSON() ([]byte, error) { return []byte(`{"written":true}`), nil }
+
+func TestStore_ARecordThatCanNeverBeStoredIsToldFromADatabaseThatFailed(t *testing.T) {
+	// What the server says about the record's own content or size is something no
+	// retry changes: a data exception (class 22) and a program limit (class 54).
+	// What it says about itself or the moment is not.
+	pgError := func(code string) error { return &pgconn.PgError{Code: code, Message: "m"} }
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"a number past numeric's range", pgError("22003"), true},
+		{"an unsupported escape", pgError("22P05"), true},
+		{"a byte sequence the encoding refuses", pgError("22021"), true},
+		{"an invalid text representation", pgError("22P02"), true},
+		{"a data exception that is none of those", pgError("22000"), true},
+		{"a value nested too deeply", pgError("54001"), true},
+		{"a row or an index entry too large", pgError("54000"), true},
+		{"the same, wrapped", fmt.Errorf("pgx: %w", pgError("22003")), true},
+
+		{"the server shutting down", pgError("57P01"), false},
+		{"a connection that failed", pgError("08006"), false},
+		{"too many connections", pgError("53300"), false},
+		{"a serialization failure", pgError("40001"), false},
+		{"a transaction that was aborted", pgError("25P02"), false},
+		{"a deadlock", pgError("40P01"), false},
+		{"a read-only server", pgError("25006"), false},
+		{"a connection that was refused", errors.New("dial tcp 127.0.0.1:5432: connect: connection refused"), false},
+		{"a cancelled context", context.Canceled, false},
+		{"a deadline", context.DeadlineExceeded, false},
+		{"an unexpected end of file", io.ErrUnexpectedEOF, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := policypg.New(&fakeDB{err: tt.err}).Record(t.Context(), sample("send", base))
+			require.Error(t, err)
+			require.ErrorIs(t, err, tt.err, "the database's own error stays in the chain")
+			assert.Equal(t, tt.want, errors.Is(err, policy.ErrUnrecordable))
+			assert.Contains(t, err.Error(), "policy/pg")
+		})
+	}
+
+	t.Run("with a real database", func(t *testing.T) {
+		store, pool := openStore(t)
+		ctx := t.Context()
+
+		// Nested more deeply than the server's stack allows a value to be.
+		var deep any = []any{}
+		for range 20000 {
+			deep = []any{deep}
+		}
+		// A name too large to be an entry in the index on the rule: it does not
+		// compress, since it is a hash of each of its own pieces.
+		var long strings.Builder
+		for i := range 400 {
+			fmt.Fprintf(&long, "%x", sha256.Sum256([]byte{byte(i), byte(i >> 8)}))
+		}
+
+		for _, tt := range []struct {
+			name   string
+			change func(*policy.Record)
+			code   string
+		}{
+			{"a number past the server's range", func(r *policy.Record) { r.Action.Attrs["n"] = json.Number("1e131072") }, "22003"},
+			{"a value nested too deeply", func(r *policy.Record) { r.Action.Attrs["deep"] = deep }, "54001"},
+			{"a rule name too large for its index", func(r *policy.Record) { r.Decision.Rule = long.String() }, "54000"},
+		} {
+			err := store.Record(ctx, recordWith(tt.change))
+			require.Errorf(t, err, "%s", tt.name)
+			assert.ErrorIs(t, err, policy.ErrUnrecordable, tt.name)
+			var pgErr *pgconn.PgError
+			require.ErrorAs(t, err, &pgErr, tt.name)
+			assert.Equal(t, tt.code, pgErr.Code, tt.name)
+		}
+
+		var n int
+		require.NoError(t, pool.QueryRow(ctx, `select count(*) from `+policypg.Table).Scan(&n))
+		assert.Zero(t, n, "none of them is on the log")
+	})
+
+	t.Run("a database that is not there is not one", func(t *testing.T) {
+		_, closed := openStore(t)
+		closed.Close()
+		store, _ := openStore(t)
+		cancelled, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		for name, rec := range map[string]func() error{
+			"a closed pool":         func() error { return policypg.New(closed).Record(t.Context(), sample("send", base)) },
+			"nothing listening":     func() error { return policypg.New(deadPool(t)).Record(t.Context(), sample("send", base)) },
+			"a cancelled context":   func() error { return store.Record(cancelled, sample("send", base)) },
+			"a transaction aborted": func() error { return abortedTx(t).Record(t.Context(), sample("send", base)) },
+		} {
+			err := rec()
+			require.Errorf(t, err, "%s", name)
+			assert.NotErrorIs(t, err, policy.ErrUnrecordable, name)
+		}
+	})
+}
+
+// abortedTx is a store over a transaction that a failed statement has aborted,
+// where every statement now fails with SQLSTATE 25P02.
+func abortedTx(t *testing.T) *policypg.Store {
+	t.Helper()
+	_, pool := openStore(t)
+	tx, err := pool.Begin(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	_, err = tx.Exec(t.Context(), `select 1/0`)
+	require.Error(t, err)
+	return policypg.New(tx)
 }

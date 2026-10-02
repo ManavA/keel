@@ -79,15 +79,18 @@ func sample(kind string, at time.Time) policy.Record {
 }
 
 // requireRecords compares what List returned with what was written. The times
-// are compared as instants and must be in UTC; the rest is compared whole.
+// are compared as instants and must be in UTC, every record must carry an id,
+// and the rest is compared whole.
 func requireRecords(t *testing.T, want, got []policy.Record) {
 	t.Helper()
 	require.Len(t, got, len(want))
 	for i := range want {
 		assert.True(t, want[i].At.Equal(got[i].At), "record %d: decided at %v, listed at %v", i, want[i].At, got[i].At)
 		assert.Equal(t, time.UTC, got[i].At.Location(), "record %d must be read back in UTC", i)
+		assert.Positive(t, got[i].ID, "record %d must carry its id", i)
 		w, g := want[i], got[i]
 		w.At, g.At = time.Time{}, time.Time{}
+		w.ID, g.ID = 0, 0
 		assert.Equal(t, w, g, "record %d", i)
 	}
 }
@@ -599,4 +602,42 @@ func TestStore_HasAnInsertAndAReadAndNothingThatChangesTheLog(t *testing.T) {
 	}
 	slices.Sort(methods)
 	assert.Equal(t, []string{"List", "Record"}, methods)
+}
+
+func TestStore_InvalidUTF8IsReplacedInJSONAndRefusedInText(t *testing.T) {
+	store, pool := openStore(t)
+	ctx := t.Context()
+
+	// In an attribute value, an attribute name, a matched rule and an uncertain
+	// attribute, encoding/json writes U+FFFD for each bad byte, so that is what
+	// the log holds.
+	rec := policy.Record{
+		At:     base,
+		Action: policy.Action{Kind: "k", Attrs: map[string]any{"note": "a\xffb", "x\xfey": "v"}},
+		Decision: policy.Decision{
+			Effect: policy.Ask, Rule: "r", Matched: []string{"m\xff"}, Uncertain: []string{"u\xff"},
+		},
+	}
+	require.NoError(t, store.Record(ctx, rec))
+	got, err := store.List(ctx, policypg.Filter{})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, map[string]any{"note": "a\ufffdb", "x\ufffdy": "v"}, got[0].Action.Attrs)
+	assert.Equal(t, []string{"m\ufffd"}, got[0].Decision.Matched)
+	assert.Equal(t, []string{"u\ufffd"}, got[0].Decision.Uncertain)
+
+	// In a text column the server refuses it, and no retry will change that.
+	for name, change := range map[string]func(*policy.Record){
+		"the kind":    func(r *policy.Record) { r.Action.Kind = "a\xffb" },
+		"the target":  func(r *policy.Record) { r.Action.Target = "a\xffb" },
+		"the rule":    func(r *policy.Record) { r.Decision.Rule = "a\xffb" },
+		"the version": func(r *policy.Record) { r.Version = "a\xffb" },
+	} {
+		err := store.Record(ctx, recordWith(change))
+		require.Errorf(t, err, "%s", name)
+		assert.ErrorIs(t, err, policy.ErrUnrecordable, name)
+	}
+	var n int
+	require.NoError(t, pool.QueryRow(ctx, `select count(*) from `+policypg.Table).Scan(&n))
+	assert.Equal(t, 1, n, "only the first record is on the log")
 }

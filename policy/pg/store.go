@@ -51,17 +51,19 @@ values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 
 // Record implements [policy.Recorder]. It returns nil only when one row was
 // written; an error means the decision is not on the record, and a
-// [policy.Decider] then gives no decision. See the package comment for what it
-// refuses before it asks the database, which is a NUL character anywhere in the
-// record and attributes that JSON cannot hold.
+// [policy.Decider] then gives no decision. An error for a record that can never
+// be stored wraps [policy.ErrUnrecordable]: what the store refuses before it
+// asks the database (see the package comment) and what the server refuses of
+// the record's own content or size. An error that is the database's, or the
+// moment's, does not.
 func (s *Store) Record(ctx context.Context, rec policy.Record) error {
 	args, err := insertArgs(rec)
 	if err != nil {
-		return fmt.Errorf("policy/pg: record %q action: %w", rec.Action.Kind, err)
+		return fmt.Errorf("policy/pg: record %q action: %w", rec.Action.Kind, unrecordable(err))
 	}
 	tag, err := s.db.Exec(ctx, insertSQL, args...)
 	if err != nil {
-		return fmt.Errorf("policy/pg: record %q action: %w", rec.Action.Kind, err)
+		return fmt.Errorf("policy/pg: record %q action: %w", rec.Action.Kind, asUnrecordable(err))
 	}
 	if n := tag.RowsAffected(); n != 1 {
 		return fmt.Errorf("policy/pg: record %q action: the insert wrote %d rows, not 1", rec.Action.Kind, n)
@@ -131,39 +133,16 @@ func encodeNames(what string, names []string) ([]byte, error) {
 	return b, nil
 }
 
-// encodeAttrs is the attributes as the JSON object to store, {} when there are
-// none.
-func encodeAttrs(attrs map[string]any) ([]byte, error) {
-	if len(attrs) == 0 {
-		return []byte("{}"), nil
-	}
-	b, err := json.Marshal(attrs)
-	if err != nil {
-		return nil, fmt.Errorf("the attributes cannot be written as JSON: %w", err)
-	}
-	if hasNULEscape(b) {
-		return nil, errNUL("an attribute name or value")
-	}
-	return b, nil
+// Cursor is a position in the log, as agent.Cursor is in a run listing: the
+// time a decision was decided and its ID, which orders those decided at one
+// time. A caller builds one from a record it was given, as Cursor{At: rec.At,
+// ID: rec.ID}.
+type Cursor struct {
+	At time.Time
+	ID int64
 }
 
-// hasNULEscape reports whether JSON text spells a NUL character, which is the
-// escape \u0000, in a string or a key. It reads escapes as JSON does, so the
-// text of an escaped backslash followed by u0000 is not one.
-func hasNULEscape(text []byte) bool {
-	for i := 0; i < len(text); i++ {
-		if text[i] != '\\' {
-			continue
-		}
-		if bytes.HasPrefix(text[i+1:], []byte("u0000")) {
-			return true
-		}
-		i++ // whatever follows a backslash is part of its escape
-	}
-	return false
-}
-
-// Filter narrows List. The zero Filter lists everything, up to the limit.
+// Filter narrows List. The zero Filter lists the newest decisions.
 type Filter struct {
 	// Effect, Rule and Kind each match a decision's own value exactly, with no
 	// regard to case. Empty matches any. An Effect that is not allow, ask or
@@ -174,7 +153,16 @@ type Filter struct {
 	// Since keeps the decisions decided at this time or later. It is read to the
 	// microsecond, as a decision's time is stored. The zero time keeps all.
 	Since time.Time
-	// Limit defaults to 100, and is at most 1000: a larger number is 1000.
+	// Before returns decisions older than this position: those decided earlier,
+	// and those decided at the same time and recorded earlier, so a record that
+	// shares its time with the last one of a page is on that page or the next
+	// and never both. It is read to the microsecond like Since. To read the next
+	// page, set it to the position of the last record of the one before; a page
+	// that comes back empty is the end of the log. A cursor whose ID is not one
+	// the log gives, which is any below 1, is an error.
+	Before *Cursor
+	// Limit is the size of a page. It defaults to 100, and is at most 1000: a
+	// larger number is 1000, and Before reaches the rest.
 	Limit int
 }
 
@@ -219,6 +207,13 @@ func (f Filter) query() (string, []any) {
 	if !f.Since.IsZero() {
 		and("decided_at >=", f.Since.UTC().Truncate(time.Microsecond))
 	}
+	if f.Before != nil {
+		// The order of the log, as a row comparison: it is also the order of
+		// policy_decisions_decided_idx.
+		args = append(args, f.Before.At.UTC().Truncate(time.Microsecond), f.Before.ID)
+		fmt.Fprintf(&sql, "%s(decided_at, id) < ($%d, $%d)", join, len(args)-1, len(args))
+		join = "\n  and "
+	}
 	// The id breaks a tie between decisions of one instant, so the order, and
 	// which of them a limit cuts, is the same every time.
 	args = append(args, f.limit())
@@ -226,13 +221,17 @@ func (f Filter) query() (string, []any) {
 	return sql.String(), args
 }
 
-// List returns decisions newest first, as the package comment describes: at
-// most 1000, an empty list and not nil when none match, and every record read
-// back in UTC with its attributes, matched rules and uncertain attributes
-// non-nil and its numbers json.Number.
+// List returns a page of decisions newest first, as the package comment
+// describes: at most 1000, an empty list and not nil when none match, and every
+// record read back with its ID, in UTC, with its attributes, matched rules and
+// uncertain attributes non-nil and its numbers json.Number. Filter.Before pages
+// back through the log.
 func (s *Store) List(ctx context.Context, f Filter) ([]policy.Record, error) {
 	if f.Effect != "" && !f.Effect.Valid() {
 		return nil, fmt.Errorf("policy/pg: list: the effect %q is not allow, ask or block", f.Effect)
+	}
+	if f.Before != nil && f.Before.ID < 1 {
+		return nil, fmt.Errorf("policy/pg: list: the cursor's id %d is not an id the log gives, which starts at 1", f.Before.ID)
 	}
 	sql, args := f.query()
 	rows, err := s.db.Query(ctx, sql, args...)
@@ -255,8 +254,7 @@ func (s *Store) List(ctx context.Context, f Filter) ([]policy.Record, error) {
 	return out, nil
 }
 
-// scanRecord reads the row rows is on. The row's id is read only to name a row
-// that cannot be decoded.
+// scanRecord reads the row rows is on.
 func scanRecord(rows pgx.Rows) (policy.Record, error) {
 	var (
 		id                        int64
@@ -269,6 +267,7 @@ func scanRecord(rows pgx.Rows) (policy.Record, error) {
 	); err != nil {
 		return policy.Record{}, fmt.Errorf("policy/pg: list: scan: %w", err)
 	}
+	rec.ID = id
 	rec.At = rec.At.UTC()
 	rec.Decision.Effect = policy.Effect(effect)
 

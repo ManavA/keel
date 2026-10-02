@@ -198,6 +198,7 @@ func TestDecider_OverTheStoreGivesAnErrorAndNoAllowWhenTheRecordCannotBeWritten(
 			assert.NotEqual(t, policy.Allow, dec.Effect, "a decision that could not be recorded is not an allow")
 			assert.Equal(t, policy.Decision{}, dec)
 			assert.Contains(t, err.Error(), "policy/pg")
+			assert.NotErrorIs(t, err, policy.ErrUnrecordable, "the database may be back by the next try")
 			if tt.check != nil {
 				tt.check(t, err)
 			}
@@ -217,6 +218,7 @@ func TestDecider_OverTheStoreIsNotAllowedAnActionWhoseAttributesCannotBeRecorded
 	dec, err := d.Decide(ctx, policy.Action{Kind: "read", Attrs: map[string]any{"note": "a\x00b"}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "NUL")
+	assert.ErrorIs(t, err, policy.ErrUnrecordable, "an agent that retries a failed step must not retry this one")
 	assert.Equal(t, policy.Decision{}, dec)
 
 	var rows int
