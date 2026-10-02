@@ -1538,8 +1538,23 @@ func (p Policy) Group(actions []Action) Grouped
 // as json.Number.
 func Parse(data []byte) (Policy, error)
 
+// ErrUnrecordable is what a Recorder wraps in the error it returns for a record
+// it can never store, however often it is tried again: a value its storage
+// cannot represent, or more of them than it will take. A Recorder that cannot
+// write because of how things are at the moment (a database that is down, a
+// context that is done) does not wrap it. Whoever retries a decision that failed
+// to record retries on the second kind and stops at the first, since a retry of
+// a record that can never be stored never ends. The error that wraps it is still
+// the Recorder's own, which errors.Is and errors.As can find.
+var ErrUnrecordable = errors.New("policy: the record cannot be stored")
+
 // Record is one decision as it is logged.
 type Record struct {
+	// ID is the store's own number for a record it lists, which with At is the
+	// record's place in the log: a Recorder that keeps an ID sets it on the
+	// records it returns and ignores it on the ones it is handed. It is zero for
+	// a record that no store has numbered, and the in-memory recorder has none.
+	ID       int64     `json:"id,omitempty"`
 	At       time.Time `json:"at"`
 	Action   Action    `json:"action"`
 	Decision Decision  `json:"decision"`
@@ -1547,7 +1562,10 @@ type Record struct {
 	Version string `json:"version,omitempty"`
 }
 
-// Recorder keeps the decision log.
+// Recorder keeps the decision log. Record returns nil only when the record is
+// kept; a Decider returns no decision for one that is not. An error for a record
+// that can never be stored, whatever is retried, wraps ErrUnrecordable. Any
+// other error is one a later call may not meet.
 type Recorder interface {
 	Record(ctx context.Context, rec Record) error
 }
@@ -1561,7 +1579,7 @@ type MemoryRecorder struct{ /* unexported fields */ }
 func NewMemoryRecorder() *MemoryRecorder
 
 // Record implements Recorder. It fails only when rec holds more than 10000
-// values to copy.
+// values to copy, and the error wraps ErrUnrecordable.
 func (m *MemoryRecorder) Record(ctx context.Context, rec Record) error
 
 // Records returns a copy of the log, oldest first.
@@ -1591,7 +1609,9 @@ func NewDecider(p Policy, opts Options) (*Decider, error)
 
 // Decide decides a and records the decision. When the record cannot be
 // written it returns the error and a zero Decision, whose empty Effect no
-// caller may read as Allow.
+// caller may read as Allow. An action whose attributes hold more than 10000
+// values cannot be copied for the record, and the error wraps ErrUnrecordable,
+// as does any a Recorder returns for a record it can never store.
 func (d *Decider) Decide(ctx context.Context, a Action) (Decision, error)
 
 // Policy returns the rules this Decider decides under, as a deep copy.
@@ -1641,7 +1661,12 @@ value `false`, which says the attribute is absent, is refused together with
 any other condition on the same attribute, since an absent attribute meets
 none, and written twice it is refused as a repeat. A bare `*` target is refused, with a message that says to leave the
 target empty for every target. A rule named `RuleDefault` is refused, since
-the record would then not say whether a rule matched.
+the record would then not say whether a rule matched. A NUL character is
+refused in a rule's name, a kind, a target pattern, an attribute name and the
+policy's version, with a message that names the rule, since a decision record
+holds the rule's name, the version and the attribute names a decision could
+not tell, and no record can hold a NUL: a rule with one would load and then
+fail to record every decision made under it.
 
 `Parse` first reads the document once to refuse what the decoder would take
 without a word: a document that is not an object (`null` is not an empty
@@ -1679,20 +1704,33 @@ type Store struct{ /* unexported fields */ }
 // New builds a Store over db.
 func New(db conn) *Store
 
-// Record implements policy.Recorder.
+// Record implements policy.Recorder. An error for a record that can never be
+// stored wraps policy.ErrUnrecordable; one that is the database's does not.
 func (s *Store) Record(ctx context.Context, rec policy.Record) error
 
-// Filter narrows List. The zero Filter lists everything.
+// Cursor is a position in the log, as agent.Cursor is in a run listing: the
+// time a decision was decided and its ID.
+type Cursor struct {
+	At time.Time
+	ID int64
+}
+
+// Filter narrows List. The zero Filter lists the newest decisions.
 type Filter struct {
 	Effect policy.Effect
 	Rule   string
 	Kind   string
 	Since  time.Time
-	// Limit defaults to 100.
+	// Before returns decisions older than this position. A cursor whose ID is
+	// below 1 is an error.
+	Before *Cursor
+	// Limit defaults to 100 and is at most 1000: a larger number is 1000.
 	Limit int
 }
 
-// List returns decisions newest first.
+// List returns a page of decisions, newest first by the time decided and then
+// by ID, each with its ID. To read the next page, set Before to the At and ID
+// of the last record of this one.
 func (s *Store) List(ctx context.Context, f Filter) ([]policy.Record, error)
 
 var _ policy.Recorder = (*Store)(nil)
@@ -1733,6 +1771,16 @@ UTC. `uncertain` is what `Decision.Uncertain` carries: the attributes a
 decision could not tell, so a reviewer reading the table sees why an ask or
 block rule decided on a condition that looks unmet.
 
+The listing orders by `(decided_at, id)`, which is the order of
+`policy_decisions_decided_idx`, and pages with a row comparison on it,
+`(decided_at, id) < ($time, $id)`, so a page is a short index scan however
+far back it is, and records that share a time are each on one page and no
+more. `id` is what the log gives a record when it is listed, as `Record.ID`.
+`jsonb` keeps a number as a `numeric`, with every digit and the scale it was
+written with; it refuses `\u0000`, a number of 131072 digits or more before
+the point, and a value nested more deeply than the server's stack, and each
+of those is an error that no retry changes.
+
 The down file drops the two indexes and the table.
 
 ### 5.5 Interfaces consumed
@@ -1755,7 +1803,8 @@ A copy is bounded in work: a policy whose conditions hold more than 10000
 values between them is refused by `NewDecider`, and an action whose
 attributes hold more is a record that cannot be written, so `Decide`
 returns an error and a zero `Decision`. `MemoryRecorder.Record` refuses such
-a record too, and its zero value is ready to use.
+a record too, and its zero value is ready to use. The errors for a record
+that is too large wrap `ErrUnrecordable`, as the next paragraphs say.
 
 `Decider.Decide` computes the decision and then records it. If the record
 cannot be written, it returns the error and a zero `Decision`. The zero
@@ -1764,6 +1813,22 @@ that is not one of the three as block, so a decision that could not be
 recorded is never acted on as an allow. A `Recorder` that panics takes
 `Decide` with it, and no decision is returned. The decision log is
 append-only: `policy/pg` has an insert and a read, and no update or delete.
+
+A record that can never be stored is told apart from a store that is down. A
+`Recorder` wraps `ErrUnrecordable` in the error it returns for a record that
+no retry will make storable, and does not for a failure of the moment, so a
+caller that retries a step whose decision failed to record retries the second
+and stops at the first. `Decider.Decide` wraps it for an action with more than
+10000 values, `MemoryRecorder.Record` for a record with more, and
+`policy/pg` for what it refuses before it sends anything (a NUL character, a
+decision whose effect is none of the three, attributes JSON cannot hold, an
+empty `json.Number`) and for the errors the server gives of the record's own
+content or size: SQLSTATE class 22, a data exception, and class 54, a program
+limit. A refused connection, a cancelled context, an aborted transaction and
+a server shutting down are the store's, and do not wrap it. The `Decider`
+returns a zero `Decision` either way. A NUL a policy holds in a name, a kind,
+a pattern or an attribute name is refused by `Validate`, since otherwise every
+decision made under that rule would fail to record, for ever.
 
 An invalid policy cannot reach `Decide` through a `Decider`, since
 `NewDecider` validates. Called on a `Policy` value directly, `Decide` treats
@@ -4674,3 +4739,32 @@ lead confirmed its choices, and the table now states each of them.
     normalisation, so whatever builds an `Action` puts them in one canonical
     spelling: normalising inside `policy` would pick one spelling for every
     caller's idea of what a target is.
+
+**The decision log is read by position, a record that can never be stored
+is told from a store that is down, and a policy that could not be recorded
+is refused at load.** `policy/pg` pages back through the log with a keyset
+cursor, `Cursor{At, ID}` on `Filter.Before`, the position of the last record
+of the page before, in the order the query already had and the index already
+served; each listed record carries its `ID` (a new field of `policy.Record`,
+zero where no store numbered it). Rejected: an offset, which skips or repeats
+records as new ones arrive and costs a scan of everything it skips; a cursor
+of the time alone, which splits a group of records that share one between
+pages and loses or repeats some of them; and returning a type of the store's
+own from `List`, which would have changed the signature that other packages
+build against. The limit's ceiling of 1000 stays, and the cursor is what
+makes it a page size and not a limit on how far back the log can be read: an
+audit log whose older entries cannot be reached is not one. `ErrUnrecordable`
+is one sentinel in `policy`, wrapped by whichever recorder refuses a record
+for good; the server's own error stays in the chain beside it. Rejected: a
+sentinel for the failures of the moment, since what is not known to be final
+must be treated as retryable, and a type that carries a reason, which every
+caller would have to switch on. `Validate` refuses a NUL in a rule's name, a
+kind, a target pattern, an attribute name and the version because the
+alternative is a rule that loads and then fails, closed, on every record under
+it, for ever; the refusal is at load, where it costs one startup error that
+names the rule. An empty `json.Number` in an attribute is refused as
+unrecordable, not stored as the 0 `encoding/json` writes for it: a record is
+what was decided on, and nobody sent a zero. Invalid UTF-8 in an attribute
+is replaced by U+FFFD, as `encoding/json` does, and the log says so;
+rejected: refusing it, which would fail the record of an action the policy
+decided on without a word.
