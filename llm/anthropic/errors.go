@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"strconv"
@@ -59,9 +60,13 @@ func apiError(resp *http.Response, body []byte) *llm.Error {
 	return e
 }
 
-// streamError turns a stream's error event into an *llm.Error. The status is
-// the one the stream opened with: the failure came after it.
-func streamError(resp *http.Response, wire wireError) *llm.Error {
+// sentError turns an error object the API sent under a 200 into an
+// *llm.Error: a stream's error event, or an error body where a reply was
+// expected. The status is the one the response came with, since the failure
+// came after it. The reference names overloaded_error as the usual one, the
+// counterpart of a 529, and api_error is the counterpart of a 500; those two
+// are worth another try.
+func sentError(resp *http.Response, wire wireError) *llm.Error {
 	return &llm.Error{
 		Provider:  Name,
 		Status:    resp.StatusCode,
@@ -70,6 +75,25 @@ func streamError(resp *http.Response, wire wireError) *llm.Error {
 		RequestID: requestID(resp),
 		Retryable: wire.Type == "overloaded_error" || wire.Type == "api_error",
 	}
+}
+
+// errorObject returns the error a 2xx body holds in place of a reply, or nil
+// when the body is not the API's error shape.
+func errorObject(resp *http.Response, body []byte) *llm.Error {
+	var wire struct {
+		Type string `json:"type"`
+		wireErrorBody
+	}
+	// A body that is not JSON is not an error object, whatever else it is.
+	_ = json.Unmarshal(body, &wire)
+	if wire.Type != eventError {
+		return nil
+	}
+	e := sentError(resp, wire.Error)
+	if e.RequestID == "" {
+		e.RequestID = wire.RequestID
+	}
+	return e
 }
 
 // replyError reports a response that arrived whole and is not what the
@@ -84,18 +108,99 @@ func replyError(resp *http.Response, format string, args ...any) *llm.Error {
 	}
 }
 
-// transportError reports a call that got no response, or lost it part way.
-// It is retryable unless the caller's context is what ended it.
-func transportError(ctx context.Context, id string, err error) *llm.Error {
-	return &llm.Error{Provider: Name, RequestID: id, Err: err, Retryable: ctx.Err() == nil}
+// callError reports a call that got no response, or lost it part way. When
+// the caller's context has ended, that is why, and the error is the
+// context's: nothing of the provider's and nothing to retry. With the
+// context live it is a transport failure or the HTTP client's own timeout,
+// and the same request may well succeed, unless what failed it was a
+// redirect the client's policy would not follow.
+func callError(ctx context.Context, id string, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("anthropic: %w", ctxErr)
+	}
+	// A redirect the client's policy refused would be refused again.
+	var refused *refusedRedirect
+	return &llm.Error{Provider: Name, RequestID: id, Err: err, Retryable: !errors.As(err, &refused)}
 }
 
-// readError reports a failure to read a response body.
-func readError(ctx context.Context, resp *http.Response, err error) *llm.Error {
-	if errors.Is(err, errTooLarge) {
-		return replyError(resp, "%v", errTooLarge)
+// sendError reports a request that got no response to read. resp is what
+// net/http returned beside the error, which it does only for the 3xx of a
+// redirect the client's policy refused. That one is the server's answer and
+// the policy's decision: an error with the status, and not retryable, like
+// the 3xx the default client does not follow.
+func sendError(ctx context.Context, resp *http.Response, err error) error {
+	var refused *refusedRedirect
+	if ctx.Err() != nil || resp == nil || !errors.As(err, &refused) {
+		return callError(ctx, "", err)
 	}
-	return transportError(ctx, requestID(resp), err)
+	return &llm.Error{
+		Provider:  Name,
+		Status:    resp.StatusCode,
+		Message:   "the redirect was not followed: " + refused.Error(),
+		RequestID: requestID(resp),
+		Err:       err,
+	}
+}
+
+// readError reports a failure to read a response body that is read whole.
+func readError(ctx context.Context, resp *http.Response, err error) error {
+	if errors.Is(err, errTooLarge) {
+		return sizeError(err)
+	}
+	return callError(ctx, requestID(resp), err)
+}
+
+// sizeError reports a reply past one of this package's size bounds. It is a
+// plain error: the API did not fail, and the same request would pass the
+// bound again.
+func sizeError(err error) error {
+	return fmt.Errorf("anthropic: %w", err)
+}
+
+// streamFailure reports a streamed call that failed before its events began:
+// no response, or a body that is not a stream and could not be read. id is
+// the response's request id, when there was a response. stalled says the idle
+// watch ended the wait, in which case err is only the cancellation the watch
+// caused.
+func (c *Client) streamFailure(ctx context.Context, id string, err error, stalled bool) error {
+	switch {
+	case ctx.Err() != nil:
+		return callError(ctx, id, err)
+	case stalled:
+		// The cause is a new error and not the cancelled read: the caller
+		// cancelled nothing, and a stalled connection is worth another try.
+		return &llm.Error{
+			Provider:  Name,
+			RequestID: id,
+			Err:       fmt.Errorf("the stream sent nothing for %s", c.idle),
+			Retryable: true,
+		}
+	case errors.Is(err, errTooLarge):
+		return sizeError(err)
+	default:
+		return callError(ctx, id, err)
+	}
+}
+
+// eventFailure reports a stream whose events stopped before the reply was
+// whole.
+func (c *Client) eventFailure(ctx context.Context, id string, err error, stalled bool) error {
+	var failed *readFailure
+	switch {
+	case ctx.Err() != nil, stalled, errors.As(err, &failed), errors.Is(err, io.ErrUnexpectedEOF):
+		// The caller gave up, the stream stalled, or the connection failed
+		// or was cut in the middle of an event.
+		return c.streamFailure(ctx, id, err, stalled)
+	case errors.Is(err, io.EOF):
+		// The stream ended between events and message_stop never came.
+		// Whether the connection dropped or the server stopped early, the
+		// reply is not whole.
+		return callError(ctx, id, fmt.Errorf("the stream ended before message_stop: %w", io.ErrUnexpectedEOF))
+	default:
+		// The body was read and the event reader would not take it: an
+		// event past its bound.
+		return sizeError(err)
+	}
 }
 
 func requestID(resp *http.Response) string {

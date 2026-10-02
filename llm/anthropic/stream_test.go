@@ -80,11 +80,13 @@ func TestClient_Stream_EqualsGenerate(t *testing.T) {
 		events string
 		body   string
 		opts   anthropic.Options
+		// refused marks a reply that has no provider form to replay.
+		refused bool
 	}{
 		{name: "text only, with a ping", events: "stream_text.sse", body: "stream_text.json"},
 		{name: "text then a tool call split across deltas", events: "stream_tool_use.sse", body: "stream_tool_use.json"},
 		{name: "a thinking block with no text and a signature", events: "stream_thinking.sse", body: "stream_thinking.json"},
-		{name: "a refusal before any output", events: "stream_refusal.sse", body: "refusal.json"},
+		{name: "a refusal before any output", events: "stream_refusal.sse", body: "refusal.json", refused: true},
 		{
 			name:   "a fallback part way through the reply",
 			events: "stream_fallback.sse", body: "stream_fallback.json",
@@ -107,6 +109,10 @@ func TestClient_Stream_EqualsGenerate(t *testing.T) {
 			assert.NotEmpty(t, got.ID)
 			assert.NotEmpty(t, got.Model)
 			assert.NotEmpty(t, got.Stop)
+			if tt.refused {
+				assert.Nil(t, got.Message.Opaque)
+				return
+			}
 			require.NotNil(t, got.Message.Opaque)
 			assert.Equal(t, anthropic.Name, got.Message.Opaque.Provider)
 		})
@@ -540,6 +546,36 @@ func TestClient_Stream_FnErrorStopsTheStream(t *testing.T) {
 	assert.False(t, llm.Retryable(err))
 }
 
+func TestClient_Stream_FnErrorOnACallWithNoArguments(t *testing.T) {
+	// A call that streamed no arguments is announced when its block closes,
+	// and an error from fn there stops the stream like any other.
+	events := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"now","input":{}}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":9}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	api := newFakeAPI(t, replyStream(events))
+	stop := errors.New("the consumer has gone")
+	resp, err := api.client(t, anthropic.Options{}).Stream(context.Background(), llm.Request{Messages: hello()},
+		func(d llm.Delta) error {
+			require.NotNil(t, d.ToolCall)
+			return stop
+		})
+	require.ErrorIs(t, err, stop)
+	assert.Nil(t, resp)
+}
+
 func TestClient_Stream_UsageIsCumulative(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -594,18 +630,96 @@ func TestClient_Stream_UsageIsCumulative(t *testing.T) {
 }
 
 func TestClient_Stream_Refusal(t *testing.T) {
-	resp, deltas, err := stream(t, anthropic.Options{}, fixture(t, "stream_refusal.sse"))
-	require.NoError(t, err, "a refusal is a reply")
+	t.Run("before any output", func(t *testing.T) {
+		resp, deltas, err := stream(t, anthropic.Options{}, fixture(t, "stream_refusal.sse"))
+		require.NoError(t, err, "a refusal is a reply")
+
+		assert.Empty(t, deltas)
+		assert.Equal(t, llm.StopRefusal, resp.Stop)
+		assert.Equal(t, &llm.Refusal{
+			Category:    "cyber",
+			Explanation: "This request was declined because it could enable cyber harm.",
+		}, resp.Refusal)
+		assert.Equal(t, llm.Message{Role: llm.RoleAssistant}, resp.Message)
+		assert.Equal(t, llm.Usage{}, resp.Usage, "declined before any output, in a category that is not billed")
+	})
+
+	t.Run("after partial output", func(t *testing.T) {
+		// Text and a whole tool call arrive, and then the reply is refused.
+		// What was streamed has been seen and cannot be taken back; the
+		// Response carries none of it.
+		events := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":412,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me look at"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"delta_from_the_future","payload":{"k":1}}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01A09q90qw90lq917835lq9","name":"get_weather","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"location\": \"San Francisco, CA\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"cyber","explanation":"This request was declined because it could enable cyber harm."}},"usage":{"output_tokens":37}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+		logger, logged := captureLog()
+		resp, deltas, err := stream(t, anthropic.Options{Logger: logger}, events)
+		require.NoError(t, err)
+
+		require.Len(t, deltas, 2, "the deltas were delivered as they came")
+		assert.Equal(t, "Let me look at", deltas[0].Text)
+		assert.Equal(t, "get_weather", deltas[1].ToolCall.Name)
+
+		assert.Equal(t, llm.StopRefusal, resp.Stop)
+		assert.Equal(t, "cyber", resp.Refusal.Category)
+		assert.Equal(t, llm.Message{Role: llm.RoleAssistant}, resp.Message, "a refused reply hands on no text, no tool call and nothing to replay")
+		assert.Equal(t, llm.Usage{InputTokens: 412, OutputTokens: 37}, resp.Usage, "a refusal after output is billed")
+		// The stream held a delta this package does not know, which costs any
+		// other reply its provider form and earns a warning. A refused reply
+		// had none to lose.
+		assert.Empty(t, logged.String(), "there is nothing to warn about: a refused turn is never replayed")
+	})
+}
+
+func TestClient_Stream_EmptyReply(t *testing.T) {
+	// The server opened the message, said how it ended and closed it, with
+	// no content between. That is a reply, and not a stream that failed.
+	events := `event: message_start
+data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":9,"output_tokens":1}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	resp, deltas, err := stream(t, anthropic.Options{}, events)
+	require.NoError(t, err)
 
 	assert.Empty(t, deltas)
-	assert.Equal(t, llm.StopRefusal, resp.Stop)
-	assert.Equal(t, &llm.Refusal{
-		Category:    "cyber",
-		Explanation: "This request was declined because it could enable cyber harm.",
-	}, resp.Refusal)
+	assert.Equal(t, "msg_01", resp.ID)
+	assert.Equal(t, llm.StopEnd, resp.Stop)
 	assert.Empty(t, resp.Message.Text)
-	assert.Equal(t, llm.Usage{InputTokens: 412}, resp.Usage)
 	assert.Equal(t, `[]`, string(resp.Message.Opaque.Data))
+	assert.Equal(t, llm.Usage{InputTokens: 9, OutputTokens: 1}, resp.Usage)
 }
 
 func TestClient_Stream_Fallback(t *testing.T) {
@@ -939,6 +1053,5 @@ func TestClient_Stream_CancelledContextIsNotRetryable(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	assert.False(t, llm.Retryable(err))
 	var e *llm.Error
-	require.ErrorAs(t, err, &e)
-	assert.False(t, e.Retryable, "the caller gave up: there is nobody to retry for")
+	assert.NotErrorAs(t, err, &e, "the caller gave up: that is the context's error and not the provider's")
 }

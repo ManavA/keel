@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"net/http"
 	"slices"
@@ -25,6 +23,16 @@ const (
 	eventMessageDelta      = "message_delta"
 	eventMessageStop       = "message_stop"
 	eventError             = "error"
+)
+
+// The delta types this package folds into a block. A block that receives any
+// other cannot be rebuilt as the server holds it; citations_delta is one
+// such, since this package does not map citations.
+const (
+	deltaText      = "text_delta"
+	deltaInputJSON = "input_json_delta"
+	deltaThinking  = "thinking_delta"
+	deltaSignature = "signature_delta"
 )
 
 // streamEvent is the fields of every event this package acts on, in one
@@ -47,9 +55,30 @@ type streamed struct {
 	blocks  map[int]*streamedBlock
 	// calls counts the client tool calls opened so far.
 	calls int
+	// size is the bytes gathered so far of everything the reply keeps: the
+	// message's id and model, each block as it started (a tool call's id
+	// and name with it), every delta folded into a block, and how the reply
+	// ended.
+	size int
+	// ending is how many of those bytes the latest message_delta accounts
+	// for.
+	ending int
 	// lost says why the content array cannot be rebuilt as the server holds
 	// it, and is "" while it can.
 	lost string
+}
+
+// grow counts n more bytes that the reply keeps, and fails once it has
+// outgrown the bound an unstreamed body is held to. Events that add nothing
+// to the reply, keep-alives above all, are not counted: a stream may run as
+// long as it likes, and it is what the reply holds in memory that is
+// bounded.
+func (s *streamed) grow(n int) error {
+	s.size += n
+	if s.size > maxBodyBytes {
+		return sizeError(fmt.Errorf("the streamed reply is larger than %d bytes", maxBodyBytes))
+	}
+	return nil
 }
 
 // streamedBlock is one content block being put together from its deltas.
@@ -71,20 +100,18 @@ type streamedBlock struct {
 }
 
 // readStream reads the events of resp into a Response, calling fn for each
-// increment. body is resp's body under the size bound.
-func (c *Client) readStream(ctx context.Context, resp *http.Response, body io.Reader, fn func(llm.Delta) error) (*llm.Response, error) {
-	events := sse.NewReader(body)
+// increment. watch bounds each wait for the server.
+func (c *Client) readStream(ctx context.Context, resp *http.Response, watch *idleWatch, fn func(llm.Delta) error) (*llm.Response, error) {
+	events := sse.NewReader(streamBody{r: resp.Body, watch: watch})
 	s := &streamed{blocks: make(map[int]*streamedBlock)}
 	for {
+		// The wait starts afresh here, after fn has returned, so the time
+		// the caller took over the last delta is not the server's silence.
+		watch.begin(c.idle)
 		ev, err := events.Next()
-		if err != nil {
-			// The stream is over and message_stop never came. Whether the
-			// connection dropped or the server stopped early, the reply is
-			// not whole and the call has failed.
-			if errors.Is(err, io.EOF) {
-				err = fmt.Errorf("the stream ended before message_stop: %w", io.ErrUnexpectedEOF)
-			}
-			return nil, readError(ctx, resp, err)
+		stalled := watch.end()
+		if err != nil || stalled {
+			return nil, c.eventFailure(ctx, requestID(resp), err, stalled)
 		}
 
 		// Every event repeats its name as the type in its data, so a stream
@@ -111,10 +138,17 @@ func (c *Client) readStream(ctx context.Context, resp *http.Response, body io.Re
 		switch kind {
 		case eventMessageStart:
 			if e.Message != nil {
+				// The message's id and model are kept.
+				if err := s.grow(len(ev.Data)); err != nil {
+					return nil, err
+				}
 				s.started = true
 				s.msg.ID, s.msg.Model, s.msg.Usage = e.Message.ID, e.Message.Model, e.Message.Usage
 			}
 		case eventContentBlockStart:
+			if err := s.grow(len(e.ContentBlock)); err != nil {
+				return nil, err
+			}
 			if err := s.open(e); err != nil {
 				return nil, replyError(resp, "the stream's %s event is not valid: %v", kind, err)
 			}
@@ -134,16 +168,24 @@ func (c *Client) readStream(ctx context.Context, resp *http.Response, body io.Re
 				}
 			}
 		case eventMessageDelta:
+			// How the reply ended is kept too: the explanation of a refusal,
+			// the models that worked on it. A later message_delta replaces
+			// what an earlier one said, so only the latest is counted.
+			if err := s.grow(len(ev.Data) - s.ending); err != nil {
+				return nil, err
+			}
+			s.ending = len(ev.Data)
 			s.finish(e)
 		case eventMessageStop:
 			if !s.started {
 				return nil, replyError(resp, "the stream ended without a message_start event")
 			}
 			// The reply is complete. Whatever the connection does after
-			// this, there is nothing left to read.
+			// this cannot fail the call.
+			watch.drain(resp.Body)
 			return s.response(ctx, c), nil
 		case eventError:
-			return nil, streamError(resp, e.Error)
+			return nil, sentError(resp, e.Error)
 		}
 	}
 }
@@ -184,31 +226,45 @@ func (s *streamed) apply(b *streamedBlock, raw json.RawMessage, fn func(llm.Delt
 	var delta map[string]json.RawMessage
 	_ = json.Unmarshal(raw, &delta)
 
-	switch kind := str(delta["type"]); kind {
-	case "text_delta":
-		text := str(delta["text"])
-		b.text = extend(b.text, b.fields["text"], text)
-		if text != "" {
-			return fn(llm.Delta{Text: text})
-		}
-	case "input_json_delta":
-		part := str(delta["partial_json"])
-		b.input = extend(b.input, nil, part)
-		if b.typ == blockToolUse {
-			return fn(llm.Delta{ToolCall: b.announce(part)})
-		}
-	case "thinking_delta":
-		thinking := str(delta["thinking"])
-		b.thinking = extend(b.thinking, b.fields["thinking"], thinking)
-		if thinking != "" {
-			return fn(llm.Delta{Reasoning: thinking})
-		}
-	case "signature_delta":
-		b.fields["signature"] = quote(str(delta["signature"]))
+	kind := str(delta["type"])
+	var part string
+	switch kind {
+	case deltaText:
+		part = str(delta["text"])
+	case deltaInputJSON:
+		part = str(delta["partial_json"])
+	case deltaThinking:
+		part = str(delta["thinking"])
+	case deltaSignature:
+		part = str(delta["signature"])
 	default:
 		if s.lost == "" {
 			s.lost = fmt.Sprintf("the stream sent a delta of type %q, which this package does not know", kind)
 		}
+		return nil
+	}
+	if err := s.grow(len(part)); err != nil {
+		return err
+	}
+
+	switch kind {
+	case deltaText:
+		b.text = extend(b.text, b.fields["text"], part)
+		if part != "" {
+			return fn(llm.Delta{Text: part})
+		}
+	case deltaInputJSON:
+		b.input = extend(b.input, nil, part)
+		if b.typ == blockToolUse {
+			return fn(llm.Delta{ToolCall: b.announce(part)})
+		}
+	case deltaThinking:
+		b.thinking = extend(b.thinking, b.fields["thinking"], part)
+		if part != "" {
+			return fn(llm.Delta{Reasoning: part})
+		}
+	case deltaSignature:
+		b.fields["signature"] = quote(part)
 	}
 	return nil
 }
@@ -264,7 +320,9 @@ func (s *streamed) response(ctx context.Context, c *Client) *llm.Response {
 	}
 
 	resp := s.msg.response(blocks, nil)
-	if s.lost != "" {
+	// A refused reply has no provider form whatever the stream held, so
+	// there is nothing lost to warn about.
+	if s.lost != "" && resp.Stop != llm.StopRefusal {
 		// The content array would not be the one the server holds, and
 		// sending back a different one is worse than sending none: the turn
 		// is replayed from its text and tool calls instead.

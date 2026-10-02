@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -56,6 +57,8 @@ type received struct {
 	Path   string
 	Header http.Header
 	Body   []byte
+	// Gone is closed when the client has gone away.
+	Gone <-chan struct{}
 }
 
 // reply answers one request the fake API received.
@@ -79,7 +82,7 @@ func newFakeAPI(t *testing.T, answer reply) *fakeAPI {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		req := received{Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone(), Body: body}
+		req := received{Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone(), Body: body, Gone: r.Context().Done()}
 		f.mu.Lock()
 		f.requests = append(f.requests, req)
 		f.mu.Unlock()
@@ -97,6 +100,19 @@ func (f *fakeAPI) client(t *testing.T, opts anthropic.Options) *anthropic.Client
 	}
 	opts.BaseURL = f.srv.URL
 	c, err := anthropic.New(opts)
+	require.NoError(t, err)
+	return c
+}
+
+// clientWithin is client with the time an unstreamed call is given set to
+// timeout, which is otherwise ten minutes.
+func (f *fakeAPI) clientWithin(t *testing.T, opts anthropic.Options, timeout time.Duration) *anthropic.Client {
+	t.Helper()
+	if opts.APIKey == "" {
+		opts.APIKey = testKey
+	}
+	opts.BaseURL = f.srv.URL
+	c, err := anthropic.NewWithRequestTimeout(opts, timeout)
 	require.NoError(t, err)
 	return c
 }
@@ -245,13 +261,14 @@ func TestClient_RequestLine(t *testing.T) {
 }
 
 func TestClient_BaseURLThatIsNotAnAddress(t *testing.T) {
-	c, err := anthropic.New(anthropic.Options{APIKey: testKey, BaseURL: "http://[::1"})
-	require.NoError(t, err)
-
-	_, err = c.Generate(context.Background(), llm.Request{Messages: hello()})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "anthropic: build request")
-	assert.False(t, llm.Retryable(err))
+	for _, base := range []string{"http://[::1", "api.keel.test", "/v1"} {
+		t.Run(base, func(t *testing.T) {
+			c, err := anthropic.New(anthropic.Options{APIKey: testKey, BaseURL: base})
+			require.Error(t, err)
+			assert.Nil(t, c)
+			assert.Contains(t, err.Error(), "BaseURL")
+		})
+	}
 }
 
 func TestClient_BaseURLWithATrailingSlash(t *testing.T) {

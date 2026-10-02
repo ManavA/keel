@@ -5,6 +5,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -284,6 +285,43 @@ func TestClient_TransportFailure(t *testing.T) {
 	})
 }
 
+// The status is the answer. An error whose body was cut short is still the
+// error the status says it is, with whatever of the body arrived.
+func TestClient_ErrorStatusWithABodyCutShort(t *testing.T) {
+	api := newFakeAPI(t, func(w http.ResponseWriter, _ received) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("the test server cannot hijack its connection")
+			return
+		}
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		body := errorBody("overloaded_error", "Overloaded")
+		_, _ = buf.WriteString("HTTP/1.1 529 Overloaded\r\nContent-Type: application/json\r\nrequest-id: " + requestID +
+			"\r\nContent-Length: " + strconv.Itoa(len(body)+100) + "\r\n\r\n" + body)
+		_ = buf.Flush()
+	})
+	c := api.client(t, anthropic.Options{})
+
+	check := func(t *testing.T, err error) {
+		t.Helper()
+		var e *llm.Error
+		require.ErrorAs(t, err, &e)
+		assert.Equal(t, 529, e.Status)
+		assert.Equal(t, "overloaded_error", e.Type)
+		assert.Equal(t, requestID, e.RequestID)
+		assert.True(t, e.Retryable)
+	}
+	_, err := c.Generate(context.Background(), llm.Request{Messages: hello()})
+	check(t, err)
+	_, err = c.Stream(context.Background(), llm.Request{Messages: hello()}, func(llm.Delta) error { return nil })
+	check(t, err)
+}
+
 func TestClient_CancelledContextIsNotRetryable(t *testing.T) {
 	api := newFakeAPI(t, replyEither(okBody, okStream))
 	c := api.client(t, anthropic.Options{})
@@ -297,8 +335,7 @@ func TestClient_CancelledContextIsNotRetryable(t *testing.T) {
 		require.ErrorIs(t, err, context.Canceled)
 		assert.False(t, llm.Retryable(err))
 		var e *llm.Error
-		require.ErrorAs(t, err, &e)
-		assert.False(t, e.Retryable)
+		assert.NotErrorAs(t, err, &e, "the caller gave up: that is the context's error and not the provider's")
 	}
 
 	resp, err := c.Generate(ctx, llm.Request{Messages: hello()})
@@ -319,61 +356,33 @@ func TestClient_DeadlineIsNotRetryable(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.False(t, llm.Retryable(err))
 	var e *llm.Error
-	require.ErrorAs(t, err, &e)
-	assert.False(t, e.Retryable)
+	assert.NotErrorAs(t, err, &e, "the caller's deadline is the context's error and not the provider's")
 }
 
-// A reply past the bound is refused instead of read whole.
-func TestClient_ReplyOverTheBodyLimit(t *testing.T) {
-	const limit = 32 << 20
+// A reply past the bound is refused instead of read whole. Passing a size
+// bound is a plain error: the same request would pass it again.
+func TestClient_Generate_ReplyOverTheBodyBound(t *testing.T) {
+	const bound = 32 << 20
 	chunk := strings.Repeat("a", 1<<20)
 
-	t.Run("Generate", func(t *testing.T) {
-		api := newFakeAPI(t, func(w http.ResponseWriter, _ received) {
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("request-id", requestID)
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"`)
-			for range limit/len(chunk) + 1 {
-				if _, err := io.WriteString(w, chunk); err != nil {
-					return
-				}
+	api := newFakeAPI(t, func(w http.ResponseWriter, _ received) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("request-id", requestID)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"`)
+		for range bound/len(chunk) + 1 {
+			if _, err := io.WriteString(w, chunk); err != nil {
+				return
 			}
-			_, _ = io.WriteString(w, `"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
-		})
-		resp, err := api.client(t, anthropic.Options{}).Generate(context.Background(), llm.Request{Messages: hello()})
-
-		require.Error(t, err)
-		assert.Nil(t, resp)
-		assert.Contains(t, err.Error(), "larger than")
-		assert.False(t, llm.Retryable(err))
+		}
+		_, _ = io.WriteString(w, `"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
 	})
+	resp, err := api.client(t, anthropic.Options{}).Generate(context.Background(), llm.Request{Messages: hello()})
 
-	t.Run("Stream", func(t *testing.T) {
-		api := newFakeAPI(t, func(w http.ResponseWriter, _ received) {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("request-id", requestID)
-			w.WriteHeader(http.StatusOK)
-			head, _, _ := strings.Cut(okStream, "event: content_block_delta")
-			_, tail, _ := strings.Cut(okStream, "event: content_block_stop")
-			_, _ = io.WriteString(w, head)
-			// Each event is well under the reader's own bound of 16 MiB; it
-			// is their sum that passes this package's.
-			for range limit/len(chunk) + 1 {
-				event := "event: content_block_delta\n" +
-					`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"` + chunk + `"}}` + "\n\n"
-				if _, err := io.WriteString(w, event); err != nil {
-					return
-				}
-			}
-			_, _ = io.WriteString(w, "event: content_block_stop"+tail)
-		})
-		resp, err := api.client(t, anthropic.Options{}).Stream(context.Background(), llm.Request{Messages: hello()},
-			func(llm.Delta) error { return nil })
-
-		require.Error(t, err)
-		assert.Nil(t, resp)
-		assert.Contains(t, err.Error(), "larger than")
-		assert.False(t, llm.Retryable(err))
-	})
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Contains(t, err.Error(), "larger than")
+	assert.False(t, llm.Retryable(err))
+	var e *llm.Error
+	assert.NotErrorAs(t, err, &e)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"testing"
 
@@ -144,8 +145,10 @@ func TestClient_Generate_StopReasons(t *testing.T) {
 			assert.Equal(t, tt.want, resp.Stop)
 			if tt.want == llm.StopRefusal {
 				assert.NotNil(t, resp.Refusal, "Refusal is set whenever Stop is StopRefusal")
+				assert.Equal(t, llm.Message{Role: llm.RoleAssistant}, resp.Message, "a refused reply carries no output")
 			} else {
 				assert.Nil(t, resp.Refusal)
+				assert.Equal(t, "ok", resp.Message.Text)
 			}
 		})
 	}
@@ -160,9 +163,9 @@ func TestClient_Generate_Refusal(t *testing.T) {
 			Category:    "cyber",
 			Explanation: "This request was declined because it could enable cyber harm.",
 		}, resp.Refusal)
-		assert.Empty(t, resp.Message.Text)
-		assert.Empty(t, resp.Message.ToolCalls)
-		assert.Equal(t, llm.Usage{InputTokens: 412}, resp.Usage)
+		assert.Equal(t, llm.Message{Role: llm.RoleAssistant}, resp.Message)
+		assert.Equal(t, "msg_01XFUDYJgAACzvnptvVoYEL", resp.ID)
+		assert.Equal(t, "claude-opus-5-5", resp.Model)
 	})
 
 	t.Run("without a category", func(t *testing.T) {
@@ -170,7 +173,333 @@ func TestClient_Generate_Refusal(t *testing.T) {
 
 		assert.Equal(t, llm.StopRefusal, resp.Stop)
 		assert.Equal(t, &llm.Refusal{}, resp.Refusal)
+		assert.Equal(t, llm.Message{Role: llm.RoleAssistant}, resp.Message)
 	})
+
+	t.Run("partial output is not handed on", func(t *testing.T) {
+		// The reference: "treat any partial output as incomplete and discard
+		// it". A tool call from a turn the model refused must never reach
+		// whatever runs tools, and the turn has no form to replay.
+		resp := generate(t, `{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[`+
+			`{"type":"thinking","thinking":"","signature":"EqQBCgIYAhIM1gbcDa9GJwZA2b3hGgxBdjrkzLoky3dl1pkiMOYds"},`+
+			`{"type":"text","text":"Let me look at"},`+
+			`{"type":"tool_use","id":"toolu_01A09q90qw90lq917835lq9","name":"get_weather","input":{"location":"San Francisco, CA"}}],`+
+			`"stop_reason":"refusal","stop_sequence":null,`+
+			`"stop_details":{"type":"refusal","category":"cyber","explanation":"This request was declined because it could enable cyber harm."},`+
+			`"usage":{"input_tokens":412,"output_tokens":37}}`)
+
+		assert.Equal(t, llm.StopRefusal, resp.Stop)
+		assert.Equal(t, "cyber", resp.Refusal.Category)
+		assert.Equal(t, llm.Message{Role: llm.RoleAssistant}, resp.Message)
+		assert.Empty(t, resp.Message.Text)
+		assert.Empty(t, resp.Message.ToolCalls)
+		assert.Nil(t, resp.Message.Opaque)
+	})
+}
+
+// billedPrices prices every token at one millionth of a dollar, so the cost
+// of a reply is the number of tokens it was billed for.
+func billedPrices() llm.Prices {
+	one := llm.Price{Input: 1_000_000, Output: 1_000_000, CacheRead: 1_000_000, CacheWrite: 1_000_000}
+	return llm.Prices{"claude-opus-5-5": one, "claude-sonnet-5-5": one, "claude-haiku-4-5-20251001": one}
+}
+
+// What a reply reports as usage is what the reference says is billed. An
+// attempt that declined before producing any output is billed only in the
+// three categories the refusals reference marks, and is listed with no usage
+// otherwise, so the record still shows it ran.
+func TestClient_Generate_Billing(t *testing.T) {
+	const (
+		// One reply, refused before any output.
+		refusedHead = `{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":"refusal","stop_sequence":null,`
+		// A fallback block as the beta Messages reference defines it, with
+		// the category that made the first model hand over.
+		toSonnet = `{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-sonnet-5-5"},"trigger":{"type":"refusal","category":%s}}`
+		toHaiku  = `{"type":"fallback","from":{"model":"claude-sonnet-5-5"},"to":{"model":"claude-haiku-4-5-20251001"},"trigger":{"type":"refusal","category":%s}}`
+		answer   = `{"type":"text","text":"Hi! How can I help you today?"}`
+
+		opusDeclined   = `{"type":"message","model":"claude-opus-5-5","input_tokens":535,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`
+		sonnetDeclined = `{"type":"message","model":"claude-sonnet-5-5","input_tokens":500,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`
+		sonnetServed   = `{"type":"fallback_message","model":"claude-sonnet-5-5","input_tokens":412,"output_tokens":264,"cache_read_input_tokens":96,"cache_creation_input_tokens":31}`
+		haikuServed    = `{"type":"fallback_message","model":"claude-haiku-4-5-20251001","input_tokens":412,"output_tokens":264,"cache_read_input_tokens":96,"cache_creation_input_tokens":31}`
+		servedUsage    = `"input_tokens":412,"output_tokens":264,"cache_read_input_tokens":96,"cache_creation_input_tokens":31`
+	)
+	served := llm.Usage{InputTokens: 412, OutputTokens: 264, CacheReadTokens: 96, CacheWriteTokens: 31}
+	fallback := func(model string, content []string, iterations ...string) string {
+		return `{"id":"msg_01","type":"message","role":"assistant","model":"` + model + `","content":` + jsonArray(content) +
+			`,"stop_reason":"end_turn","stop_details":null,"usage":{` + servedUsage + `,"iterations":` + jsonArray(iterations) + `}}`
+	}
+
+	tests := []struct {
+		name string
+		body string
+
+		wantUsage    llm.Usage
+		wantAttempts []llm.Attempt
+		// wantBilled is every token the reference says the call is billed
+		// for, over all the models that worked on it.
+		wantBilled int64
+	}{
+		{
+			name: "a refusal before any output, in a category that is not billed",
+			body: refusedHead + `"stop_details":{"type":"refusal","category":"cyber","explanation":"x"},"usage":{"input_tokens":412,"output_tokens":0}}`,
+		},
+		{
+			name: "a refusal before any output, in the other category that is not billed",
+			body: refusedHead + `"stop_details":{"type":"refusal","category":"general_harms","explanation":"x"},"usage":{"input_tokens":412,"output_tokens":0}}`,
+		},
+		{
+			name: "a refusal before any output, with no category",
+			body: refusedHead + `"stop_details":{"type":"refusal","category":null,"explanation":null},"usage":{"input_tokens":412,"output_tokens":0}}`,
+		},
+		{
+			name:      "a refusal before any output, category bio, is billed",
+			body:      refusedHead + `"stop_details":{"type":"refusal","category":"bio","explanation":"x"},"usage":{"input_tokens":412,"output_tokens":0}}`,
+			wantUsage: llm.Usage{InputTokens: 412}, wantBilled: 412,
+		},
+		{
+			name:      "a refusal before any output, category frontier_llm, is billed",
+			body:      refusedHead + `"stop_details":{"type":"refusal","category":"frontier_llm","explanation":"x"},"usage":{"input_tokens":412,"output_tokens":0}}`,
+			wantUsage: llm.Usage{InputTokens: 412}, wantBilled: 412,
+		},
+		{
+			name:      "a refusal before any output, category reasoning_extraction, is billed",
+			body:      refusedHead + `"stop_details":{"type":"refusal","category":"reasoning_extraction","explanation":"x"},"usage":{"input_tokens":412,"output_tokens":0}}`,
+			wantUsage: llm.Usage{InputTokens: 412}, wantBilled: 412,
+		},
+		{
+			name:      "a refusal after some output is billed whatever its category",
+			body:      refusedHead + `"stop_details":{"type":"refusal","category":"cyber","explanation":"x"},"usage":{"input_tokens":412,"output_tokens":37}}`,
+			wantUsage: llm.Usage{InputTokens: 412, OutputTokens: 37}, wantBilled: 449,
+		},
+		{
+			name:      "a refusal that does not say why is taken as billed",
+			body:      refusedHead + `"stop_details":null,"usage":{"input_tokens":412,"output_tokens":0}}`,
+			wantUsage: llm.Usage{InputTokens: 412}, wantBilled: 412,
+		},
+		{
+			// The reference's own example reply carries stop_details beside
+			// end_turn. Only a refusal is judged by them.
+			name: "stop_details beside another stop reason change nothing",
+			body: `{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"stop_reason":"end_turn","stop_sequence":null,` +
+				`"stop_details":{"type":"refusal","category":"cyber","explanation":"x"},"usage":{"input_tokens":412,"output_tokens":0}}`,
+			wantUsage: llm.Usage{InputTokens: 412}, wantBilled: 412,
+		},
+		{
+			name:      "the first model declined before any output, in a category that is not billed",
+			body:      fallback("claude-sonnet-5-5", []string{fmt.Sprintf(toSonnet, `"cyber"`), answer}, opusDeclined, sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5"},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 803,
+		},
+		{
+			name:      "the first model declined before any output, with no category",
+			body:      fallback("claude-sonnet-5-5", []string{fmt.Sprintf(toSonnet, `null`), answer}, opusDeclined, sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5"},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 803,
+		},
+		{
+			name:      "the first model declined before any output, in a billed category",
+			body:      fallback("claude-sonnet-5-5", []string{fmt.Sprintf(toSonnet, `"bio"`), answer}, opusDeclined, sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 535}},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 535 + 803,
+		},
+		{
+			name: "the first model declined after some output, which is billed whatever the category",
+			body: fallback("claude-sonnet-5-5", []string{fmt.Sprintf(toSonnet, `"cyber"`), answer},
+				`{"type":"message","model":"claude-opus-5-5","input_tokens":535,"output_tokens":148,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`,
+				sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 535, OutputTokens: 148}},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 683 + 803,
+		},
+		{
+			name: "a declined model that ran a tool loop first produced output, so all of it is billed",
+			body: fallback("claude-sonnet-5-5", []string{fmt.Sprintf(toSonnet, `"cyber"`), answer},
+				`{"type":"message","model":"claude-opus-5-5","input_tokens":300,"output_tokens":40,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`,
+				`{"type":"message","model":"claude-opus-5-5","input_tokens":380,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`,
+				sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 300, OutputTokens: 40}},
+				{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 380}},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 340 + 380 + 803,
+		},
+		{
+			name: "two models declined, each judged by its own category",
+			body: fallback("claude-haiku-4-5-20251001",
+				[]string{fmt.Sprintf(toSonnet, `"cyber"`), fmt.Sprintf(toHaiku, `"frontier_llm"`), answer},
+				opusDeclined, sonnetDeclined, haikuServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5"},
+				{Model: "claude-sonnet-5-5", Usage: llm.Usage{InputTokens: 500}},
+				{Model: "claude-haiku-4-5-20251001", Usage: served},
+			},
+			wantBilled: 500 + 803,
+		},
+		{
+			// The refusals guide prints its fallback block with no trigger.
+			// With nothing to say which category it was, the attempt is
+			// taken as billed: a cost that may be too high, never too low.
+			name: "a fallback block that does not say why is taken as billed",
+			body: fallback("claude-sonnet-5-5",
+				[]string{`{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-sonnet-5-5"}}`, answer},
+				opusDeclined, sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 535}},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 535 + 803,
+		},
+		{
+			name: "a fallback block whose trigger is null does not say why either",
+			body: fallback("claude-sonnet-5-5",
+				[]string{`{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-sonnet-5-5"},"trigger":null}`, answer},
+				opusDeclined, sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 535}},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 535 + 803,
+		},
+		{
+			// The model that answered sampled twice, in a server-side tool
+			// loop. Its entries are one attempt, and the model before it is
+			// still the one the fallback block speaks of.
+			name: "the answering model's own tool loop is one attempt",
+			body: fallback("claude-sonnet-5-5", []string{fmt.Sprintf(toSonnet, `"cyber"`), answer},
+				opusDeclined,
+				`{"type":"message","model":"claude-sonnet-5-5","input_tokens":200,"output_tokens":30,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`,
+				sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5"},
+				{Model: "claude-sonnet-5-5", Usage: llm.Usage{InputTokens: 200, OutputTokens: 30}},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 230 + 803,
+		},
+		{
+			// A compaction between the two is nobody's turn at the reply: it
+			// neither joins the declined attempt nor makes a third.
+			name: "a compaction entry beside a fallback is billed and is not an attempt at the reply",
+			body: fallback("claude-sonnet-5-5", []string{fmt.Sprintf(toSonnet, `"cyber"`), answer},
+				opusDeclined, `{"type":"compaction","input_tokens":40,"output_tokens":9}`, sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5"},
+				{Model: "claude-sonnet-5-5", Usage: llm.Usage{InputTokens: 40, OutputTokens: 9}},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 49 + 803,
+		},
+		{
+			name: "a compaction entry ahead of the declined attempt changes nothing either",
+			body: fallback("claude-sonnet-5-5", []string{fmt.Sprintf(toSonnet, `"cyber"`), answer},
+				`{"type":"compaction","input_tokens":40,"output_tokens":9}`, opusDeclined, sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-sonnet-5-5", Usage: llm.Usage{InputTokens: 40, OutputTokens: 9}},
+				{Model: "claude-opus-5-5"},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 49 + 803,
+		},
+		{
+			// The reference types a message entry's model "Model or null".
+			// One with none is read as work of the model that answered, and
+			// never as a model that declined for free.
+			name: "an entry that names no model is not taken for a model that declined",
+			body: fallback("claude-sonnet-5-5", []string{fmt.Sprintf(toSonnet, `"cyber"`), answer},
+				`{"type":"message","model":null,"input_tokens":535,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`,
+				sonnetServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-sonnet-5-5", Usage: llm.Usage{InputTokens: 535}},
+				{Model: "claude-sonnet-5-5", Usage: served},
+			},
+			wantBilled: 535 + 803,
+		},
+		{
+			// Sticky routing: a later turn goes straight to the fallback
+			// model, with no fallback block and nothing declined.
+			name:         "a turn routed straight to the fallback model",
+			body:         fallback("claude-sonnet-5-5", []string{answer}, sonnetServed),
+			wantUsage:    served,
+			wantAttempts: []llm.Attempt{{Model: "claude-sonnet-5-5", Usage: served}},
+			wantBilled:   803,
+		},
+		{
+			name: "models and fallback blocks that do not line up: nothing is taken as free",
+			body: fallback("claude-haiku-4-5-20251001", []string{fmt.Sprintf(toHaiku, `"cyber"`), answer},
+				opusDeclined, sonnetDeclined, haikuServed),
+			wantUsage: served,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 535}},
+				{Model: "claude-sonnet-5-5", Usage: llm.Usage{InputTokens: 500}},
+				{Model: "claude-haiku-4-5-20251001", Usage: served},
+			},
+			wantBilled: 535 + 500 + 803,
+		},
+		{
+			name: "every model declined: the last refusal is the reply, each attempt judged by its own category",
+			body: `{"id":"msg_01","type":"message","role":"assistant","model":"claude-sonnet-5-5","content":[` + fmt.Sprintf(toSonnet, `"bio"`) + `],` +
+				`"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":"x"},` +
+				`"usage":{"input_tokens":412,"output_tokens":0,"iterations":[` + opusDeclined + `,` +
+				`{"type":"fallback_message","model":"claude-sonnet-5-5","input_tokens":412,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}]}}`,
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 535}},
+				{Model: "claude-sonnet-5-5"},
+			},
+			wantBilled: 535,
+		},
+		{
+			// A compaction entry names no model and is billed besides the
+			// counts at the top level, which the beta reference says do not
+			// include it.
+			name: "a compaction entry is billed to the model that answered",
+			body: `{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],` +
+				`"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":3,"iterations":[` +
+				`{"type":"compaction","input_tokens":40,"output_tokens":9},` +
+				`{"type":"message","model":"claude-opus-5-5","input_tokens":7,"output_tokens":3}]}}`,
+			wantUsage: llm.Usage{InputTokens: 7, OutputTokens: 3},
+			wantAttempts: []llm.Attempt{
+				{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 40, OutputTokens: 9}},
+				{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 7, OutputTokens: 3}},
+			},
+			wantBilled: 59,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := generate(t, tt.body)
+
+			assert.Equal(t, tt.wantUsage, resp.Usage)
+			assert.Equal(t, tt.wantAttempts, resp.Attempts)
+			cost, err := billedPrices().CostOf(resp)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantBilled, cost, "the cost of the reply is what the reference says is billed")
+		})
+	}
 }
 
 func TestClient_Generate_Usage(t *testing.T) {
@@ -208,31 +537,19 @@ func TestClient_Generate_Fallback(t *testing.T) {
 	assert.Nil(t, resp.Refusal)
 	assert.Equal(t, llm.Usage{InputTokens: 412, OutputTokens: 264, CacheReadTokens: 96, CacheWriteTokens: 31}, resp.Usage,
 		"Usage is what the answering model was billed")
+	// The first model declined before any output, in a category the
+	// reference does not bill. It is listed, with nothing against it.
 	assert.Equal(t, []llm.Attempt{
-		{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 535}},
+		{Model: "claude-opus-5-5"},
 		{Model: "claude-sonnet-5-5", Usage: llm.Usage{InputTokens: 412, OutputTokens: 264, CacheReadTokens: 96, CacheWriteTokens: 31}},
 	}, resp.Attempts)
+	cost, err := billedPrices().CostOf(resp)
+	require.NoError(t, err)
+	assert.Equal(t, int64(412+264+96+31), cost)
 
 	// Nothing comes before the fallback block here, so the echo rule keeps
 	// every block.
 	assert.JSONEq(t, string(contentOf(t, body)), string(resp.Message.Opaque.Data))
-}
-
-func TestClient_Generate_AttemptWithNoModel(t *testing.T) {
-	// Every usage.iterations entry the reference shows names its model. An
-	// entry that did not is priced as the model that answered, since an
-	// attempt with no model cannot be priced at all.
-	resp := generate(t, `{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5",`+
-		`"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":3,`+
-		`"iterations":[{"type":"other","input_tokens":40,"output_tokens":9},{"type":"message","model":"claude-opus-5-5","input_tokens":7,"output_tokens":3}]}}`)
-
-	assert.Equal(t, []llm.Attempt{
-		{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 40, OutputTokens: 9}},
-		{Model: "claude-opus-5-5", Usage: llm.Usage{InputTokens: 7, OutputTokens: 3}},
-	}, resp.Attempts)
-	cost, err := llm.Prices{"claude-opus-5-5": {Input: 4_000_000, Output: 20_000_000}}.CostOf(resp)
-	require.NoError(t, err)
-	assert.Equal(t, int64(40*4+9*20+7*4+3*20), cost)
 }
 
 func TestClient_Generate_FallbackEchoRule(t *testing.T) {
@@ -349,7 +666,6 @@ func TestClient_Generate_ReplyThatIsNotAMessage(t *testing.T) {
 		{name: "content that is null", body: `{"id":"msg_01","content":null,"stop_reason":"end_turn"}`},
 		{name: "no content", body: `{"id":"msg_01","stop_reason":"end_turn"}`},
 		{name: "a block that is not an object", body: `{"id":"msg_01","content":["text"],"stop_reason":"end_turn"}`},
-		{name: "an error body under a 200", body: `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -366,6 +682,89 @@ func TestClient_Generate_ReplyThatIsNotAMessage(t *testing.T) {
 			assert.False(t, e.Retryable)
 		})
 	}
+}
+
+// An error object in a body that came with a 200 is still the API's error.
+func TestClient_Generate_ErrorObjectUnderA200(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		wantType  string
+		wantMsg   string
+		retryable bool
+	}{
+		{
+			name:     "overloaded_error is retryable",
+			body:     `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}`,
+			wantType: "overloaded_error", wantMsg: "Overloaded", retryable: true,
+		},
+		{
+			name:     "api_error is retryable",
+			body:     `{"type":"error","error":{"type":"api_error","message":"Internal server error"}}`,
+			wantType: "api_error", wantMsg: "Internal server error", retryable: true,
+		},
+		{
+			name:     "invalid_request_error is not",
+			body:     `{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`,
+			wantType: "invalid_request_error", wantMsg: "bad",
+		},
+		{
+			name:    "an error that names no type is still an error",
+			body:    `{"type":"error","error":{"message":"something went wrong"}}`,
+			wantMsg: "something went wrong",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			check := func(t *testing.T, resp *llm.Response, err error) {
+				t.Helper()
+				require.Error(t, err)
+				assert.Nil(t, resp)
+				var e *llm.Error
+				require.ErrorAs(t, err, &e)
+				assert.Equal(t, &llm.Error{
+					Provider:  anthropic.Name,
+					Status:    http.StatusOK,
+					Type:      tt.wantType,
+					Message:   tt.wantMsg,
+					RequestID: requestID,
+					Retryable: tt.retryable,
+				}, e)
+			}
+			api := newFakeAPI(t, replyJSON(tt.body))
+			c := api.client(t, anthropic.Options{})
+
+			resp, err := c.Generate(context.Background(), llm.Request{Messages: hello()})
+			check(t, resp, err)
+			// The same body in answer to a request for a stream.
+			resp, err = c.Stream(context.Background(), llm.Request{Messages: hello()}, func(llm.Delta) error { return nil })
+			check(t, resp, err)
+		})
+	}
+
+	t.Run("the request id is the body's when no header carries one", func(t *testing.T) {
+		api := newFakeAPI(t, func(w http.ResponseWriter, _ received) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}`)
+		})
+		_, err := api.client(t, anthropic.Options{}).Generate(context.Background(), llm.Request{Messages: hello()})
+		var e *llm.Error
+		require.ErrorAs(t, err, &e)
+		assert.Equal(t, "req_011CSHoEeqs5C35K2UUqR7Fy", e.RequestID)
+	})
+}
+
+func TestClient_Generate_EmptyReply(t *testing.T) {
+	// A reply the server ended properly with nothing in it is a reply.
+	resp := generate(t, `{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],`+
+		`"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":9,"output_tokens":1}}`)
+
+	assert.Equal(t, llm.StopEnd, resp.Stop)
+	assert.Empty(t, resp.Message.Text)
+	assert.Empty(t, resp.Message.ToolCalls)
+	assert.Equal(t, `[]`, string(resp.Message.Opaque.Data))
+	assert.Equal(t, llm.Usage{InputTokens: 9, OutputTokens: 1}, resp.Usage)
 }
 
 // The case that must fail when the mapping is wrong. A reply holding a
