@@ -332,6 +332,7 @@ func TestConstants_WireValues(t *testing.T) {
 		{name: "EventRunCompleted", got: agent.EventRunCompleted, want: "run.completed"},
 		{name: "EventRunFailed", got: agent.EventRunFailed, want: "run.failed"},
 		{name: "EventRunCancelled", got: agent.EventRunCancelled, want: "run.cancelled"},
+		{name: "EventRunCancelRequested", got: agent.EventRunCancelRequested, want: "run.cancel_requested"},
 		{name: "EventStepStarted", got: agent.EventStepStarted, want: "step.started"},
 		{name: "EventStepCompleted", got: agent.EventStepCompleted, want: "step.completed"},
 		{name: "EventStepBlocked", got: agent.EventStepBlocked, want: "step.blocked"},

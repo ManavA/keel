@@ -33,10 +33,11 @@ type Event struct {
 	ID   string
 }
 
-var (
-	errTooLarge = fmt.Errorf("sse: event is larger than %d bytes", MaxEventBytes)
-	errCutShort = fmt.Errorf("sse: stream ended in the middle of an event: %w", io.ErrUnexpectedEOF)
-)
+// ErrEventTooLarge is returned for an event over MaxEventBytes. Asking again
+// meets the same event, so a provider does not treat it as a transport failure.
+var ErrEventTooLarge = fmt.Errorf("sse: event is larger than %d bytes", MaxEventBytes)
+
+var errCutShort = fmt.Errorf("sse: stream ended in the middle of an event: %w", io.ErrUnexpectedEOF)
 
 // Reader reads events from a stream.
 type Reader struct {
@@ -135,7 +136,7 @@ func (r *Reader) readLine(room int) (line []byte, comment bool, err error) {
 		if !comment {
 			// Two bytes of grace for a line ending not yet trimmed.
 			if len(r.line)+len(chunk) > room+2 {
-				return nil, false, errTooLarge
+				return nil, false, ErrEventTooLarge
 			}
 			r.line = append(r.line, chunk...)
 		}
@@ -145,7 +146,7 @@ func (r *Reader) readLine(room int) (line []byte, comment bool, err error) {
 			line = bytes.TrimSuffix(r.line, []byte("\n"))
 			line = bytes.TrimSuffix(line, []byte("\r"))
 			if len(line) > room {
-				return nil, false, errTooLarge
+				return nil, false, ErrEventTooLarge
 			}
 			return line, comment, readErr
 		case errors.Is(readErr, bufio.ErrBufferFull):

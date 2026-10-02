@@ -469,6 +469,14 @@ func (p Prices) CostOf(resp *Response) (int64, error) {
 	}
 	return total, nil
 }
+
+// CostFor is the cost of a whole Response as Budgeted and Metered price it:
+// each attempt at the model it names or, when the table does not list that
+// one, at asked, the model the request asked for. A provider commonly answers
+// an alias with a dated id the table does not carry, which CostOf would
+// refuse. It returns an error wrapping ErrNoPrice when some attempt can be
+// priced at neither name, and never the sum of the attempts that could be.
+func (p Prices) CostFor(resp *Response, asked string) (int64, error)
 ```
 
 The rest of the package, as signatures:
@@ -1062,10 +1070,26 @@ type Options struct {
 	// SystemRole is the role the system prompt is sent under. Default
 	// "system"; OpenAI's newer models also accept "developer".
 	SystemRole string
-	// Header is added to every request, for a gateway that needs one.
+	// Header is added to every request, for a gateway that needs one. It
+	// cannot replace Content-Type, nor the Authorization header an APIKey
+	// sets.
 	Header http.Header
-	// HTTPClient defaults to a client with a 10 minute timeout.
+	// HTTPClient defaults to a client that follows no redirects and has no
+	// timeout of its own: a call that is not a stream is bounded by 10
+	// minutes, and a stream by IdleTimeout. A client given here keeps its own
+	// timeout, which then bounds a stream too, and its own policy on
+	// redirects. The key and Header are withheld from a redirect to another
+	// origin than BaseURL's, another scheme, host or port. The request is not:
+	// a client that follows a 307 or 308 re-sends its body, which holds the
+	// prompt, to wherever the redirect points, and that is for the client given
+	// here to decide.
 	HTTPClient *http.Client
+	// IdleTimeout is how long a stream may go without receiving a byte from
+	// the server, from the request being sent to the end of the stream. A
+	// keep-alive comment is bytes and counts, so a server that sends nothing
+	// else is bounded by the context and not by this, and the time a callback
+	// takes is not counted. Zero is two minutes; negative is no limit.
+	IdleTimeout time.Duration
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
 }
@@ -1135,16 +1159,77 @@ with `id` and `function.name` arriving on its first chunk and
 with choices, and `usage` on a final chunk whose `choices` is empty. A
 server that sends no usage chunk leaves `Usage` zero.
 
+A stream ends in one of three ways. A chunk carried a `finish_reason`: the
+reply is complete, whatever follows, and a connection cut after it, with or
+without `data: [DONE]`, costs at most a usage chunk. No chunk did, but the
+stream ended cleanly with `data: [DONE]`: some servers never send a finish
+reason, so the reply is complete and its stop reason is read from what was
+assembled (`StopToolUse` for tool calls, `StopRefusal` for a refusal,
+`StopEnd` otherwise), and the missing reason is logged at debug level, since
+`Response` has no field for it. Neither, which includes a `[DONE]` that
+follows no chunk with an id or a choice, a stream that ends between events and
+one cut in the middle of an event: a failure of the connection, an `*llm.Error`
+with `Err` set and `Retryable` true. A server that said it finished, with a
+finish reason, and said no more, has given an empty reply, which is legitimate.
+
+A response to a streaming request whose content type is not
+`text/event-stream` is an `*llm.Error` that names the content type and is not
+retryable: it is a page from a proxy, or a server that ignored `stream`, and
+asking again gets the same. An `{"error": …}` chunk in a stream, which the
+reference does not document and servers send, is an `*llm.Error` too. A piece
+of a tool call belongs to the most recent call opened for its `index`, or from
+a server that sends none, for the index of the last piece, and an id that is
+not the one that call already has opens a new one.
+
+A stream is bounded by the caller's context; by `IdleTimeout` without a byte
+from the server, where a keep-alive comment is a byte and the time a callback
+takes is not counted; by 16 MiB in one event; and by 32 MiB in all that the
+reply keeps: its text, its refusal and the id, name and arguments of each tool
+call, with a fixed 256 bytes counted for each call besides, so that a server
+that opens calls without end meets the bound. It is not bounded by a timeout on
+the whole request, which would cut a long reply that is going well. A reply that
+outgrows a size bound is a plain error, not retryable, since a retry meets the
+same size. After a stream ends cleanly the body is read on, for at most 64 KiB
+and 100 milliseconds, so that the connection is used again; after a failure or
+an error from `fn` it is not, and the connection is closed.
+
 Embeddings. `POST {BaseURL}/embeddings` with `model`, `input` as an array,
 `encoding_format: "float"`, and `dimensions` when set. `data[]` is ordered
 by its `index` into `Vectors`; `usage.prompt_tokens` is `InputTokens`.
 
-Errors. The body is `{"error":{"message","type","param","code"}}`.
-`Retryable` is true for 408 and every 5xx, and for 429 unless `code` is
-one of `insufficient_quota`, `credit_balance_exhausted`,
-`organization_spend_limit_exceeded`, `project_spend_limit_exceeded` or
-`organization_usage_limit_exceeded`, which no wait fixes. `RetryAfter` is
-read from `Retry-After`; `RequestID` from `x-request-id`.
+Errors. The body is `{"error":{"message","type","param","code"}}`; a server
+may send the message, type and code at the top level, or `error` as a string,
+or a `code` that is a number. `Retryable` is true for 408 and every 5xx, and
+for 429 unless `code` or `type` is one of `insufficient_quota`,
+`credit_balance_exhausted`, `organization_spend_limit_exceeded`,
+`project_spend_limit_exceeded` or `organization_usage_limit_exceeded`, which no
+wait fixes. The reference's error guide gives `insufficient_quota` as the
+`type` that can accompany those codes, so both fields are read. `RetryAfter` is
+read from `Retry-After`, as seconds or as an HTTP date; `RequestID` from
+`x-request-id`.
+
+An error object inside a 200 response, in a completion, an embeddings reply
+or a stream, is an `*llm.Error` with `Status` 200. It counts as an error only
+when it carries a message or a type: an empty string or an empty object, which
+some servers send beside a good reply, is not one. It is retryable when its
+`type` or `code` is one the reference gives as passing (`rate_limit_error`,
+`rate_limit_exceeded`, `service_unavailable_error`, `server_is_overloaded`,
+`slow_down`, `server_error`) and not one of the final codes above.
+
+A 3xx is an `*llm.Error`, not retryable, because the default client does not
+follow redirects: one would send the caller's headers, and for a 307 or 308
+the whole prompt, to whatever host the answer named. A client supplied in the
+options keeps its own redirect policy, and the package withholds the key and
+`Header` from any origin other than the configured one's (another scheme, host
+or port, with a default port the same as none). The request is not withheld: a
+client that follows a 307 or 308 re-sends its body, which holds the prompt, to
+wherever the redirect points, and that is for the supplied client's policy to
+set. A redirect that a supplied client refuses, by its own check or by the
+ten hops `net/http` allows, is an `*llm.Error` that is not retryable.
+
+When a call fails and the caller's context is done, the error is the context's
+and is not retryable. When the context is live, a transport failure or the
+client's own timeout is an `*llm.Error` with `Err` set and `Retryable` true.
 
 ### 4.6 Interfaces consumed
 
@@ -1164,11 +1249,21 @@ from the context, not from an error that merely wraps a deadline. An HTTP
 client's own timeout wraps `context.DeadlineExceeded` while the caller's
 context is live; it is a failure of the provider, which marks it retryable,
 and both `Retryable` and `Fallback` treat it as one. A provider whose caller's
-context is done returns the context's error and no `*Error`.
+context is done returns the context's error and no `*Error`. If the server had
+already answered with an error status, that status is what is returned, even
+when the cancellation cut its body short.
 
 A provider reads at most 32 MiB of response body, and the event reader at
 most 16 MiB per event; past either it returns an error instead of
-allocating without limit.
+allocating without limit, and a plain one that is not retryable, since a
+retry meets the same size. A stream is not a body in this sense: it is bounded
+by its context, by an idle limit on the bytes received from the server
+(default two minutes, from the options; negative means none; comments count and
+the time a callback takes does not), by the event bound, and by the same 32 MiB
+applied to what the reply keeps. No timeout on the whole request applies
+to a stream. After a stream ends cleanly a provider reads the rest of the body,
+a little and for a moment, so that the connection is reused. The default
+`http.Client` a provider builds follows no redirects.
 
 The order to compose the wrappers, outermost first, is `Budgeted`, `Metered`,
 `Fallback`, then one `Retrying` per provider: each provider retries its own
@@ -1267,7 +1362,9 @@ this.
 The reference is `web/src/demos/permissions/logic.ts` in the hanaML
 repository, with its tests in `web/test/demos/permissions.test.ts`.
 
-1. Every rule whose `When` matches the action is a match.
+1. A rule whose `When` holds for the action is a match, and one whose
+   `When` cannot be told is a match unless its effect is allow (the three
+   values are set out below).
 2. The effects are ordered allow, ask, block.
 3. The decision is the first match of the greatest strictness: walking the
    rules in order, a match replaces the best so far only when it is strictly
@@ -1278,16 +1375,85 @@ repository, with its tests in `web/test/demos/permissions.test.ts`.
 
 A `Match` holds when every part that is set holds:
 
-- `Kinds`: the action's kind is one of them.
-- `Target`: `path.Match(pattern, action.Target)` is true. A pattern that
-  does not compile is a validation error.
+- `Kinds`: the action's kind is one of them. Empty is every kind.
+- `Target`: `path.Match(pattern, action.Target)` is true. Empty is every
+  target. The target is matched as written, with no normalisation: no case
+  folding, no trimming, no cleaning of dots or slashes. A block rule by
+  target is therefore passed by any other spelling of the same thing, and
+  whatever builds an `Action` (the `app` adapter, the example's tools) puts
+  targets in one canonical spelling before asking for a decision. `*` matches
+  any run of characters but a slash, `?` one character but a slash,
+  `[a-z]` and `[^a-z]` a class, and `\` makes the next character literal.
+  A pattern that does not compile is a validation error, and so is a bare
+  `*`, which matches no target that holds a slash: an empty target is every
+  target.
 - `Attrs`: every `Cond` holds. A condition on an attribute the action does
-  not carry never holds, except `OpExists` with value `false`. Numbers
-  compare as numbers whatever their Go type (`int`, `int64`, `float64`,
-  `json.Number`); `OpEq` and `OpNe` also compare strings and booleans;
-  `OpGt`, `OpGte`, `OpLt`, `OpLte` hold only between numbers; `OpIn` holds
-  when the attribute equals any element of the list in `Value`; `OpExists`
-  compares presence with the boolean in `Value`.
+  not carry does not hold, for every operator, `OpNe` included, except
+  `OpExists` with value `false`; an author who means "block unless the
+  attribute is present and equal" adds an `OpExists` condition, as the
+  package comment shows. Numbers compare as numbers, exactly, whatever
+  holds them (an integer type, a float type, `json.Number`); `OpEq` and
+  `OpNe` also compare strings and booleans; `OpGt`, `OpGte`, `OpLt`, `OpLte`
+  hold only between numbers; `OpIn` holds when the attribute equals any
+  element of the list in `Value`; `OpExists` compares presence with the
+  boolean in `Value`, and an attribute that is present and `null` is
+  present. Attribute names and string values are matched exactly as written,
+  as targets and kinds are: `Amount` is not `amount`, and `"prod "` is not
+  `"prod"`.
+
+**Three values.** A condition holds, does not hold, or cannot be told. It
+cannot be told when the attribute is present but its type is one the
+operator cannot compare: a string where a number is wanted, a boolean, a
+list, a pointer, `null`, NaN, a number written too long to compare, a float
+whose two readings disagree about the condition (below), or a
+type different from the one the value is (`OpEq` of the number 5 against the
+string `"5"`). `OpIn` is `OpEq` on each element joined by "or", and in three
+values: it holds if any element equals the attribute; it does not hold only
+if every element could be compared with the attribute and none equalled it;
+otherwise it cannot be told. A block rule on `in [22, "ssh"]` therefore
+blocks the attribute `"22"`, as `in [22]` and `eq 22` do. It also cannot be told when the condition itself is
+malformed, which only a `Policy` that skipped `Validate` can have: an
+operator that is not listed, or a value its operator cannot use. A target
+pattern that does not compile, on such a `Policy`, cannot be told either. A
+rule matches for certain when every condition holds, and does not match when
+any condition does not hold, whatever else cannot be told. When no condition
+fails but at least one cannot be told, a rule whose effect is ask or block
+matches and a rule whose effect is allow does not. What cannot be evaluated
+therefore counts toward the stricter outcome, and a model that writes an
+amount as the string `"1250"` cannot walk round a limit by it. Strings are
+never read as numbers.
+
+A decision reached that way says so. `Decision.Uncertain` names each
+attribute whose condition could not be told, in the order of the conditions
+(`"target pattern"` and `"kinds list"` for those parts of a malformed rule),
+so the record explains why a rule whose condition looks unmet decided. It is
+empty when the deciding rule matched for certain, and it belongs to the rule
+that decided, not to others that also matched.
+
+**Numbers.** A number is compared exactly. An integer is itself. A float
+without an integer value is the shortest decimal that gives it back, so a
+`float64` 0.1 is the number 0.1 and meets a threshold written 0.1; comparing
+the binary value instead would leave 0.3 below a threshold of 0.3. A float
+with an integer value has two readings, that integer and its shortest
+decimal. Below 2^53 (below 2^24 for a `float32`) they are one number. Above
+they are two: a `float64` 2^70 is 1180591620717411303424 and also
+1180591620717411300000, and a `float64` 1e23 is 99999999999999991611392 and
+also 1e23. A condition is told under both readings. Where they give the same
+outcome that is the outcome: a `float64` 1e23 is above 1e22 and is not above
+1e24 or 1e23 whichever it is. Where they differ the condition cannot be told,
+and the attribute is named in `Uncertain` like any other: a `float64` 1e23
+against `gte 1e23`, or 2^70 against `gt 1180591620717411303000`. When both
+sides are such floats their readings are paired, exact with exact and
+shortest with shortest, so a float equals itself. So a float cannot be told
+against a threshold that lies within its rounding, and a number that is
+meant to be exact should reach the package as a `json.Number`, not as a
+`float64` that has already rounded it: tool input is decoded with
+`json.Decoder.UseNumber`, and the `json.Number` passed on. A `json.Number` is the decimal it
+spells, of any size or precision up to 4096 bytes of text and an exponent of
+4096, which bounds what a hostile value can cost; text past either bound, or
+that is not a JSON number (no plus sign, no leading zero, no `Infinity`), is
+not a number, so cannot be told. `Parse` keeps every number in a policy as a
+`json.Number`, so a threshold is never passed through a `float64`.
 
 The reference's policy is a fixed shape; in Go it is this rule list, in this
 order, and the port of the reference's tests builds it with a test helper:
@@ -1302,8 +1468,17 @@ order, and the port of the reference's tests builds it with a test helper:
 Under that list every case in the reference's tests gives the same decision
 and the same rule name, including a payment with no amount (the condition
 does not hold, as `undefined ?? 0` is not above the limit) and
-`external: false` (not a match). This was checked against a prototype of
-the algorithm while writing this document.
+`external: false` (not a match). A grid of 21,870 policies and actions, with
+the reference's answer to each stored in `policy/testdata`, holds the Go
+code to it as a standing test.
+
+Go differs from the reference in two places, on purpose. The reference
+reads a missing amount as 0, where Go reads the attribute as absent; the two
+agree for every limit from 0 up, which is the demonstration's range, and
+differ below it. And the reference compares an amount that is not a number
+as JavaScript does, where Go cannot tell: `"1250"` asks in both, but `"50"`,
+`"abc"`, `null` and NaN are allowed by the reference's coercion and asked
+about by Go.
 
 Two names differ, and one function is not carried over:
 
@@ -1312,7 +1487,7 @@ Two names differ, and one function is not carried over:
   person said yes, and a timeline reading "decision: approve" for a call
   still waiting would mislead. `Effect.UnmarshalText` reads `"approve"` as
   `Ask`, so a reference fixture decodes unchanged. A `Decision` marshals as
-  `{"decision": …, "rule": …}`, the reference's `Verdict`.
+  `{"decision": …, "rule": …, …}`, the reference's `Verdict` and more.
 - `sortActions` is `Policy.Group`.
 - `clampLimit` clamps a number typed into the demonstration's form. It is
   not policy and is not ported.
@@ -1419,13 +1594,21 @@ type Decision struct {
 	Index int `json:"index"`
 	// Matched names every rule that matched, in order.
 	Matched []string `json:"matched,omitempty"`
+	// Uncertain is set when Rule decided without every one of its conditions
+	// holding: a condition could not be told, and an ask or block rule counts
+	// that against the action. It names each attribute whose value a condition
+	// could not compare, and "target pattern" or "kinds list" for a part of
+	// the rule that could not be evaluated. It is empty when Rule matched for
+	// certain.
+	Uncertain []string `json:"uncertain,omitempty"`
 }
 
 // Validate reports the first thing wrong with p.
 func (p Policy) Validate() error
 
 // Decide gives the decision for a. It is pure: it reads nothing but p and a,
-// and records nothing.
+// and records nothing. A condition that cannot be told counts toward the
+// stricter outcome: see 5.2.
 func (p Policy) Decide(a Action) Decision
 
 // Judged is an action with its decision.
@@ -1444,12 +1627,29 @@ type Grouped struct {
 // Group decides every action and sorts them by effect.
 func (p Policy) Group(actions []Action) Grouped
 
-// Parse reads a policy from its JSON form and validates it. An unknown field
-// is an error.
+// Parse reads a policy from its JSON form and validates it. The document must
+// be a JSON object. An unknown field is an error, and so is a key repeated in
+// any object, compared without regard to case. Numbers are kept as written,
+// as json.Number.
 func Parse(data []byte) (Policy, error)
+
+// ErrUnrecordable is what a Recorder wraps in the error it returns for a record
+// it can never store, however often it is tried again: a value its storage
+// cannot represent, or more of them than it will take. A Recorder that cannot
+// write because of how things are at the moment (a database that is down, a
+// context that is done) does not wrap it. Whoever retries a decision that failed
+// to record retries on the second kind and stops at the first, since a retry of
+// a record that can never be stored never ends. The error that wraps it is still
+// the Recorder's own, which errors.Is and errors.As can find.
+var ErrUnrecordable = errors.New("policy: the record cannot be stored")
 
 // Record is one decision as it is logged.
 type Record struct {
+	// ID is the store's own number for a record it lists, which with At is the
+	// record's place in the log: a Recorder that keeps an ID sets it on the
+	// records it returns and ignores it on the ones it is handed. It is zero for
+	// a record that no store has numbered, and the in-memory recorder has none.
+	ID       int64     `json:"id,omitempty"`
 	At       time.Time `json:"at"`
 	Action   Action    `json:"action"`
 	Decision Decision  `json:"decision"`
@@ -1457,18 +1657,24 @@ type Record struct {
 	Version string `json:"version,omitempty"`
 }
 
-// Recorder keeps the decision log.
+// Recorder keeps the decision log. Record returns nil only when the record is
+// kept; a Decider returns no decision for one that is not. An error for a record
+// that can never be stored, whatever is retried, wraps ErrUnrecordable. Any
+// other error is one a later call may not meet.
 type Recorder interface {
 	Record(ctx context.Context, rec Record) error
 }
 
-// MemoryRecorder is the in-process Recorder.
+// MemoryRecorder is the in-process Recorder. It keeps the most recent 1000
+// decisions, and what it keeps and returns are deep copies. Its zero value is
+// ready to use.
 type MemoryRecorder struct{ /* unexported fields */ }
 
 // NewMemoryRecorder builds an empty MemoryRecorder.
 func NewMemoryRecorder() *MemoryRecorder
 
-// Record implements Recorder.
+// Record implements Recorder. It fails only when rec holds more than 10000
+// values to copy, and the error wraps ErrUnrecordable.
 func (m *MemoryRecorder) Record(ctx context.Context, rec Record) error
 
 // Records returns a copy of the log, oldest first.
@@ -1482,20 +1688,28 @@ type Options struct {
 	Now func() time.Time
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
+	// MemoryRecords is how many of the most recent decisions the default
+	// in-memory recorder keeps. Zero or less keeps 1000. It has no effect when
+	// Recorder is set.
+	MemoryRecords int
 }
 
 // Decider decides actions under one Policy and records every decision.
 type Decider struct{ /* unexported fields */ }
 
 // NewDecider builds a Decider. It returns an error when p does not validate.
+// The Decider takes a deep copy of the rules, every list and every value in
+// them; a policy whose conditions hold more than 10000 values is refused.
 func NewDecider(p Policy, opts Options) (*Decider, error)
 
 // Decide decides a and records the decision. When the record cannot be
 // written it returns the error and a zero Decision, whose empty Effect no
-// caller may read as Allow.
+// caller may read as Allow. An action whose attributes hold more than 10000
+// values cannot be copied for the record, and the error wraps ErrUnrecordable,
+// as does any a Recorder returns for a record it can never store.
 func (d *Decider) Decide(ctx context.Context, a Action) (Decision, error)
 
-// Policy returns the rules this Decider decides under.
+// Policy returns the rules this Decider decides under, as a deep copy.
 func (d *Decider) Policy() Policy
 
 var _ Recorder = (*MemoryRecorder)(nil)
@@ -1522,8 +1736,48 @@ is the record, so it must identify one rule), an effect that is not one of
 the three, a `Default` that is neither empty nor one of the three, a target
 pattern that does not compile, an operator that is not listed, an `OpIn`
 whose value is not a list, an `OpExists` whose value is not a boolean, and a
-numeric operator whose value is not a number. `Parse` decodes with unknown
-fields disallowed and then validates.
+numeric operator whose value is not a number.
+
+It also refuses each form that can never hold, or holds for every action by
+accident, because on a block rule either one fails open without a word, and
+it names the rule and the condition as it does the other faults: a `Cond`
+with an empty `Attr`; an `OpEq` or `OpNe` whose value is not a number, a
+string or a boolean, so no value at all, and no list or object either, since
+such a value is equal to nothing and would leave `OpEq` never holding and
+`OpNe` always holding; a number that is not finite (NaN, or an infinity,
+which nothing is above and every number is below) as the value of any
+operator or as an element of an `OpIn` list; an `OpIn` whose list is empty or
+has an element that is not a number, a string or a boolean; and a kind in
+`Match.Kinds` that is the empty string, which names no action. The empty
+`Kinds`, `Target` and `Attrs` are not refused: the field comments above say
+each means every kind, every target and no condition. Two conditions that
+contradict one another are not detected, with one exception: `OpExists` with
+value `false`, which says the attribute is absent, is refused together with
+any other condition on the same attribute, since an absent attribute meets
+none, and written twice it is refused as a repeat. A bare `*` target is refused, with a message that says to leave the
+target empty for every target. A rule named `RuleDefault` is refused, since
+the record would then not say whether a rule matched. A decision record
+holds the name of the rule that decided and of each that matched, the
+policy's version, and the names of the attributes a condition could not tell;
+a name and the version go to text columns, and a name is indexed. So a rule's
+name, an attribute name and the version are refused when they hold a NUL
+character or are not valid UTF-8, and a rule's name and the version when they
+are longer than 256 bytes, each with a message that names the rule: a policy
+with one would load and then fail to record every decision made under it, or
+record something other than what decided. A kind and a target pattern are
+never in a record, and are refused for a NUL because one that holds it can
+only match an action that could never be recorded.
+
+`Parse` first reads the document once to refuse what the decoder would take
+without a word: a document that is not an object (`null` is not an empty
+policy), a key repeated in any object at any depth (compared without regard
+to case, since the decoder matches keys that way, and the later of
+`"effect":"block","effect":"allow"` would otherwise win), and anything after
+the document. The error names the key and where it is. It then decodes with
+unknown fields disallowed, keeping every number as a `json.Number`, and
+validates, so a serialised policy with any of these cannot be loaded, and a
+`Parse(Marshal(p))` is `p` when `p`'s numbers are `json.Number` values, as
+`Parse` returns them.
 
 *package pg: policy/pg/store.go, migrations.go*
 
@@ -1550,20 +1804,36 @@ type Store struct{ /* unexported fields */ }
 // New builds a Store over db.
 func New(db conn) *Store
 
-// Record implements policy.Recorder.
+// Record implements policy.Recorder. An error for a record that can never be
+// stored wraps policy.ErrUnrecordable; one that is the database's does not.
+// Over a pgx.Tx the insert runs in a savepoint, rolled back when it fails, so
+// that a refusal never leaves the caller's transaction aborted.
 func (s *Store) Record(ctx context.Context, rec policy.Record) error
 
-// Filter narrows List. The zero Filter lists everything.
+// Cursor is a position in the log, as agent.Cursor is in a run listing: the
+// time a decision was decided and its ID.
+type Cursor struct {
+	At time.Time
+	ID int64
+}
+
+// Filter narrows List. The zero Filter lists the newest decisions. Effect,
+// Rule and Kind match exactly, and so case-sensitively.
 type Filter struct {
 	Effect policy.Effect
 	Rule   string
 	Kind   string
 	Since  time.Time
-	// Limit defaults to 100.
+	// Before returns decisions older than this position. A cursor whose ID is
+	// below 1, or whose time is outside the years 1 to 9999, is an error.
+	Before *Cursor
+	// Limit defaults to 100 and is at most 1000: a larger number is 1000.
 	Limit int
 }
 
-// List returns decisions newest first.
+// List returns a page of decisions, newest first by the time decided and then
+// by ID, each with its ID. To read the next page, set Before to the At and ID
+// of the last record of this one.
 func (s *Store) List(ctx context.Context, f Filter) ([]policy.Record, error)
 
 var _ policy.Recorder = (*Store)(nil)
@@ -1589,13 +1859,36 @@ CREATE TABLE IF NOT EXISTS policy_decisions (
     rule           TEXT NOT NULL,
     rule_index     INTEGER NOT NULL,
     matched        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    uncertain      JSONB NOT NULL DEFAULT '[]'::jsonb,
     policy_version TEXT NOT NULL DEFAULT ''
 );
 
--- List reads newest first, optionally narrowed by effect or rule.
+-- List reads newest first, optionally narrowed by effect or rule. The rule index
+-- is in that order within a rule, so a filter on one reads only its rows.
 CREATE INDEX IF NOT EXISTS policy_decisions_decided_idx ON policy_decisions (decided_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS policy_decisions_rule_idx ON policy_decisions (rule, id DESC);
+CREATE INDEX IF NOT EXISTS policy_decisions_rule_idx ON policy_decisions (rule, decided_at DESC, id DESC);
 ```
+
+`attrs`, `matched` and `uncertain` are written as `{}`, `[]` and `[]` when
+the record's own are nil, never as JSON `null`, and `decided_at` is stored in
+UTC. `uncertain` is what `Decision.Uncertain` carries: the attributes a
+decision could not tell, so a reviewer reading the table sees why an ask or
+block rule decided on a condition that looks unmet.
+
+The listing orders by `(decided_at, id)`, which is the order of
+`policy_decisions_decided_idx`, and pages with a row comparison on it,
+`(decided_at, id) < ($time, $id)`, so a page is a short index scan however
+far back it is, and records that share a time are each on one page and no
+more. A filter on a rule reads `policy_decisions_rule_idx`, which is in the
+same order within a rule, `(rule, decided_at DESC, id DESC)`, and so reads
+only that rule's rows and does not sort them; with the index on the rule and
+the id alone it read them all and sorted. `id` is what the log gives a
+record when it is listed, as `Record.ID`. `jsonb` keeps a number as a
+`numeric`, with every digit and the scale it was written with, up to 131072
+digits before the point and 16383 after it, an exponent counting as it
+expands; it refuses `\u0000`, a number past either limit, and a value nested
+more deeply than the server's stack, and each of those is an error that no
+retry changes. A time is held to years 1 to 9999.
 
 The down file drops the two indexes and the table.
 
@@ -1609,23 +1902,70 @@ unexported interface, as `jobs/pg` does.
 
 `Policy.Decide` is pure and total: it cannot fail, reads nothing but its
 arguments, and may be called from any number of goroutines. A `Decider` is
-immutable after `NewDecider`; changing the rules means building another.
+immutable after `NewDecider`: it holds a deep copy of the policy, every
+list and nested value, and `Policy()` hands out another, so nothing a caller
+does afterwards, from any goroutine, changes the rules it decides under; to
+change the rules, build another. A `Recorder` is handed a deep copy of the
+record, so neither side can change what the other holds. What Go cannot
+copy (a function, a channel, the unexported fields of a struct) is shared.
+A copy is bounded in work: a policy whose conditions hold more than 10000
+values between them is refused by `NewDecider`, and an action whose
+attributes hold more is a record that cannot be written, so `Decide`
+returns an error and a zero `Decision`. `MemoryRecorder.Record` refuses such
+a record too, and its zero value is ready to use. The errors for a record
+that is too large wrap `ErrUnrecordable`, as the next paragraphs say.
 
 `Decider.Decide` computes the decision and then records it. If the record
 cannot be written, it returns the error and a zero `Decision`. The zero
 `Effect` is not `Allow`, and every caller in this design treats an effect
 that is not one of the three as block, so a decision that could not be
-recorded is never acted on as an allow. The decision log is append-only:
-`policy/pg` has an insert and a read, and no update or delete.
+recorded is never acted on as an allow. A `Recorder` that panics takes
+`Decide` with it, and no decision is returned. The decision log is
+append-only: `policy/pg` has an insert and a read, and no update or delete.
+
+A record that can never be stored is told apart from a store that is down. A
+`Recorder` wraps `ErrUnrecordable` in the error it returns for a record that
+no retry will make storable, and does not for a failure of the moment, so a
+caller that retries a step whose decision failed to record retries the second
+and stops at the first. `Decider.Decide` wraps it for an action with more than
+10000 values, `MemoryRecorder.Record` for a record with more, and
+`policy/pg` for what it refuses before it sends anything (a NUL character, a
+decision whose effect is none of the three, a kind, target, rule or version
+that is not valid UTF-8, a time outside the years 1 to 9999, an index outside
+an integer column, attributes JSON cannot hold, an empty `json.Number`) and
+for the errors the server gives of the record's own content or size: SQLSTATE
+class 22, a data exception, and class 54, a program limit. A refused connection, a cancelled context, an aborted transaction and
+a server shutting down are the store's, and do not wrap it. The `Decider`
+returns a zero `Decision` either way. A NUL, bytes that are not UTF-8, or too
+much length in a policy's names or version is refused by `Validate`, since
+otherwise every decision made under that rule would fail to record, for ever.
+
+A store built over a `pgx.Tx` shares the caller's transaction, and a statement
+the server refuses aborts a transaction, so that every statement after it
+fails until the rollback. `policy/pg` therefore refuses in Go what it can,
+and runs the insert in a savepoint when its connection is a transaction,
+rolled back to when it fails: whatever it refuses, the caller's transaction
+goes on. Over a pool the insert is one statement. A page is read from the
+records already committed: a record that commits late with a time older than
+the cursor of a pass that is already beyond it is not in that pass, and a
+fresh pass from the newest finds it.
 
 An invalid policy cannot reach `Decide` through a `Decider`, since
 `NewDecider` validates. Called on a `Policy` value directly, `Decide` treats
-a rule with an unknown effect as block and a pattern that does not compile
-as not matching.
+a rule with an unknown effect as block, and a rule whose match cannot be
+evaluated (a pattern that does not compile, a condition with an operator
+that is not listed or a value its operator cannot use, a list of kinds with
+an empty entry) as cannot be told: it matches unless its effect is allow,
+and says so in `Decision.Uncertain`. "Does not match" would be the safe
+reading only for an allow rule. The other forms `Validate` refuses are
+decided as written.
 
 ### 5.7 In-process default
 
-`MemoryRecorder`, which is what `Options.Recorder` is when nil.
+`MemoryRecorder`, which is what `Options.Recorder` is when nil. It keeps the
+most recent 1000 decisions, or `Options.MemoryRecords`, and drops the
+oldest: with the zero `Options` it cannot be read, so it must not grow with
+every decision.
 
 ### 5.8 Tests
 
@@ -1636,20 +1976,49 @@ Without a database:
   port lives in `policy/reference_test.go` and names the file it mirrors.
 - A table over `Match`: each operator, each Go number type against each,
   an absent attribute under each operator, kinds, target patterns.
+- The three values: each operator against each type it cannot compare;
+  conditions combined; a malformed rule under an allow, an ask and a block
+  effect; numbers exactly, including text of any size within the bounds and
+  past them. The reviewer's case: an allow by kind and an ask above a limit,
+  with the amount as a string, a pointer, a list, NaN and a number too large
+  for a `float64`.
+- The grid comparison with the reference, as a standing test against
+  `policy/testdata/reference_grid.json`.
 - No rule matched: `Block` by default, `Policy.Default` when set,
   `RuleDefault` reported, `Index` -1.
 - `Validate`, one case per refusal above. `Parse` round-trip:
-  `Parse(Marshal(p))` equals `p`; an unknown field is an error; `"approve"`
-  decodes as `Ask`.
+  `Parse(Marshal(p))` equals `p`; an unknown field is an error; a repeated
+  key is an error at each level, in any case; a document that is not an
+  object is an error; `"approve"` decodes as `Ask`; thresholds stay exact.
 - `Decider`: each decision is recorded once with the policy's version; a
   recorder that fails yields an error and a zero decision. The case that
   must fail: a test asserting the zero decision is not `Allow`, so that a
   change making the failure path return the computed decision goes red.
+  A cancelled context; a recorder that panics; a policy with conditions,
+  including an `in` list, changed after `NewDecider` and after `Policy()`,
+  and under `-race`; a recorder handed a copy; the bounded memory log; the
+  zero value of `MemoryRecorder`, alone and under a `Decider`; a value that
+  shares a child at every level.
 
 With `pg/testdb`: `policy/pg` records and lists; filters by effect, rule,
-kind and time; attributes survive the round trip; concurrent records all
-land. Its migrations are found by the repository-wide replay check without
-wiring.
+kind and time, case-sensitively; attributes survive the round trip, numbers
+exactly; concurrent records all land. Paging: twelve records recorded in a
+scrambled order, several sharing a time, read back by cursor in pages of every
+size from 1 to 13 and compared with an order worked out by hand, each record
+once; each filter, alone and combined, paged and compared with the same
+filter in one piece; a cursor past the end, before everything, in another
+zone and finer than a microsecond; a malformed cursor refused before a query;
+a limit of a million giving pages of 1000 and the cursor reaching the rest.
+The sentinel: every refusal of the store, and each server error class, wraps
+`policy.ErrUnrecordable` and a refused connection, a closed pool, a
+cancelled context and an aborted transaction do not; through `New(tx)`, after
+each refusal the next statement in the caller's transaction succeeds, and the
+statements sent over a pool and over a transaction are as the package says. The
+server is asked for the plan of the statement `List` runs for a rule filter
+with a cursor, which must read the rule index and not sort. A NUL, a number
+past `numeric`'s range, a value nested too deeply, a lone surrogate and an
+empty `json.Number` are each refused. Its migrations, with the index order,
+are found by the repository-wide replay check without wiring.
 
 ### 5.9 Left out
 
@@ -2410,6 +2779,9 @@ const (
 	EventRunCompleted      = "run.completed"
 	EventRunFailed         = "run.failed"
 	EventRunCancelled      = "run.cancelled"
+	// EventRunCancelRequested says a run was asked to stop and is still to
+	// end; EventRunCancelled says it has ended, cancelled.
+	EventRunCancelRequested = "run.cancel_requested"
 	EventStepStarted       = "step.started"
 	EventStepCompleted     = "step.completed"
 	EventStepBlocked       = "step.blocked"
@@ -2483,7 +2855,9 @@ type Options struct {
 	// long a run whose process died waits to be taken over. Default 30
 	// seconds.
 	LeaseTTL time.Duration
-	// HeartbeatInterval defaults to a third of LeaseTTL.
+	// HeartbeatInterval defaults to a third of LeaseTTL. It must be below
+	// LeaseTTL, or New refuses the Options: a lease that is not extended
+	// before it lapses is taken over while its holder still works.
 	HeartbeatInterval time.Duration
 	// PollInterval is how often Work looks for a run when it found none.
 	// Default 1 second.
@@ -2533,7 +2907,8 @@ type Report struct {
 // Engine starts runs, executes them, and answers for them.
 type Engine struct{ /* unexported fields */ }
 
-// New builds an Engine. It returns an error when Model is nil.
+// New builds an Engine. It returns an error when Model is nil, and when
+// HeartbeatInterval is not below LeaseTTL once both have their defaults.
 func New(opts Options) (*Engine, error)
 
 // Register adds an agent. It returns an error for a Definition that does
@@ -2777,7 +3152,9 @@ What the engine's methods do beyond their comments:
   run is new.
 - `Execute`, `Tick` and `Work` claim only runs of agents registered in this
   process.
-- `Approve`, `Decline` and `Cancel` refuse an empty `by`.
+- `Approve`, `Decline` and `Cancel` refuse a `by` that is empty once trimmed,
+  is not valid UTF-8 or holds a NUL, and record the trimmed name; they refuse
+  a reason that is not valid UTF-8 or holds a NUL.
 
 What each `Store` method does, for both implementations. Every time comes
 from the request; a store never reads a clock.
@@ -3067,11 +3444,25 @@ every rebuild:
 | Interrupted and not run again | `interrupted before its result was recorded; not run again` | true |
 | Malformed arguments | `arguments were not valid JSON` | true |
 | Tool missing from this build | `tool is not available` | true |
-| Tool returned an error | The error's text | true |
-| Tool panicked | `tool panicked` (the stack goes to the log) | true |
+| Tool returned an error | The error's text, made fit for the journal: bytes that are not UTF-8 replaced by U+FFFD, then NUL bytes removed | true |
+| Tool panicked | `tool panicked` (the value and the stack go to the log) | true |
 | Tool ran past its timeout | `timed out after <duration>` | true |
+| Tool given no time, a timeout of zero or less, and so not run | `tool was given no time to run` | true |
 | Result over 1 MiB | `result too large: <n> bytes` | true |
+| Result not valid UTF-8 | `result is not valid UTF-8` | true |
+| Result with a NUL byte | `result contains a NUL byte` | true |
 | Child run failed or was cancelled | `<agent> <status>: <reason>` | true |
+
+A result is stored as text, and Postgres refuses, in a text column, a NUL
+byte and bytes that are not UTF-8. A write refused for its content would be
+refused on every attempt, and the run could never move past the step. So
+`invoke` hands the journal only text it can hold. A tool's result with such
+bytes is refused with one of the two fixed texts above, as one that is too
+large is, and the model is told: a result with bytes changed would no longer
+be the tool's answer. An error's text is repaired instead, since it only has
+to say what went wrong. The 1 MiB bound is on bytes, and for an error's text
+is applied after the repair. A result that fails more than one check is
+reported by the first of: too large, not valid UTF-8, a NUL byte.
 
 ### 6.5 Execution
 
@@ -3109,6 +3500,7 @@ const (
 	actResolve                   // record a person's no on a waiting tool step
 	actAsk                       // ask a person about an interrupted at-most-once call
 	actPark                      // nothing can proceed until a person or a child acts
+	actYield                     // give the run up for now: the journal holds what this build cannot read
 )
 
 type action struct {
@@ -3117,7 +3509,7 @@ type action struct {
 	status Status // actFinish
 	reason string // actFinish, actPark
 	output string // actFinish
-	errmsg string // actFinish
+	errmsg string // actYield: what was found
 }
 
 // conversation rebuilds what the model is sent. See 6.4.
@@ -3128,45 +3520,110 @@ func conversation(run Run, steps []Step) []Message
 func next(run Run, def Definition, steps []Step, approvals []Approval, children map[string]Run) action
 ```
 
-`next` applies these rules in order and returns at the first that gives an
-action. One rule sits over the others: when the action chosen would do work
-(`actModel`, `actJudge`, `actRun`, `actSpawn`) and a budget is spent (6.9),
-the action is instead finish, `StatusFailed`, with the budget's reason. A
-run whose work is done is never failed for its budget.
+`next` applies these six rules in order and returns at the first that gives
+an action. They are numbered here as the comment on `next` in `plan.go`
+numbers them.
 
-1. `run.CancelRequested`: finish, `StatusCancelled`.
-2. Walk the tool steps that are not final, in `seq` order. For each:
+1. **Cancellation.** `run.CancelRequested`: finish, `StatusCancelled`.
+2. **A step this build cannot read**, anywhere in the journal: `actYield`,
+   naming the first. That is a step whose kind is neither model nor tool;
+   a model step that is neither `started` nor `completed`; a tool step
+   whose status is none of the six; a completed model step with no
+   message.
+3. **The last reply's `Stop`**, when the last model step is completed.
+   - `StopRefusal`, `StopMaxTokens` or `StopContextWindow`: finish,
+     `StatusFailed`, with `ReasonRefusal`, `ReasonTruncated`,
+     `ReasonContextWindow`. Such a reply is final whatever came with it,
+     so its calls are never judged or run: a refusal is not a turn, and
+     the last call of a reply cut at its token limit can be incomplete and
+     still valid JSON.
+   - `StopEnd`, `StopPause` or `StopToolUse`: no action here. The reply is
+     a turn if it made calls, and rule 6 reads it if it made none.
+   - Any other, the empty one included: `actYield`, whether or not the
+     reply made calls.
+
+   Only the last model step's stop is read. A model step that is still
+   `started` has none, and gives no action here.
+4. **The walk.** Go through the tool steps that are not final, in `seq`
+   order. For each:
    - `proposed`: `actJudge`.
    - `started`, the tool delegates: `actSpawn`.
-   - `started`, the tool is `AtMostOnce` and the step has no approved
-     approval for its current `Attempts`: `actAsk`.
-   - `started` otherwise: `actRun`.
+   - `started`, the tool is neither delegating nor `AtMostOnce`: `actRun`.
+   - `started`, the tool is `AtMostOnce` and does not delegate: `actAsk`.
+     If an approval for the step's current `Attempts` already exists,
+     `actYield` instead: asking again would be handed that approval and
+     change nothing, and the same action would come back for ever. No
+     store leaves a step so.
 
      A `started` step seen here was interrupted: an execution that starts
      a step always finishes it, or ends, before `next` is asked again.
    - `waiting` with a `ChildRunID`: `actCollect` if the child has ended;
-     otherwise the step is pending.
-   - `waiting` without one: look at the approval with the highest `Attempt`
-     for the step. Approved: `actRun`. Declined, expired or cancelled:
-     `actResolve`. Pending: the step is pending.
-   If the walk ends with pending steps and no action: `actPark`, with
-   `ReasonApproval` when any pending step waits on a person and
-   `ReasonChildren` otherwise.
-3. No tool step is open. Look at the last model step:
-   - None, or the last one is completed and made calls: `actModel` at
-     `len(steps)+1`, unless `Run.ModelCalls` has reached the limit, in
-     which case finish, `StatusFailed`, `ReasonModelCalls`.
-   - `started`: `actModel` at its `seq`. The call was interrupted.
-   - Completed with no calls: by its `Stop`. `StopEnd`: finish,
-     `StatusCompleted`, output its text. `StopPause`: `actModel` at
-     `len(steps)+1`. `StopRefusal`, `StopMaxTokens`, `StopContextWindow`:
-     finish, `StatusFailed`, with `ReasonRefusal`, `ReasonTruncated`,
-     `ReasonContextWindow`.
+     otherwise the step is pending. A child that is not in `children` is
+     `actYield`.
+   - `waiting` without one: look at the approval for the step's current
+     `Attempts`, which is the one that was asked when the step began to
+     wait. Approved: `actRun`. Declined, expired or cancelled:
+     `actResolve`. Pending: the step is pending. None, or one in a status
+     this build does not know: `actYield`. An approval for an earlier
+     attempt decides nothing: read from a list that was cut short, it
+     would run an interrupted call that nobody has approved.
+
+   A pending step is passed over and the walk goes on to the next.
+
+   **When a budget is spent** (time, cost or tokens: 6.9), `actJudge`,
+   `actRun`, `actSpawn` and `actAsk` are not given: the step is held back
+   and the walk goes on. `actCollect`, `actResolve` and `actYield` are
+   still given where they are met, so an ended child's usage reaches the
+   run's totals and a person's no is recorded before the run fails, and a
+   person is not asked about a call that will not run. The limit on model
+   calls holds nothing back here: it stops a model call and nothing else.
+5. **The walk gave no action.**
+   - It held a step back for a budget: finish, `StatusFailed`, with the
+     budget's reason.
+   - Else it passed over a step that waits on a person: `actPark`,
+     `ReasonApproval`.
+   - Else it passed over a step that waits on a child: `actPark`,
+     `ReasonChildren`.
+
+   So a run with a spent budget and nothing but pending steps still parks,
+   and fails when it is woken with work to do.
+6. **No tool step is open.** The end of the journal decides.
+   - No step, or the last step is a tool step (the last reply made calls
+     and all are final): `actModel` at `len(steps)+1`.
+   - The last step is a `started` model step: `actModel` at its `seq`. The
+     call was interrupted.
+   - The last step is a completed reply that made no calls: by its `Stop`.
+     `StopEnd`: finish, `StatusCompleted`, output its text. `StopPause`:
+     `actModel` at `len(steps)+1`. `StopToolUse`: `actYield`, since a reply
+     that says it used tools and made no calls is not one the rules can
+     place.
+
+   In place of any `actModel` here, when a budget is spent: finish,
+   `StatusFailed`, with its reason. `Run.ModelCalls` having reached its
+   limit, `ReasonModelCalls`, is one of the four at this point and at no
+   other.
+
+When more than one budget is spent the reason is the first of time, cost,
+tokens and model calls. A run whose work is done is never failed for its
+budget: a finish, a park and an `actYield` are given whatever has been
+spent.
 
 Calls of one reply are executed one at a time in the order the model wrote
 them. A step waiting on a person does not hold up the steps after it:
 `next` passes over a pending step and acts on the next one, and the run
 parks only when everything left is pending.
+
+`actYield` carries what was found in `errmsg`, and is given at the point in
+the rules where it is met, as they say above. The run is given up as a
+failed attempt and not ended, because ending a run cannot be undone and
+neither cause is the run's own: a value this build does not know is what an
+older worker reads during a deploy once a newer build has written to the
+journal, and a child or an approval that was not passed in is the
+executor's mistake. Given up, the run waits out its back-off and is claimed
+again, by a worker that can read it or after a fix, and if none can, the
+limit on failed executions ends it with the same message; parking it
+instead would leave nothing to wake it. A budget does not replace
+`actYield`, and cancellation still comes first.
 
 How each action is performed:
 
@@ -3181,6 +3638,7 @@ How each action is performed:
 | `actAsk` | `RequestApproval` | `From: StepStarted`, cause `interrupted`, rule `RuleInterrupted` |
 | `actPark` | `Park` | If `Park` reports false, something changed since the journal was read; the loop goes round again |
 | `actFinish` | `Finish` | For a run that fails or is cancelled, each child that has not ended is sent `RequestCancel` first |
+| `actYield` | `Yield` | The execution ends as one whose step failed (6.6), with `errmsg` as the error: `Yield{Failed: true}` with the back-off, or, when this is failure number `MaxFailures`, `Finish` as failed, `ReasonError`, with the same message. Nothing is written to the journal |
 
 A delegating tool is described to the `Guard` as
 `Action{Kind: "delegate", Target: <agent name>}` unless it has its own
@@ -3198,9 +3656,11 @@ contract types, so each compiles and is tested alone.
 var errCancelRequested = errors.New("agent: cancellation requested")
 
 type keepOptions struct {
-	Store    Store
-	Clock    Clock
-	TTL      time.Duration
+	Store Store
+	Clock Clock
+	TTL   time.Duration
+	// Interval must be more than zero and less than TTL. Any other value is
+	// replaced by a third of TTL and reported once in the log as an error.
 	Interval time.Duration
 	Logger   *slog.Logger
 }
@@ -3209,12 +3669,35 @@ type keepOptions struct {
 // returns is ctx, cancelled with cause ErrLeaseLost when a heartbeat finds
 // the lease gone or no heartbeat has succeeded for a whole TTL, and with
 // cause errCancelRequested when a heartbeat reports the request.
+//
+// After a cancel request the heartbeats go on until stop, so the caller has
+// as long as it needs to finish the run as cancelled; a lease lost after
+// that ends the heartbeats and leaves the cause as it was.
+//
+// A lease another process took is noticed at most one Interval and one
+// round trip to the store after the takeover. With the store failing,
+// another process may claim the run from the last heartbeat that succeeded
+// plus the TTL, and the held context ends less than two Intervals after
+// that. Until a first heartbeat has succeeded the TTL is counted from the
+// call to keep.
+//
+// stop returns once the goroutine that makes the heartbeats has exited, and
+// releases the held context: one still live ends with context.Canceled as
+// its cause. Whatever is written after stop is written under ctx.
 func keep(ctx context.Context, lease Lease, opts keepOptions) (held context.Context, stop func())
 
 // invoke.go
 
 // outcome is what one execution of a tool produced. retry is set, and the
-// rest empty, when the tool's error wraps ErrTransient.
+// rest empty, when the tool's error wraps ErrTransient. It is then an error
+// that unwraps to the tool's own and carries its text, read in the tool's
+// goroutine and made fit for the journal, so the caller can record it
+// without calling into the tool's code.
+//
+// retry is also set, and the rest empty, when the context invoke was given
+// ended before a result was taken: it is then that context's cause. Either
+// way there is nothing to record, and the caller reads its own context to
+// tell the two apart.
 type outcome struct {
 	result  string
 	isError bool
@@ -3222,9 +3705,14 @@ type outcome struct {
 }
 
 // invoke runs tool.Run once: under timeout, with a panic recovered and
-// logged, an error turned into an error result, and a result over 1 MiB
-// refused. The fixed result texts are those in 6.4.
-func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration) outcome
+// logged to logger, an error turned into an error result, and a result the
+// journal cannot hold refused: one over 1 MiB, one that is not valid UTF-8,
+// one with a NUL byte. The fixed result texts are those in 6.4.
+//
+// timeout is the whole bound: invoke does not read Tool.Timeout. With a
+// timeout of zero or less the tool is not run, and the result says so. A
+// nil logger is slog.Default.
+func invoke(ctx context.Context, tool Tool, in Invocation, timeout time.Duration, logger *slog.Logger) outcome
 
 // actionFor is the Action the Guard is asked about: the tool's own, or the
 // default for its kind, with AttrAgent, AttrTool, AttrRun and AttrSeq set
@@ -3378,7 +3866,7 @@ process died or merely lost its lease.
 |---|---|---|---|
 | Before `BeginModel` commits | No step | Makes the call | Nothing |
 | After `BeginModel`, before `CompleteModel` commits, whether or not the reply arrived | A `started` model step | Makes the call again, as attempt 2 | The model call. The first call's cost is on no record |
-| After `CompleteModel` commits | The reply and its proposed tool steps | Judges the first proposed step | Nothing |
+| After `CompleteModel` commits | The reply and its proposed tool steps | Judges the first proposed step. When the reply is a refusal, was cut at its token limit or ran out of context window, finishes the run as failed instead and its steps stay `proposed`; when its `Stop` is one this build does not know, gives the run up (6.5, rule 3) | Nothing |
 | While judging, before the step leaves `proposed` | A `proposed` step | Asks the guard again | The guard is asked twice, and a guard that records writes two records. No effect on the world |
 | After a step is `blocked` or `declined` | The final result | Passes over it | Nothing |
 | After `RequestApproval` commits | A `waiting` step and a pending approval | Parks | Nothing. The same approval is found, not a second one |
@@ -3554,6 +4042,17 @@ bus := events.NewInMemoryBus(events.InMemoryBusOptions{})
 engine, err := agent.New(agent.Options{Model: model, Store: store, Events: bus})
 ```
 
+The types, and who publishes each: `EventRunStarted` by `Start`, for a run
+that is new; `EventApprovalDecided` by `Approve` and `Decline`;
+`EventRunCancelRequested` by `Cancel`, for the request that sets the mark;
+and by the execution, `EventStepStarted`, `EventStepCompleted`,
+`EventStepBlocked`, `EventApprovalRequested`, `EventRunWaiting`, and one of
+`EventRunCompleted`, `EventRunFailed` and `EventRunCancelled` when the run
+ends. A request to cancel and a run that ended cancelled are two events,
+so that no type means two things: `EventRunCancelRequested`
+(`"run.cancel_requested"`) says the run was asked to stop and is still to
+end, and `EventRunCancelled` says it has.
+
 The event says which run changed and how, and carries nothing from the
 journal, so tool arguments and results never travel on a bus. Publishing
 happens after the commit and is best effort: a failed publish is logged at
@@ -3600,6 +4099,12 @@ type Options struct {
 	// Heartbeat is how often an idle event stream sends a comment line, to
 	// keep proxies from closing it. Default 15 seconds.
 	Heartbeat time.Duration
+	// CrossOrigin guards the three routes that change something against a
+	// request a browser makes for a page on another origin: 403, before
+	// Actor is asked. Nil means a protection with no trusted origins; a
+	// service whose front end is on another origin supplies one that trusts
+	// it. Reading and the stream are not guarded.
+	CrossOrigin *http.CrossOriginProtection
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
 }
@@ -3619,7 +4124,7 @@ var _ Runs = (*agent.Engine)(nil)
 
 | Route | Answers |
 |---|---|
-| `GET /runs` | `{"runs": […], "next": "<cursor>"}`, newest first. Query: `status`, `agent`, `parent`, `limit` (1 to 200, default 50), `cursor`. An unknown status or a limit out of range is 400, as `pg.ParsePage` refuses rather than clamps |
+| `GET /runs` | `{"runs": […], "next": "<cursor>"}`, newest first. Query: `status`, `agent`, `parent`, `limit` (1 to 200, default 50), `cursor`. An unknown status or a limit out of range is 400, as `pg.ParsePage` refuses rather than clamps; so is a cursor that does not decode, whose time does not parse, or whose id is not a UUID in the canonical lower-case hyphenated form |
 | `GET /runs/{id}` | The run, or 404 |
 | `GET /runs/{id}/timeline` | `{"run": …, "steps": […], "approvals": […]}`: `Changes` since 0 |
 | `GET /runs/{id}/events` | A server-sent event stream, below |
@@ -3630,14 +4135,49 @@ var _ Runs = (*agent.Engine)(nil)
 
 Responses go through `httpx.JSON`, and failures through `httpx.NotFound`,
 `httpx.BadRequest` and `httpx.Error`, so error bodies are the generic ones
-and the reason is in the log. `Message.Opaque` is removed from every step
-before it is served: it is the provider's private data, large, and of no
-use to a reader.
+and the reason is in the log. What the engine answered (`ErrNotFound`, the
+two conflicts) is told whatever became of the request. After that, a request
+whose context was cancelled is 503, logged at debug level and not as a
+fault: a cancelled context does not say the client has gone (a server
+shutting down, a client that half-closes after sending and a mount's
+middleware cancel it with the client still reading), so it is answered, which
+costs nothing if the client is gone. One whose time ran out is 503 too. No
+failure leaves the status a handler starts with, which would read as success;
+a body that cannot be read to the end is treated as a cancelled call, and one
+that is too long is 400. Everything but the stream is sent with
+`Cache-Control: no-store`: it is journal content. `Message.Opaque` is removed
+from every step before it is served: it is the provider's private data,
+large, and of no use to a reader.
 
 The three routes that change something need `Options.Actor` to return a
-name, and answer 403 without one. The zero `Options` therefore serves a
-read-only surface. A request body is read through `http.MaxBytesReader` at
-4 KiB and decoded with unknown fields disallowed.
+name, and answer 403 without one. A name is recorded for good, so it is
+what is left after the white space round it, and it is no name when it is
+empty, is not valid UTF-8, is over 256 bytes, holds a control character (a
+newline, a NUL, a tab, a line or paragraph separator), or has nothing to see
+in it (no letter, mark, number, punctuation or symbol, so a name of only
+zero-width characters is nobody). The zero `Options` therefore serves a
+read-only surface. `Actor` is a name for the
+record and not an authorisation: the package does not authenticate and does
+not decide who may decide which approval, so anyone `Actor` names can
+approve, decline or cancel anything the API can see, and authorisation is
+the mount's. A request body is read through `http.MaxBytesReader` at 4 KiB
+and decoded with unknown fields disallowed; a reason that is not valid UTF-8
+or has a NUL in it is 400, since a database could not keep it.
+
+Those three routes are also behind `http.CrossOriginProtection`
+(`Options.CrossOrigin`), checked before `Actor` is asked. A request that
+`Sec-Fetch-Site` marks as anything but same-origin or none, or that has no
+such header and an `Origin` other than its host, is refused with 403 unless
+the protection trusts that origin; a request with neither header, which is a
+server-side client and not a browser acting for a page, passes. It closes the
+cross-site form post against a cookie session, and nothing more: it is not
+authentication, `Actor` only names who is acting, for the record, and it does not guard
+the reads or the stream, which change nothing.
+
+A cursor comes from the client, so it is input and is decoded strictly, in
+the package and before the engine is asked: a token that is not what the
+package made, a time that does not parse, or an id that `uuid.Parse` does not
+read back to the same string is 400.
 
 The package has no route that starts a run. What a run's input is, and who
 may start one, belong to the service; the example has its own.
@@ -3645,15 +4185,42 @@ may start one, belong to the service; the example has its own.
 The stream. `GET /runs/{id}/events` answers 404 for an unknown run before
 any stream starts. Then, through `httpx.NewEventStream`:
 
-1. `since` is `Last-Event-ID` as an integer, or 0.
-2. Read `Changes(id, since)`. Send one `step` event per step and one
-   `approval` event per approval, in `Rev` order, with no id. Then send one
-   `run` event whose id is `Run.Rev`, and set `since` to it. Sending the id
-   last means a client that reconnects mid-batch is sent the whole batch
-   again, which is harmless: each event is the current state of one thing.
-3. If the run has ended, send an `end` event and return.
+1. `since` is `Last-Event-ID` as a non-negative integer, or 0. A value that
+   is not a number, is negative, or overflows is 0, and a value ahead of
+   the run's own `Rev` is read again from 0: the stream carries state, so
+   sending it all again is always safe, where refusing the header would
+   strand an `EventSource`, which cannot change what it sends, and waiting
+   for a run to reach a revision it never had would skip every change in
+   between.
+2. Read `Changes(id, since)`. This first read is the lookup, made before
+   the stream opens, so that an unknown run is a 404 and a failing store a
+   500. Send one `step` event per step and one `approval` event per
+   approval, in `Rev` order (a step before an approval of the same
+   revision), with no id. Then send one `run` event whose id is `Run.Rev`,
+   and set `since` to it. Sending the id last means a client that
+   reconnects mid-batch is sent the whole batch again, which is harmless:
+   each event is the current state of one thing. When the read holds
+   nothing and `Run.Rev` has not passed `since`, nothing is sent, not even
+   the `run` event.
+3. If the run has ended, send an `end` event, whose data is `{}` and which
+   has no id, and return. A client closes its event source on `end`: a
+   reconnect to a finished run is sent `end` again, so one that did not
+   would loop at the browser's retry interval.
 4. Wait `PollInterval`, sending a comment line every `Heartbeat` while
-   nothing changes, and go to 2. Return when the request's context ends.
+   nothing is sent (any send restarts the wait), and go to 2. Return when
+   the request's context ends, when a send fails (the client has gone and
+   the stream is unusable), when a read fails, or when an event cannot be
+   encoded (a step whose stored arguments are not JSON). In the last two the
+   stream ends with no `end` event, which is how a client knows to reconnect
+   from the id it has, and the cause is logged: a read that failed because
+   the request is over quietly, and an event that cannot be encoded as a
+   fault, since the client will meet it again at every reconnect.
+
+A `HEAD` request on the route is answered with the headers a stream has
+and no stream, after a `GetRun` for the 404 (a GET's lookup is its first
+`Changes`), and the package keeps the two in step with a test; a stream started for a `HEAD` would only wait for the client to
+leave. A writer that cannot flush is answered with an ordinary 500, before
+anything is written.
 
 The stream carries state, not history: a step that started and completed
 between two polls appears once, completed. The journal is the history.
@@ -3922,14 +4489,32 @@ package app
 // AgentModelOptions configures AgentModel. The zero value prices nothing.
 type AgentModelOptions struct {
 	// Prices turns each reply's tokens into the cost a run's budget is
-	// measured in. With Prices set, a reply from a model it does not list
-	// fails the run rather than being counted as free.
+	// measured in. Nil prices nothing: every reply costs zero. Anything else
+	// is a table, and a table that lists no model that answers, an empty one
+	// included, fails the run on every reply rather than leaving its cost limit
+	// silently off: a reply that neither the model it names nor the model
+	// priced for the request can price is a permanent error. AgentModel keeps a
+	// copy of the table.
 	Prices llm.Prices
 	// Effort is sent with every request.
 	Effort llm.Effort
 	// StrictTools asks the provider to guarantee tool arguments match their
 	// schemas.
 	StrictTools bool
+	// DefaultMaxTokens bounds the reply to a request that sets no MaxTokens.
+	// Zero is 16000, the number llm.Budgeted assumes for a request that sets
+	// none: the adapter always sends a bound, so that a budget's hold is a
+	// real upper bound on the call. It goes to every model the adapter
+	// serves, so a model with a lower output cap needs it set lower.
+	DefaultMaxTokens int
+	// Model is the model a request that names none is sent to, and priced as.
+	// It is llm.BudgetOptions.Model's counterpart: give both the same name, so
+	// that the budget and the adapter settle the same price.
+	Model string
+	// Logger receives one warning for each refusal, with the provider's reply
+	// id, the model and the refusal's reason. Nil uses slog.Default(). Neither
+	// the prompt nor the reply's text is logged.
+	Logger *slog.Logger
 }
 
 // AgentModel adapts an llm.Model to agent.Model.
@@ -3943,28 +4528,89 @@ func AgentGuard(d *policy.Decider) agent.Guard
 
 | `agent.Request` | `llm.Request` |
 |---|---|
-| `Model`, `System`, `MaxTokens` | The same fields |
-| `Messages`: `Role`, `Text`, `Calls`, `Results`, `Opaque` | `Role`, `Text`, `ToolCalls`, `ToolResults`, `Opaque`, field for field |
+| `Model` | The same field; when it is empty, `AgentModelOptions.Model` |
+| `System` | The same field |
+| `MaxTokens` | The same field; when it is zero or less, `DefaultMaxTokens`. A request the adapter sends always sets one |
+| `Messages`: `Role`, `Text`, `Calls`, `Results`, `Opaque` | `Role`, `Text`, `ToolCalls`, `ToolResults`, `Opaque`, field for field: a call's `ID`, `Name`, `Input` and `Malformed`, a result's `CallID`, `Content` and `IsError`, an opaque form's `Provider` and `Data` |
 | `Tools` | `Tools`, with `Strict` from `StrictTools` |
-| `Output` | `Output: &llm.Schema{Name: "answer", JSON: …}` when set |
+| `Output` | `Output: &llm.Schema{Name: "answer", JSON: …}` when it is not empty |
 | | `Effort` from the options |
+
+`RunID` and `Agent` are not sent: `llm.Request` has no place for them. Every
+slice and byte string is copied, a nil one stays nil and an empty one stays
+empty, and no JSON is decoded or encoded, so an assistant turn, its tool calls
+and its opaque provider form go back to the provider exactly as they came, key
+order and spacing included.
 
 | `llm.Response` | `agent.Response` |
 |---|---|
 | `Message` | `Message`, field for field |
-| `Stop` | The constant of the same name; `StopSequence` becomes `StopEnd` |
+| `Stop` | The constant of the same name; `StopSequence` becomes `StopEnd`. A reason `agent` has no name for is a permanent error |
 | `Model` | `Model` |
-| `Usage` | `InputTokens` is input plus cache reads plus cache writes; `OutputTokens`; `CostMicros` is `Prices.CostOf(resp)` |
+| `Usage`, and `Attempts` when there are some | `InputTokens` is input plus cache reads plus cache writes, and `OutputTokens`, summed over every attempt, or over the one `Model` and `Usage` when there are none; `CostMicros` is `Prices.CostFor(resp, asked)` with the model the request was sent to as `asked`, and zero when `Prices` is nil |
 
-Errors: `ErrBudgetExceeded`, `ErrNoPrice`, and an `*llm.Error` that is not
-retryable are returned wrapped in `agent.ErrPermanent`. With `Prices` set, a
-reply from a model the table does not list is an `ErrNoPrice` and so
-permanent: a run with a cost budget must not treat an unpriced call as
-free. Everything else is returned as it is, and the engine tries again
-later.
+A refused reply is meant to carry no text and no tool calls, and the adapter
+makes that so: when the stop is a refusal, the `agent.Response` has the role
+and nothing else, no text, no calls and no opaque form (which would replay the
+calls dropped), whatever the provider put in the reply, so that an engine that
+journals calls before it reads the stop has none to run. The usage and the cost
+are still reported, since a refusal is billed. A refusal is a reply, not an
+error, including one `Fallback` returns after the models behind it failed. Its
+reason has no place in `agent.Response`: the adapter logs one line at warning
+level through `Logger`, with the provider's reply id, the model, and the
+refusal's category and explanation when the reply carries them, and never the
+prompt or the reply's text. Any other content passes as it is given.
+
+Not carried: the run id and the agent name are not sent to the model, and the
+provider's reply id and the refusal's details are logged, not returned.
+
+Errors are classified as `llm.Retryable` classifies them, which trusts an
+`*llm.Error` in the chain before it looks for a context error:
+
+- The caller's own cancellation or deadline, read from the context given to
+  `Generate`, is returned as it is: neither retryable nor permanent. It decides
+  before anything else: a budget refusal, an `ErrNoPrice`, a reply that cannot
+  be priced or a reply with a stop `agent` has no name for, met while the
+  context is done, is returned as it is too. A worker that is shutting down
+  must not fail a run for good, and an error that is real comes back, and is
+  marked, on the retry.
+- `ErrBudgetExceeded`, `ErrNoPrice`, a reply that cannot be priced, and an
+  `*llm.Error` that is not retryable are returned wrapped in
+  `agent.ErrPermanent`, and still unwrap to themselves.
+- A retryable `*llm.Error`, a plain error, and anything else are returned as
+  they are, and the engine tries again later.
+- A nil reply with a nil error is an error, and not a permanent one.
+
+With `Prices` not nil, a reply that is priced at neither the model it names nor
+the model the request was sent to is an `ErrNoPrice` and so permanent, and an
+empty table prices nothing: a run with a cost budget must not treat an unpriced
+call as free. A request that names no model is sent to, and priced at,
+`AgentModelOptions.Model`, as `llm.Budgeted` prices it at its own
+`BudgetOptions.Model`. The reply is priced as
+`llm`'s budget and meter price it, so a provider that answers an alias with a
+dated id costs what the alias costs (decision 59).
 
 `AgentGuard` copies `Kind`, `Target` and `Attrs` into a `policy.Action`,
-calls `Decider.Decide`, and copies `Effect` and `Rule` back.
+calls `Decider.Decide`, and copies `Effect` and `Rule` back. The three are
+passed through unchanged: no trimming, no case folding, no cleaning of a
+target, and no attribute converted to another type, because `policy` matches
+names and strings exactly as written and reads an attribute it cannot compare
+as a reason to ask or block. When the policy's decision names something that
+could not be evaluated in `Decision.Uncertain`, `agent.Decision`, which carries
+only `Effect` and `Rule`, gets it in the rule: `<rule> (could not evaluate:
+<names joined by ", ">)`. The run's timeline and the approval a person is
+shown then say why a rule whose condition looks unmet decided; the structured
+field stays in the policy's own record. A decision that could not be recorded
+is an error and no decision. A decision that can never be recorded (`policy.ErrUnrecordable`:
+a NUL, a value no store holds) comes back wrapped in `agent.ErrPermanent` as
+well, so the engine refuses the call instead of retrying it for ever; a store
+that is down is returned as it is and tried again; and with the caller's
+context done the error is the caller's, as for `AgentModel`.
+
+Composition is the caller's. The `llm` wrappers go outermost first as
+`Budgeted`, `Metered`, `Fallback`, then one `Retrying` per provider (4.7); the
+budget is outermost, so the meter records only the calls it let through, and a
+call it refuses reaches the adapter as a permanent error.
 
 Wiring, as the example does it:
 
@@ -3973,7 +4619,12 @@ client, err := anthropic.New(anthropic.Options{
 	APIKey:          cfg.AnthropicAPIKey,
 	RefusalFallback: "default",
 })
-model := llm.NewMetered(llm.NewRetrying(client, llm.RetryOptions{}), llm.MeterOptions{Prices: prices})
+metered := llm.NewMetered(llm.NewRetrying(client, llm.RetryOptions{}), llm.MeterOptions{Prices: prices})
+model, err := llm.NewBudgeted(metered, llm.BudgetOptions{
+	MaxCostMicros: 50_000_000, // $50, across every run this process makes
+	Prices:        prices,
+	Model:         anthropic.DefaultModel,
+})
 
 rules, err := policy.Parse(policyJSON)
 decider, err := policy.NewDecider(rules, policy.Options{Recorder: policypg.New(pool)})
@@ -4395,8 +5046,9 @@ chose them.
     comments of any number or length do not reach it. The check is made
     while a line is being read, so a line that never ends is refused at the
     bound. Rejected: checking the assembled event, which allocates first
-    and checks after. The error is not exported, since no caller has a
-    decision to make about it.
+    and checks after. The error is exported, `ErrEventTooLarge`, since a
+    provider has a decision to make about it: a retry meets the same event,
+    so it is not a transport failure.
 
 40. **A send on an event stream is bounded, though the stream is not.**
     `NewEventStream` lifts the write deadline so that a stream can outlive
@@ -4533,3 +5185,285 @@ lead confirmed its choices, and the table now states each of them.
     was not given). `Metadata` goes through JSON as `Action.Attrs` does.
     What a NUL character inside a string of either does is left to the
     Postgres store to settle with its column types in front of it.
+
+49. **`Validate` refuses a rule that matches nothing, or everything, by
+    mistake.** A condition with no attribute; an `eq` or `ne` with no value,
+    or with a list or object; a number that is not finite; an `in` with an
+    empty list or an element that is not a number, a string or a boolean; and
+    an empty kind. Rejected: leaving them to `Decide`, where each reads as
+    "this rule does not apply". A person who wrote a block rule and left out
+    the attribute, or whose `value` was dropped when a policy was
+    reserialised, has a rule that looks like protection and protects
+    nothing, and nothing says so; the fault is also the sort a reviewer reads
+    straight past. Refusing at load time costs a startup error that names the
+    rule and the condition. Not refused: an empty `Kinds`, `Target` or
+    `Attrs`, which the design defines as "every", so a rule with no `when`
+    applies to every action; and two conditions that contradict one another,
+    which is analysis this package does not do. A bare `*` target, listed
+    here as not refused when this decision was first written, is refused:
+    see decision 52.
+
+50. **What cannot be evaluated counts toward the stricter outcome.** A
+    condition holds, does not hold, or cannot be told; a rule with nothing
+    that fails and something that cannot be told matches if it asks or
+    blocks, and does not if it allows; the decision names the attribute in
+    `Decision.Uncertain`. Rejected: reading a present attribute of the wrong
+    type as "does not hold", which the first version did. Attributes come
+    from tool input a model wrote, so under "allow by kind, and a payment
+    above 200 asks", an amount written as `"1250"`, a one-element list, a
+    pointer or NaN was allowed, the cheapest way round any limit. Also
+    rejected: reading `"1250"` as a number, which decides on a guess about
+    what the model meant and leaves `"abc"` to be allowed; and returning an
+    error, which stops the run for what a person could settle with one
+    answer. Asking is the outcome that leaves the decision to a person and
+    leaves the reason on the record. `in` follows from the same reading: it
+    is `eq` on each element joined by "or", and unknown-or-false is unknown,
+    so it does not hold only when every element could be compared and none
+    equalled; `in [22, "ssh"]` against `"22"` cannot be told, and a block
+    rule blocks it, as `in [22]` and `eq 22` do. Rejected: reading it as not
+    held once any one element was comparable, which let the same attribute be
+    blocked by a list of one type and allowed by a list of two. The same reading settles a rule that
+    cannot be evaluated at all: "does not match" is safe for an allow rule and
+    for no other.
+
+51. **Numbers are compared exactly, and a float whose integer value is
+    rounded is told under both of its readings.** `Parse` keeps every number
+    as written. Rejected: `float64` for everything, which turns
+    `9007199254740993` into `9007199254740992` and a threshold into a
+    different threshold; the exact binary value of every float, which leaves a
+    `float64` 0.3 below a threshold of 0.3; and, for a float with an integer
+    value, either single reading. As the exact integer, a `float64` 1e23
+    (99999999999999991611392) is below a threshold written 1e23; as its
+    shortest decimal, a `float64` 2^70 (1180591620717411300000) is below a
+    threshold of 1180591620717411303000 that it is above. Each is a wrong answer
+    given with certainty, and the package's rule is that what cannot be told
+    counts toward the stricter outcome. So both readings are compared; one
+    outcome is the outcome; two make the condition uncertain. Below 2^53 the
+    readings are one number and nothing changes. Text is read to 4096 bytes
+    and an exponent of 4096, and past that cannot be told, because the value is
+    a model's and an exponent of a million is an allocation of that size.
+
+52. **`Parse` refuses what a reader and the decoder would see differently.** A
+    repeated key at any depth, compared as the decoder compares keys, without
+    regard to case, because the later key wins or merges and the file read
+    is not the policy loaded; a document that is not an object, because
+    `null` would load as the empty policy, which blocks everything or
+    allows by default; and a rule named `RuleDefault`, which would make the
+    record ambiguous. `Validate` also refuses a bare `*` target, which
+    reads as every target and matches no target with a slash in it, and
+    `exists false` with another condition on the same attribute, which an
+    absent attribute can never meet. Not refused: conditions that contradict
+    one another in general, which needs analysis this package does not do.
+
+53. **A `Decider` is immutable by copying, and its default log is bounded.**
+    Every list and nested value of its policy is copied in and out, and a
+    `Recorder` is handed a copy. Rejected: sharing a condition's value, which
+    let a caller change a live rule through an `in` list and race with
+    `Decide`. The copy is bounded in work and not only in depth: a value that
+    shares a child twice at every level doubles at each, so more than 10000
+    values to copy is refused, by `NewDecider` for a policy and by `Decide`
+    with an error and no decision for an action, as when a record cannot be
+    written. The in-memory log keeps the most recent 1000 decisions,
+    because with the zero `Options` it cannot be reached and growing with
+    every decision is a leak. Targets are matched as written, with no
+    normalisation, so whatever builds an `Action` puts them in one canonical
+    spelling: normalising inside `policy` would pick one spelling for every
+    caller's idea of what a target is.
+
+The first review of the two providers settled five more, each for both of
+them. These are written from the OpenAI provider's side.
+
+54. **A stream is bounded by its context, an idle limit, an event size and
+    the reply's size, and by no whole-request timeout.** Rejected: the
+    client's `Timeout`, which covers reading the body and so cuts a long
+    reply that is going well; and capping a stream at the body bound as a
+    whole, for the same reason. What a stream may not do is stall (the idle
+    limit on bytes from the server, default two minutes, `IdleTimeout` in the
+    options, negative for none; a keep-alive comment is a byte, so a server
+    that sends only those is bounded by the context, and a callback's time is
+    not counted) or grow without limit (16 MiB an event, 32 MiB of what the
+    reply keeps, ids and names and a fixed charge per call included). A size
+    bound that is passed is a plain error and not retryable, since a retry
+    meets the same size, where a stall is a transport failure that is.
+
+55. **A response that is not what a call asked for is an error, and the
+    stream that delivered nothing is a retryable one.** A 200 to a streaming
+    request that is not an event stream, and an error object inside a 200 body
+    of any call, embeddings included, are `*llm.Error`s; the first is not
+    retryable, the second is when its type or code says it passes. A stream
+    that ends cleanly with no chunk that has an id or a choice is an
+    incomplete stream, like a cut one, and retryable; a stream whose server
+    said it finished, with a finish reason, and said no more is an empty
+    reply. Rejected: reading a stream of nothing but `[DONE]` as an empty
+    reply, which is what a proxy that dropped the upstream sends.
+
+56. **The caller's context ending is the context's error, and the rest is the
+    provider's.** When a call fails and the caller's context is done, the
+    provider returns that context's error and it is not retryable. When the
+    context is live, a transport failure, a stream that went quiet and the
+    client's own timeout are `*llm.Error`s marked retryable. Rejected: an
+    `*llm.Error` for a cancellation, which a wrapper could mistake for the
+    provider's failure and a retry loop would then repeat.
+
+57. **The default client follows no redirects, and no client sends a
+    credential to an origin it was not given.** A 3xx is an `*llm.Error`, not
+    retryable, and so is a redirect that a supplied client refuses. A client
+    supplied in the options keeps its own policy, and the package withholds the
+    key and the caller's headers from any origin other than the configured
+    one's, since `net/http` forwards every header but `Authorization`, and drops
+    that one only when the host name changes, not the scheme or the port. The
+    request body, which holds the prompt, goes wherever a followed 307 or 308
+    points: that is the supplied client's policy to set. Rejected: following
+    redirects by default, which forwards the caller's headers and, for a 307 or
+    308, the whole prompt, and which turns the POST of a 301 into a GET.
+
+58. **After a stream ends cleanly its body is drained a little, so the
+    connection is reused.** At most 64 KiB and 100 milliseconds. A stream is
+    read to `[DONE]`, which comes before the end of the chunked body, and
+    `net/http` returns a connection to the pool only for a body read to its
+    end. Rejected: draining without a bound, which makes a server that holds
+    its stream open after `[DONE]` hold the call; and draining after a failure
+    or an error from the callback, where what is left is more than the
+    connection is worth.
+
+59. **`AgentModel` prices a reply as the budget and meter do, always bounds it,
+    and lets a refusal act on nothing; `AgentGuard` says what a policy could not
+    evaluate.** Section 8 first
+    priced a reply with `Prices.CostOf` and made a model the table lacks a
+    permanent error. Now `Prices.CostFor`, which is decision 44's one function
+    under a name, prices each attempt at the model it names, then at the model
+    the request asked for; only a reply neither name prices fails the run,
+    permanently, and is never a reply that costs nothing. Rejected: `CostOf`,
+    under which a table keyed by alias fails every run whose provider answers
+    with a dated id; and a second pricing rule in `app`. The tokens a reply
+    reports are summed over its attempts as the cost is, so that a run's token
+    limit sees what its cost limit sees. Every request the adapter sends sets
+    `MaxTokens`, from the run's own or `DefaultMaxTokens` (16000, the budget's
+    number), because a budget's hold is an upper bound only when the request
+    bounds the reply. Rejected: leaving it to the provider's default, which the
+    hold would have to assume was no larger. Errors are classified as
+    `llm.Retryable` classifies them, and the caller's cancellation is read from
+    the context, as decision 42 reads it. A retryable `*llm.Error` and a plain
+    error are returned as they are, the caller's cancellation neither retryable
+    nor permanent. Rejected: `ErrPermanent` on every provider error, which
+    fails a run for a rate limit, and on a context error, which fails every run
+    a worker is stopped under. `agent.Decision` carries only `Effect` and
+    `Rule`, so a policy decision that rests on something it could not evaluate
+    comes back with the rule named as `<rule> (could not evaluate: <names>)`,
+    where the timeline and the approval read it, and the structured
+    `Uncertain` stays in the policy's own record. Rejected: dropping it, which
+    leaves a person asked about "Large payments ask" with no reason when the
+    amount arrived as the string "1250"; and a field on `agent.Decision`,
+    which changes the journal and every store. `AgentGuard` hands `Kind`,
+    `Target` and `Attrs` to `policy` as they are, as decision 53 asks of
+    whatever builds an `Action`. The review of the adapters added four rulings.
+    A refusal reaches the engine with the role and nothing else: the first
+    wording, that the adapter passes what it is given, let a refusal a provider
+    returned with tool calls in it reach an engine that journals calls before it
+    reads the stop, and the opaque form would have replayed them; the narrowest
+    place to make that impossible is here, beside the planner reading the stop
+    first. The refusal's reason, which `agent.Response` has no place for, is
+    logged through `AgentModelOptions.Logger`, and never the prompt or the
+    text. `AgentModelOptions.Model` is `BudgetOptions.Model`'s counterpart, so
+    that a request naming no model is priced where the budget prices it and
+    not as `""`, which a table keyed by alias cannot price. Nil `Prices` prices
+    nothing and any other table is set, so that a table that failed to load
+    fails the run instead of switching its cost limit off. Rejected: reading an
+    empty table as no table. And the caller's context decides before a budget
+    refusal, an `ErrNoPrice` and an unpriceable reply as it does before a
+    provider error.
+
+60. **The routes that change something refuse a cross-origin browser request, and
+    a cursor is input.** Approve, decline and cancel are how people govern a
+    run, and each accepts a POST with no body of any content type, which a form
+    on another site can make a browser send with the user's cookie. They are
+    therefore guarded in the package, with the standard library's
+    `http.CrossOriginProtection` (Go 1.25), and `Options.CrossOrigin` lets a
+    service trust the origin of its own front end. The guard refuses by
+    `Sec-Fetch-Site` or by `Origin`, answers the generic 403 and runs before
+    `Actor`. Rejected: leaving it to the mount, which `Routes` documents as
+    guarding operator traffic and which cannot know that these three routes
+    accept a request that carries nothing to tell a form from a client;
+    requiring a content type, which a form can send as `text/plain` and which
+    would refuse a client that sends none; and `CrossOriginProtection.Handler`,
+    whose refusal is plain text. The package calls `Check` and answers with its
+    own generic 403, so a deny handler set on a supplied protection is not
+    used. The guard is not authentication, and does not cover the reads or
+    the stream. A cursor is the client's to send, so it is decoded strictly
+    before the engine is asked: a token that does not decode, a time that does
+    not parse, or an id that is not a UUID in the canonical form (`uuid.Parse`
+    reads upper case, braces, a URN and no hyphens, and a store would be given
+    a name it does not know) is 400. Rejected: handing the id to the store to
+    judge as the ids in a path are, which for a cursor has no 404 to answer
+    with and, against a `uuid` column, a 500.
+
+61. **The decision log is read by position, a record that can never be stored
+    is told from a store that is down, and a policy that could not be recorded
+    is refused at load.** `policy/pg` pages back through the log with a keyset
+    cursor, `Cursor{At, ID}` on `Filter.Before`, the position of the last record
+    of the page before, in the order the query already had and the index already
+    served; each listed record carries its `ID` (a new field of `policy.Record`,
+    zero where no store numbered it). Rejected: an offset, which skips or repeats
+    records as new ones arrive and costs a scan of everything it skips; a cursor
+    of the time alone, which splits a group of records that share one between
+    pages and loses or repeats some of them; and returning a type of the store's
+    own from `List`, which would have changed the signature that other packages
+    build against. The limit's ceiling of 1000 stays, and the cursor is what
+    makes it a page size and not a limit on how far back the log can be read: an
+    audit log whose older entries cannot be reached is not one. `ErrUnrecordable`
+    is one sentinel in `policy`, wrapped by whichever recorder refuses a record
+    for good; the server's own error stays in the chain beside it. Rejected: a
+    sentinel for the failures of the moment, since what is not known to be final
+    must be treated as retryable, and a type that carries a reason, which every
+    caller would have to switch on. `Validate` refuses a NUL or bytes that are
+    not UTF-8 in a rule's name, an attribute name and the version, a name or
+    version of more than 256 bytes, and a NUL in a kind and a target pattern,
+    because the alternative is a rule that loads and then fails, closed, on every
+    record under it, for ever; the refusal is at load, where it costs one startup
+    error that names the rule. An empty `json.Number` in an attribute is refused as
+    unrecordable, not stored as the 0 `encoding/json` writes for it: a record is
+    what was decided on, and nobody sent a zero; it is looked for in what decoded
+    JSON holds (a map, a list, a number) and a struct or a typed list is left to
+    `encoding/json`, whose rules for a struct a copy would only risk disagreeing
+    with. A store built over a transaction runs its insert in a savepoint, since a
+    refused statement aborts a transaction that the store shares with its caller,
+    and an error that says the record is final does not help a caller whose
+    transaction can no longer run; rejected: refusing everything in Go, which
+    cannot be done for what only the server knows (a number past `numeric`, a
+    value nested past its stack).
+    The rule index is `(rule, decided_at DESC, id DESC)`, the order of the
+    listing, since on `(rule, id DESC)` a filter on a rare rule sorted its rows
+    and a cursor on it filtered them after the fact. Invalid UTF-8 in an attribute
+    is replaced by U+FFFD, as `encoding/json` does, and the log says so;
+    rejected: refusing it, which would fail the record of an action the policy
+    decided on without a word.
+
+62. **A journal the planner cannot read gives the run up, a reply the model
+    did not finish is final, and a request to cancel has its own event.**
+    `next` has a tenth action, `actYield`, for a journal that does not add up:
+    a step whose kind or status this build does not know, a completed model
+    step with no message, a `Stop` it does not know, a waiting step with no
+    approval for its current attempt or whose child was not passed in, an
+    interrupted at-most-once step already asked about. The execution ends as a
+    failed attempt with what was found as the error, and the run stays
+    claimable (rejected: finishing the run as failed, `ReasonError`, which
+    cannot be undone, for what may be a newer build's writing during a deploy
+    or the executor's own mistake; and parking it, which leaves a run nothing
+    will wake). A refusal, a spent budget and cancellation still end a run,
+    and so does a reply cut at its token limit or out of context window,
+    whatever calls came with it (rejected: judging and running those calls as
+    a turn, when the last of them may be cut short and still parse, so that a
+    guard keyed on an argument that is missing would let it through). A
+    waiting step is decided by the approval for its current attempt and no
+    other (rejected: the approval with the highest attempt, which, read from
+    a list that was cut short, is an older yes that runs an interrupted call
+    nobody approved). An interrupted at-most-once step is always asked about
+    (the clause "and has no approved approval for its current attempts" could
+    not fire against a store that keeps the contract, and is gone). A spent
+    budget stops work and asking, and lets what does no work finish first
+    (rejected: failing at the first working step, which left a decline
+    unrecorded and an ended child's usage out of the failed run's totals).
+    `Cancel` publishes `EventRunCancelRequested`, and `EventRunCancelled` is
+    kept for the run that has ended cancelled (rejected: `EventRunCancelled`
+    for both, which makes one type mean two things, and nothing at all, which
+    leaves a subscriber no hint that a run is about to stop).
