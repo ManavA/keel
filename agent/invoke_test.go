@@ -18,18 +18,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// lease_test.go is in package agent_test, because it uses agenttest, which
-// imports this package. These three names are how it reaches what it tests.
-
-// Keep is keep.
-var Keep = keep
-
-// ErrCancelRequested is errCancelRequested.
-var ErrCancelRequested = errCancelRequested
-
-// KeepOptions is keepOptions.
-type KeepOptions = keepOptions
-
 const (
 	invokeRunID = "0d9c1f4e-7b2a-4e6d-8c35-1a2b3c4d5e6f"
 	invokeInput = `{"id":7}`
