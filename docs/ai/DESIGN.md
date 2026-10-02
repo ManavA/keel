@@ -1012,12 +1012,17 @@ type Options struct {
 	// timeout of its own: a call that is not a stream is bounded by 10
 	// minutes, and a stream by IdleTimeout. A client given here keeps its own
 	// timeout, which then bounds a stream too, and its own policy on
-	// redirects, which may follow one. The key and Header are still withheld
-	// from a host other than the one first asked.
+	// redirects. The key and Header are withheld from a redirect to another
+	// origin than BaseURL's, another scheme, host or port. The request is not:
+	// a client that follows a 307 or 308 re-sends its body, which holds the
+	// prompt, to wherever the redirect points, and that is for the client given
+	// here to decide.
 	HTTPClient *http.Client
-	// IdleTimeout is how long a stream may go without a byte, from the
-	// request being sent to the end of the stream. Zero is two minutes;
-	// negative is no limit.
+	// IdleTimeout is how long a stream may go without receiving a byte from
+	// the server, from the request being sent to the end of the stream. A
+	// keep-alive comment is bytes and counts, so a server that sends nothing
+	// else is bounded by the context and not by this, and the time a callback
+	// takes is not counted. Zero is two minutes; negative is no limit.
 	IdleTimeout time.Duration
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
@@ -1106,13 +1111,17 @@ A response to a streaming request whose content type is not
 retryable: it is a page from a proxy, or a server that ignored `stream`, and
 asking again gets the same. An `{"error": …}` chunk in a stream, which the
 reference does not document and servers send, is an `*llm.Error` too. A piece
-of a tool call from a server that sends no `index` continues the latest call,
-and an id that is not the one a call already has starts a new one.
+of a tool call belongs to the most recent call opened for its `index`, or from
+a server that sends none, for the index of the last piece, and an id that is
+not the one that call already has opens a new one.
 
-A stream is bounded by the caller's context; by `IdleTimeout` between bytes;
-by 16 MiB in one event; and by 32 MiB in all that the reply assembles, text,
-refusal and tool-call arguments together. It is not bounded by a timeout on the
-whole request, which would cut a long reply that is going well. A reply that
+A stream is bounded by the caller's context; by `IdleTimeout` without a byte
+from the server, where a keep-alive comment is a byte and the time a callback
+takes is not counted; by 16 MiB in one event; and by 32 MiB in all that the
+reply keeps: its text, its refusal and the id, name and arguments of each tool
+call, with a fixed 256 bytes counted for each call besides, so that a server
+that opens calls without end meets the bound. It is not bounded by a timeout on
+the whole request, which would cut a long reply that is going well. A reply that
 outgrows a size bound is a plain error, not retryable, since a retry meets the
 same size. After a stream ends cleanly the body is read on, for at most 64 KiB
 and 100 milliseconds, so that the connection is used again; after a failure or
@@ -1145,7 +1154,12 @@ A 3xx is an `*llm.Error`, not retryable, because the default client does not
 follow redirects: one would send the caller's headers, and for a 307 or 308
 the whole prompt, to whatever host the answer named. A client supplied in the
 options keeps its own redirect policy, and the package withholds the key and
-`Header` from any host other than the one first asked.
+`Header` from any origin other than the configured one's (another scheme, host
+or port, with a default port the same as none). The request is not withheld: a
+client that follows a 307 or 308 re-sends its body, which holds the prompt, to
+wherever the redirect points, and that is for the supplied client's policy to
+set. A redirect that a supplied client refuses, by its own check or by the
+ten hops `net/http` allows, is an `*llm.Error` that is not retryable.
 
 When a call fails and the caller's context is done, the error is the context's
 and is not retryable. When the context is live, a transport failure or the
@@ -1162,16 +1176,19 @@ Every type here is safe for concurrent use. `Scripted`, `Budgeted` and
 `Metered` guard their state with a mutex; the providers hold no state beyond
 their options. No call is retried unless it is wrapped in `Retrying`: a
 provider makes one HTTP request per call. A cancelled context ends a call at
-once, and the error a provider returns for it is the context's, never an
-`*llm.Error`, so it is never retried and never moves a `Fallback` on.
+once, and the error a provider returns for it is the context's, not an
+`*llm.Error` for a failed connection, so it is not retried and does not move a
+`Fallback` on. If the server had already answered with an error status, that
+status is what is returned, even when the cancellation cut its body short.
 
 A provider reads at most 32 MiB of response body, and the event reader at
 most 16 MiB per event; past either it returns an error instead of
 allocating without limit, and a plain one that is not retryable, since a
 retry meets the same size. A stream is not a body in this sense: it is bounded
-by its context, by an idle limit between bytes (default two minutes, from the
-options; negative means none), by the event bound, and by the same 32 MiB
-applied to what the reply assembles. No timeout on the whole request applies
+by its context, by an idle limit on the bytes received from the server
+(default two minutes, from the options; negative means none; comments count and
+the time a callback takes does not), by the event bound, and by the same 32 MiB
+applied to what the reply keeps. No timeout on the whole request applies
 to a stream. After a stream ends cleanly a provider reads the rest of the body,
 a little and for a moment, so that the connection is reused. The default
 `http.Client` a provider builds follows no redirects.
@@ -4158,8 +4175,11 @@ them. These are written from the OpenAI provider's side.
     client's `Timeout`, which covers reading the body and so cuts a long
     reply that is going well; and capping a stream at the body bound as a
     whole, for the same reason. What a stream may not do is stall (the idle
-    limit, default two minutes, `IdleTimeout` in the options, negative for
-    none) or grow without limit (16 MiB an event, 32 MiB assembled). A size
+    limit on bytes from the server, default two minutes, `IdleTimeout` in the
+    options, negative for none; a keep-alive comment is a byte, so a server
+    that sends only those is bounded by the context, and a callback's time is
+    not counted) or grow without limit (16 MiB an event, 32 MiB of what the
+    reply keeps, ids and names and a fixed charge per call included). A size
     bound that is passed is a plain error and not retryable, since a retry
     meets the same size, where a stall is a transport failure that is.
 
@@ -4183,11 +4203,14 @@ them. These are written from the OpenAI provider's side.
     provider's failure and a retry loop would then repeat.
 
 43. **The default client follows no redirects, and no client sends a
-    credential to a host it was not given.** A 3xx is an `*llm.Error`, not
-    retryable. A client supplied in the options keeps its own policy, and the
-    package withholds the key and the caller's headers from any host other than
-    the first, since `net/http` forwards every header but `Authorization` and
-    drops that one only when the host name changes. Rejected: following
+    credential to an origin it was not given.** A 3xx is an `*llm.Error`, not
+    retryable, and so is a redirect that a supplied client refuses. A client
+    supplied in the options keeps its own policy, and the package withholds the
+    key and the caller's headers from any origin other than the configured
+    one's, since `net/http` forwards every header but `Authorization`, and drops
+    that one only when the host name changes, not the scheme or the port. The
+    request body, which holds the prompt, goes wherever a followed 307 or 308
+    points: that is the supplied client's policy to set. Rejected: following
     redirects by default, which forwards the caller's headers and, for a 307 or
     308, the whole prompt, and which turns the POST of a 301 into a GET.
 
