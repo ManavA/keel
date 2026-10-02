@@ -48,7 +48,9 @@ type Options struct {
 	// long a run whose process died waits to be taken over. Default 30
 	// seconds.
 	LeaseTTL time.Duration
-	// HeartbeatInterval defaults to a third of LeaseTTL.
+	// HeartbeatInterval defaults to a third of LeaseTTL. It must be below
+	// LeaseTTL, or New refuses the Options: a lease that is not extended
+	// before it lapses is taken over while its holder still works.
 	HeartbeatInterval time.Duration
 	// PollInterval is how often Work looks for a run when it found none.
 	// Default 1 second.
@@ -427,11 +429,19 @@ func (e *Engine) ListApprovals(ctx context.Context, f ApprovalFilter) ([]Approva
 }
 
 // Approve answers an approval yes, on behalf of by.
+//
+// by is recorded without the space around it, and must then be a name: one
+// that is empty, is not valid UTF-8 or holds a NUL is refused before the
+// store is reached, as is a reason that is not valid UTF-8 or holds a NUL.
+// The reason is otherwise recorded as given, and may be empty. For an
+// approval already answered, the answer that stands is returned with
+// ErrAlreadyDecided.
 func (e *Engine) Approve(ctx context.Context, approvalID, by, reason string) (Approval, error) {
 	return e.decide(ctx, "approve", approvalID, by, reason, true)
 }
 
-// Decline answers an approval no, on behalf of by.
+// Decline answers an approval no, on behalf of by. by and reason are checked
+// and recorded as Approve's are.
 func (e *Engine) Decline(ctx context.Context, approvalID, by, reason string) (Approval, error) {
 	return e.decide(ctx, "decline", approvalID, by, reason, false)
 }
@@ -474,6 +484,9 @@ func (e *Engine) decide(ctx context.Context, op, approvalID, by, reason string, 
 // else the next to claim the run, asks the same of each child that has not
 // ended and finishes the run cancelled, which is when EventRunCancelled is
 // published.
+//
+// by and reason are checked and recorded as Approve's are. Of two requests
+// the first stands, and a run that has ended is ErrFinished.
 func (e *Engine) Cancel(ctx context.Context, runID, by, reason string) error {
 	by, err := recordable(by, reason)
 	if err != nil {

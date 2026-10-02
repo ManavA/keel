@@ -3083,35 +3083,40 @@ func conversation(run Run, steps []Step) []Message
 func next(run Run, def Definition, steps []Step, approvals []Approval, children map[string]Run) action
 ```
 
-`next` applies these rules in order and returns at the first that gives an
-action. One rule sits over the others, for a budget that is spent (6.9).
-No step is then judged, run, spawned or asked about, and the model is not
-called: the limit on model calls stops a model call and nothing else, and
-the other three stop all four. What does no work is still done first: the
-walk of rule 2 goes on past the steps it may not work on and gives the
-`actCollect` and `actResolve` that remain, in order, so an ended child's
-usage reaches the run's totals and a person's no is recorded, and only
-when it has none left is the action finish, `StatusFailed`, with the
-budget's reason. `actAsk` counts as work here: a person is not asked about
-a call that will not run. A run whose work is done is never failed for its
-budget, and a run with nothing but pending steps still parks.
+`next` applies these six rules in order and returns at the first that gives
+an action. They are numbered here as the comment on `next` in `plan.go`
+numbers them.
 
-1. `run.CancelRequested`: finish, `StatusCancelled`.
+1. **Cancellation.** `run.CancelRequested`: finish, `StatusCancelled`.
+2. **A step this build cannot read**, anywhere in the journal: `actYield`,
+   naming the first. That is a step whose kind is neither model nor tool;
+   a model step that is neither `started` nor `completed`; a tool step
+   whose status is none of the six; a completed model step with no
+   message.
+3. **The last reply's `Stop`**, when the last model step is completed.
+   - `StopRefusal`, `StopMaxTokens` or `StopContextWindow`: finish,
+     `StatusFailed`, with `ReasonRefusal`, `ReasonTruncated`,
+     `ReasonContextWindow`. Such a reply is final whatever came with it,
+     so its calls are never judged or run: a refusal is not a turn, and
+     the last call of a reply cut at its token limit can be incomplete and
+     still valid JSON.
+   - `StopEnd`, `StopPause` or `StopToolUse`: no action here. The reply is
+     a turn if it made calls, and rule 6 reads it if it made none.
+   - Any other, the empty one included: `actYield`, whether or not the
+     reply made calls.
 
-   Then, before anything else is decided, every step is looked at, and a
-   step this build cannot read gives `actYield`: a kind that is neither
-   model nor tool; a model step that is neither `started` nor `completed`;
-   a tool step whose status is none of the six; a completed model step
-   with no message. And the last model step's `Stop` is looked at, as rule
-   3 says, since some stops end the run whatever its tool steps hold.
-2. Walk the tool steps that are not final, in `seq` order. For each:
+   Only the last model step's stop is read. A model step that is still
+   `started` has none, and gives no action here.
+4. **The walk.** Go through the tool steps that are not final, in `seq`
+   order. For each:
    - `proposed`: `actJudge`.
    - `started`, the tool delegates: `actSpawn`.
-   - `started`, the tool is `AtMostOnce`: `actAsk`. If an approval for the
-     step's current `Attempts` already exists, `actYield` instead: asking
-     again would be handed that approval and change nothing, and the same
-     action would come back for ever. No store leaves a step so.
-   - `started` otherwise: `actRun`.
+   - `started`, the tool is neither delegating nor `AtMostOnce`: `actRun`.
+   - `started`, the tool is `AtMostOnce` and does not delegate: `actAsk`.
+     If an approval for the step's current `Attempts` already exists,
+     `actYield` instead: asking again would be handed that approval and
+     change nothing, and the same action would come back for ever. No
+     store leaves a step so.
 
      A `started` step seen here was interrupted: an execution that starts
      a step always finishes it, or ends, before `next` is asked again.
@@ -3125,31 +3130,46 @@ budget, and a run with nothing but pending steps still parks.
      this build does not know: `actYield`. An approval for an earlier
      attempt decides nothing: read from a list that was cut short, it
      would run an interrupted call that nobody has approved.
-   If the walk ends with pending steps and no action: `actPark`, with
-   `ReasonApproval` when any pending step waits on a person and
-   `ReasonChildren` otherwise.
-3. Look at the last model step.
-   - Completed, and its `Stop` is `StopRefusal`, `StopMaxTokens` or
-     `StopContextWindow`: finish, `StatusFailed`, with `ReasonRefusal`,
-     `ReasonTruncated`, `ReasonContextWindow`. Such a reply is final
-     whatever came with it, so this is decided before the walk of rule 2
-     and its calls are never judged or run: a refusal is not a turn, and
-     the last call of a reply cut at its token limit can be incomplete and
-     still valid JSON.
-   - Completed, and its `Stop` is none this build knows, the empty one
-     included: `actYield`, also before the walk, whether or not it made
-     calls.
 
-   The rest applies once no tool step is open.
-   - None, or the last one is completed and made calls (its `Stop` is
-     `StopEnd`, `StopPause` or `StopToolUse`): `actModel` at
-     `len(steps)+1`, unless `Run.ModelCalls` has reached the limit, in
-     which case finish, `StatusFailed`, `ReasonModelCalls`.
-   - `started`: `actModel` at its `seq`. The call was interrupted.
-   - Completed with no calls: by its `Stop`. `StopEnd`: finish,
-     `StatusCompleted`, output its text. `StopPause`: `actModel` at
-     `len(steps)+1`. `StopToolUse`: `actYield`, since a reply that says it
-     used tools and made no calls is not one the rules can place.
+   A pending step is passed over and the walk goes on to the next.
+
+   **When a budget is spent** (time, cost or tokens: 6.9), `actJudge`,
+   `actRun`, `actSpawn` and `actAsk` are not given: the step is held back
+   and the walk goes on. `actCollect`, `actResolve` and `actYield` are
+   still given where they are met, so an ended child's usage reaches the
+   run's totals and a person's no is recorded before the run fails, and a
+   person is not asked about a call that will not run. The limit on model
+   calls holds nothing back here: it stops a model call and nothing else.
+5. **The walk gave no action.**
+   - It held a step back for a budget: finish, `StatusFailed`, with the
+     budget's reason.
+   - Else it passed over a step that waits on a person: `actPark`,
+     `ReasonApproval`.
+   - Else it passed over a step that waits on a child: `actPark`,
+     `ReasonChildren`.
+
+   So a run with a spent budget and nothing but pending steps still parks,
+   and fails when it is woken with work to do.
+6. **No tool step is open.** The end of the journal decides.
+   - No step, or the last step is a tool step (the last reply made calls
+     and all are final): `actModel` at `len(steps)+1`.
+   - The last step is a `started` model step: `actModel` at its `seq`. The
+     call was interrupted.
+   - The last step is a completed reply that made no calls: by its `Stop`.
+     `StopEnd`: finish, `StatusCompleted`, output its text. `StopPause`:
+     `actModel` at `len(steps)+1`. `StopToolUse`: `actYield`, since a reply
+     that says it used tools and made no calls is not one the rules can
+     place.
+
+   In place of any `actModel` here, when a budget is spent: finish,
+   `StatusFailed`, with its reason. `Run.ModelCalls` having reached its
+   limit, `ReasonModelCalls`, is one of the four at this point and at no
+   other.
+
+When more than one budget is spent the reason is the first of time, cost,
+tokens and model calls. A run whose work is done is never failed for its
+budget: a finish, a park and an `actYield` are given whatever has been
+spent.
 
 Calls of one reply are executed one at a time in the order the model wrote
 them. A step waiting on a person does not hold up the steps after it:
@@ -3339,7 +3359,7 @@ process died or merely lost its lease.
 |---|---|---|---|
 | Before `BeginModel` commits | No step | Makes the call | Nothing |
 | After `BeginModel`, before `CompleteModel` commits, whether or not the reply arrived | A `started` model step | Makes the call again, as attempt 2 | The model call. The first call's cost is on no record |
-| After `CompleteModel` commits | The reply and its proposed tool steps | Judges the first proposed step | Nothing |
+| After `CompleteModel` commits | The reply and its proposed tool steps | Judges the first proposed step. When the reply is a refusal, was cut at its token limit or ran out of context window, finishes the run as failed instead and its steps stay `proposed`; when its `Stop` is one this build does not know, gives the run up (6.5, rule 3) | Nothing |
 | While judging, before the step leaves `proposed` | A `proposed` step | Asks the guard again | The guard is asked twice, and a guard that records writes two records. No effect on the world |
 | After a step is `blocked` or `declined` | The final result | Passes over it | Nothing |
 | After `RequestApproval` commits | A `waiting` step and a pending approval | Parks | Nothing. The same approval is found, not a second one |

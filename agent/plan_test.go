@@ -332,7 +332,7 @@ func TestNext_Cancellation(t *testing.T) {
 	})
 }
 
-// A refusal is the run's last word, whatever came with it.
+// Rule 3: a refusal is the run's last word, whatever came with it.
 func TestNext_Refusal(t *testing.T) {
 	refused := action{kind: actFinish, status: StatusFailed, reason: ReasonRefusal}
 	checkPlan(t, []planCase{
@@ -388,7 +388,7 @@ func TestNext_Refusal(t *testing.T) {
 	})
 }
 
-// Rule 2: the tool steps that are not final, in order.
+// Rule 4: the tool steps that are not final, in order.
 func TestNext_ToolSteps(t *testing.T) {
 	checkPlan(t, []planCase{
 		{
@@ -632,7 +632,7 @@ func TestNext_ToolSteps(t *testing.T) {
 	})
 }
 
-// Rule 2's end: nothing can proceed, and the reason says who is waited for.
+// Rule 5: nothing can proceed, and the reason says who is waited for.
 func TestNext_Parks(t *testing.T) {
 	checkPlan(t, []planCase{
 		{
@@ -683,7 +683,7 @@ func TestNext_Parks(t *testing.T) {
 	})
 }
 
-// Rule 3: no tool step is open, and the last model step says what is next.
+// Rule 6: no tool step is open, and the last model step says what is next.
 func TestNext_LastModelStep(t *testing.T) {
 	checkPlan(t, []planCase{
 		{
@@ -776,8 +776,9 @@ func TestNext_LastModelStep(t *testing.T) {
 	})
 }
 
-// The rule that sits over the others: an action that would do work is
-// replaced by a failure when a budget is spent (6.9), and no other is.
+// The rule that sits over the others: no work is done once a budget is spent
+// (6.9), what does no work is still done, and the run fails when none of
+// that is left.
 func TestNext_Budgets(t *testing.T) {
 	quarter := (15 * time.Minute).Milliseconds()
 	timeSpent := func(run *Run) { run.ActiveMillis = quarter }
@@ -1455,8 +1456,8 @@ func TestNext_AJournalThatDoesNotAddUp(t *testing.T) {
 	})
 }
 
-// A reply the model did not finish is the run's last word whatever came with
-// it, as a refusal is. The last call of a reply cut at its token limit can
+// Rule 3 again: a reply the model did not finish is the run's last word
+// whatever came with it, as a refusal is. The last call of a reply cut at its token limit can
 // be incomplete and still valid JSON, so a call from one is never judged.
 func TestNext_AReplyCutShort(t *testing.T) {
 	call := Call{ID: "call-2", Name: "lookup", Input: json.RawMessage(`{"order":` + "7}")}
@@ -1527,6 +1528,44 @@ func TestNext_AReplyCutShort(t *testing.T) {
 			steps: append(planJournal(planTool(2, 1, "lookup", StepCompleted)), planModelStarted(3)),
 			want:  action{kind: actModel, seq: 3},
 		},
+	})
+}
+
+// The walk reads a tool step that is not final as proposed, started or
+// waiting, and rule 2 lets no other status reach it. Were the two ever to
+// fall out of step, a status the pass accepted and the walk did not know
+// must give the run up; the zero action it would otherwise return is a
+// finish with no status. proceed is next from rule 4 on, so calling it is
+// calling the walk without the pass in front of it.
+func TestProceed_AStatusTheWalkDoesNotKnowGivesTheRunUp(t *testing.T) {
+	steps := planJournal(
+		planTool(2, 1, "lookup", StepCompleted),
+		planTool(3, 1, "lookup", StepStatus("paused")),
+		planTool(4, 1, "lookup", StepProposed),
+	)
+
+	got := proceed(planRun(), planDefinition(), steps, nil, nil)
+
+	assert.Equal(t, action{kind: actYield, errmsg: `step 3 has the status "paused"`}, got)
+
+	t.Run("and with a budget spent", func(t *testing.T) {
+		run := planRun(func(run *Run) { run.ActiveMillis = (15 * time.Minute).Milliseconds() })
+
+		got := proceed(run, planDefinition(), steps, nil, nil)
+
+		assert.Equal(t, action{kind: actYield, errmsg: `step 3 has the status "paused"`}, got)
+	})
+
+	t.Run("the pass and the walk know the same statuses", func(t *testing.T) {
+		walked := []StepStatus{StepProposed, StepStarted, StepWaiting}
+		for _, status := range []StepStatus{
+			StepProposed, StepWaiting, StepStarted, StepCompleted, StepBlocked, StepDeclined,
+			StepStatus("paused"), StepStatus(""),
+		} {
+			_, unread := unreadable(Step{Seq: 1, Kind: StepTool, Status: status})
+			assert.Equal(t, !status.Done() && !slices.Contains(walked, status), unread,
+				"rule 2 and the walk disagree about a tool step that is %q", status)
+		}
 	})
 }
 

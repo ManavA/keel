@@ -103,42 +103,50 @@ func turnResults(turn int, after []Step) []Result {
 //     child has ended. Any other waiting step goes by the approval for its
 //     current attempt: approved, it is run; pending, it is passed over;
 //     declined, expired or cancelled, the no is recorded.
-//  5. Steps were passed over and nothing else could be done: the run parks,
-//     for a person when any step waits on one, and else for its children.
+//     With a budget spent, a step that calls for work is held back and the
+//     walk goes on, so that what does no work is still done: an ended child
+//     is collected, its usage being the run's, and a person's no recorded.
+//  5. The walk gave no action. If it held work back, the run fails for its
+//     budget. Else, if it passed steps over, the run parks: for a person
+//     when any step waits on one, and for its children otherwise.
 //  6. No tool step is open: the model is called, or called again where its
 //     call was interrupted, or the run completes with the last reply's text.
+//     A budget that is spent fails the run in place of a model call, and
+//     the limit on model calls is one of those here and nowhere else.
 //
-// Over them sits the budget. Once one is spent, no step is judged, run,
-// spawned or asked about, and the model is not called. The walk still gives
-// what does no work, collecting an ended child (whose usage belongs in the
-// run's totals) and recording a person's no, and the run fails for its
-// budget only when the walk has none of those left. A run whose work is done
-// is never failed for its budget.
+// So once a budget is spent no step is judged, run, spawned or asked about
+// and the model is not called, and a run whose work is done is never failed
+// for its budget. The design's 6.5 numbers the rules as they are here.
 //
 // A journal this build cannot make sense of gives the run up, with actYield
-// and what was found, at the point in that order where it is met: rule 2's
-// steps and rule 3's stop; a waiting step whose child was not given, or
-// that has no approval for its current attempt, or whose approval has a
-// status this build does not know; a started at-most-once step that already
-// has an approval for its current attempt, which asking again would only
-// hand back; a last reply that made no calls and did not end or pause. The
-// run is not ended for it: ending cannot be undone, and what this build
+// and what was found, at the point in that order where it is met: the steps
+// of rule 2 and the stop of rule 3; in rule 4, a waiting step whose child
+// was not given, or that has no approval for its current attempt, or whose
+// approval has a status this build does not know, and a started at-most-once
+// step that already has an approval for its current attempt, which asking
+// again would only hand back; in rule 6, a last reply that made no calls
+// and did not end or pause.
+//
+// The run is not ended for it: ending cannot be undone, and what this build
 // cannot read may be a newer build's writing during a deploy, or the
 // executor's mistake. Given up as a failed attempt, the run waits out its
 // back-off and is claimed again, by a worker that can read it or after a
 // fix; if none can, the limit on failed attempts ends it, with the same
 // message. Parking it instead would leave nothing to wake it.
 func next(run Run, def Definition, steps []Step, approvals []Approval, children map[string]Run) action {
+	// Rule 1.
 	if run.CancelRequested {
 		return action{kind: actFinish, status: StatusCancelled, reason: ReasonCancelled}
 	}
 
+	// Rule 2.
 	for _, st := range steps {
 		if a, unread := unreadable(st); unread {
 			return a
 		}
 	}
 
+	// Rule 3.
 	if last := lastModelStep(steps); last != nil && last.Status == StepCompleted {
 		switch last.Stop {
 		case StopRefusal:
@@ -153,9 +161,17 @@ func next(run Run, def Definition, steps []Step, approvals []Approval, children 
 		}
 	}
 
+	return proceed(run, def, steps, approvals, children)
+}
+
+// proceed applies rules 4 to 6 of next to a journal that rules 1 to 3 have
+// let through: every step is one this build can read, and the last reply is
+// a turn or is not there yet.
+func proceed(run Run, def Definition, steps []Step, approvals []Approval, children map[string]Run) action {
 	// over is the budget that is spent, if one is. held records that it kept
 	// a step from being worked on, and onPerson and onChild the steps passed
-	// over because nothing can be done for them yet.
+	// over because nothing can be done for them yet. Rule 4 is the loop and
+	// rule 5 the switch after it.
 	over := spent(run, false)
 	held, onPerson, onChild := false, false, false
 	for _, st := range steps {
@@ -221,6 +237,13 @@ func next(run Run, def Definition, steps []Step, approvals []Approval, children 
 			default:
 				return giveUp("step %d's approval has the status %q", st.Seq, asked.Status)
 			}
+
+		default:
+			// Rule 2 lets through only the statuses read here and the final
+			// ones passed over above. Should the two fall out of step, the
+			// run is given up; a would otherwise be returned with no kind,
+			// which is a finish with no status.
+			return giveUp("step %d has the status %q", st.Seq, st.Status)
 		}
 		if over != "" {
 			held = true
@@ -237,10 +260,10 @@ func next(run Run, def Definition, steps []Step, approvals []Approval, children 
 		return action{kind: actPark, reason: ReasonChildren}
 	}
 
-	// No tool step is open, so what the journal ends with says what is next:
-	// nothing or a call's result, and the model is owed a turn; a model step
-	// still started, and its call is made again; a reply that made no calls,
-	// and its stop decides.
+	// Rule 6. No tool step is open, so what the journal ends with says what
+	// is next: nothing or a call's result, and the model is owed a turn; a
+	// model step still started, and its call is made again; a reply that
+	// made no calls, and its stop decides.
 	if len(steps) == 0 || steps[len(steps)-1].Kind == StepTool {
 		return callModel(run, len(steps)+1)
 	}
