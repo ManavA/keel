@@ -673,6 +673,81 @@ func fencingCases() []storeCase {
 		}
 	}
 
+	// The refusals a store makes for the state of the journal and not for
+	// the request alone. Each is looked for after the fence: a stale lease
+	// is told its lease is lost, and not what the run's new holder would be
+	// told. arm journals what makes the call one the store refuses, and
+	// returns the call.
+	refusals := []struct {
+		name string
+		arm  func(k *kit, held agent.Lease) (call func(lease agent.Lease) error)
+		// conflict says the refusal is ErrConflict; otherwise it is an error
+		// of the store's own.
+		conflict bool
+	}{
+		{"RequestApproval under an approval id already in use", func(k *kit, held agent.Lease) func(agent.Lease) error {
+			_, otherLease := k.proposed(agentAlpha)
+			taken := k.ask(otherLease, 2, nil)
+			k.reply(held, Call("call-1", toolSend, sendInput))
+			return func(lease agent.Lease) error {
+				req := k.askRequest(2)
+				req.ID = taken.ID
+				_, err := k.store.RequestApproval(k.ctx, lease, req)
+				return err
+			}
+		}, false},
+		{"RequestApproval for a seq that names no step", func(k *kit, held agent.Lease) func(agent.Lease) error {
+			k.reply(held, Call("call-1", toolSend, sendInput))
+			return func(lease agent.Lease) error {
+				_, err := k.store.RequestApproval(k.ctx, lease, k.askRequest(3))
+				return err
+			}
+		}, true},
+		{"RequestApproval for a model step", func(k *kit, held agent.Lease) func(agent.Lease) error {
+			k.reply(held, Call("call-1", toolSend, sendInput))
+			return func(lease agent.Lease) error {
+				_, err := k.store.RequestApproval(k.ctx, lease, k.askRequest(1))
+				return err
+			}
+		}, true},
+		{"CompleteModel with calls on a step that is not the journal's last", func(k *kit, held agent.Lease) func(agent.Lease) error {
+			require.NoError(k.t, k.store.BeginModel(k.ctx, held, 1, k.tick()))
+			require.NoError(k.t, k.store.BeginModel(k.ctx, held, 2, k.tick()))
+			return func(lease agent.Lease) error {
+				return k.store.CompleteModel(k.ctx, lease, agent.CompleteModelRequest{
+					Seq:     1,
+					Message: Use(Call("call-1", toolLookup, lookupInput)).Message,
+					Stop:    agent.StopToolUse,
+					Model:   suiteModel,
+					Now:     k.tick(),
+				})
+			}
+		}, true},
+	}
+	for _, r := range refusals {
+		for _, l := range losses {
+			cases = append(cases, storeCase{r.name + " " + l.name + " is ErrLeaseLost", func(k *kit) {
+				run, held := k.held(agentAlpha)
+				call := r.arm(k, held)
+				stale, current := l.lose(k, held)
+				before := k.snapshot(run.ID)
+
+				err := call(stale)
+
+				require.ErrorIs(k.t, err, agent.ErrLeaseLost)
+				k.unchanged(before)
+				// Under the lease that holds the run the store refuses the
+				// call for what it asks, so the fence came first.
+				err = call(current())
+				require.Error(k.t, err)
+				require.NotErrorIs(k.t, err, agent.ErrLeaseLost)
+				if r.conflict {
+					require.ErrorIs(k.t, err, agent.ErrConflict)
+				}
+			}})
+		}
+	}
+
 	cases = append(cases,
 		storeCase{"a write under a lease that has lapsed but not been taken goes through", func(k *kit) {
 			run, lease := k.held(agentAlpha)
