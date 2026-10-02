@@ -16,6 +16,10 @@ type Options struct {
 	Now func() time.Time
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
+	// MemoryRecords is how many of the most recent decisions the default
+	// in-memory recorder keeps. Zero or less keeps 1000. It has no effect when
+	// Recorder is set.
+	MemoryRecords int
 }
 
 // Decider decides actions under one Policy and records every decision.
@@ -27,15 +31,20 @@ type Decider struct {
 }
 
 // NewDecider builds a Decider. It returns an error when p does not validate.
-// The Decider keeps its own copy of the rules, so changing p afterwards
-// changes nothing; to change the rules, build another Decider.
+// The Decider takes a deep copy of the rules, every list and every value in
+// them, so nothing the caller does to p afterwards, from any goroutine, changes
+// the Decider; to change the rules, build another one.
 func NewDecider(p Policy, opts Options) (*Decider, error) {
 	if err := p.check(); err != nil {
 		return nil, fmt.Errorf("policy: new decider: %w", err)
 	}
 	d := &Decider{policy: p.clone(), rec: opts.Recorder, now: opts.Now, log: opts.Logger}
 	if d.rec == nil {
-		d.rec = NewMemoryRecorder()
+		keep := opts.MemoryRecords
+		if keep <= 0 {
+			keep = defaultMemoryRecords
+		}
+		d.rec = newMemoryRecorder(keep)
 	}
 	if d.now == nil {
 		d.now = time.Now
@@ -48,10 +57,13 @@ func NewDecider(p Policy, opts Options) (*Decider, error) {
 
 // Decide decides a and records the decision. When the record cannot be
 // written it returns the error and a zero Decision, whose empty Effect no
-// caller may read as Allow.
+// caller may read as Allow. The Recorder is handed a copy of the action and the
+// decision, so neither it nor the caller can change what the other holds.
+//
+// A Recorder that panics takes Decide with it: no Decision is returned.
 func (d *Decider) Decide(ctx context.Context, a Action) (Decision, error) {
 	dec := d.policy.Decide(a)
-	rec := Record{At: d.now(), Action: a, Decision: dec, Version: d.policy.Version}
+	rec := Record{At: d.now(), Action: a.clone(), Decision: dec.clone(), Version: d.policy.Version}
 	if err := d.rec.Record(ctx, rec); err != nil {
 		// The action's own facts are left out: they may be what made it sensitive.
 		d.log.ErrorContext(ctx, "record policy decision",
@@ -61,18 +73,23 @@ func (d *Decider) Decide(ctx context.Context, a Action) (Decision, error) {
 	return dec, nil
 }
 
-// Policy returns the rules this Decider decides under. The result is a copy.
+// Policy returns the rules this Decider decides under, as a deep copy: changing
+// it changes nothing in the Decider.
 func (d *Decider) Policy() Policy {
 	return d.policy.clone()
 }
 
-// clone copies the rule list and the lists inside each rule. The values in a
-// condition are not copied.
+// clone copies the rule list, the lists inside each rule, and every value in a
+// condition, however deeply it nests.
 func (p Policy) clone() Policy {
 	p.Rules = slices.Clone(p.Rules)
 	for i := range p.Rules {
-		p.Rules[i].When.Kinds = slices.Clone(p.Rules[i].When.Kinds)
-		p.Rules[i].When.Attrs = slices.Clone(p.Rules[i].When.Attrs)
+		w := &p.Rules[i].When
+		w.Kinds = slices.Clone(w.Kinds)
+		w.Attrs = slices.Clone(w.Attrs)
+		for j := range w.Attrs {
+			w.Attrs[j].Value = copyValue(w.Attrs[j].Value)
+		}
 	}
 	return p
 }

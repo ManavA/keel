@@ -14,8 +14,9 @@ import (
 	"github.com/ManavA/keel/policy"
 )
 
-// holds reports whether m matches a, through the exported surface: a policy of
-// one rule that allows what m matches, under the default that blocks the rest.
+// holds reports whether m matches a for certain, through the exported surface:
+// a policy of one rule that allows what m matches, under the default that
+// blocks the rest. An allow rule does not match what cannot be told.
 func holds(m policy.Match, a policy.Action) bool {
 	d := policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Allow, When: m}}}.Decide(a)
 	return d.Index == 0
@@ -80,8 +81,8 @@ func TestMatch_Target(t *testing.T) {
 		{name: "a pattern that matches nothing", pattern: "no-such-target-*", target: "email:ap@example.com", want: false},
 		{name: "a literal pattern against no target", pattern: "email:x", target: "", want: false},
 		{name: "star matches an action with no target", pattern: "*", target: "", want: true},
-		{name: "a pattern that does not compile matches nothing", pattern: "[", target: "[", want: false},
-		{name: "a pattern that does not compile matches nothing, though an earlier part mismatches", pattern: "x[", target: "y", want: false},
+		{name: "a pattern that does not compile does not match an allow rule", pattern: "[", target: "[", want: false},
+		{name: "a pattern that does not compile does not match an allow rule, though an earlier part mismatches", pattern: "x[", target: "y", want: false},
 		{name: "an empty pattern is every target", pattern: "", target: "anything", want: true},
 	}
 	for _, tt := range tests {
@@ -121,9 +122,12 @@ func TestMatch_Conditions(t *testing.T) {
 		{name: "ne: different booleans", m: cond("b", policy.OpNe, true), attrs: attrs("b", false), want: true},
 		{name: "ne: equal numbers", m: cond("n", policy.OpNe, 5), attrs: attrs("n", 5.0), want: false},
 		{name: "ne: different numbers", m: cond("n", policy.OpNe, 5), attrs: attrs("n", 6), want: true},
-		{name: "ne: a present attribute of another type is not equal", m: cond("n", policy.OpNe, 5), attrs: attrs("n", "five"), want: true},
-		// Decide on a policy Validate refuses: a value eq and ne cannot compare
-		// with makes the condition fail, ne no less than eq, not hold by accident.
+		// An attribute of another type cannot be compared, which is not the same
+		// as being unequal: an allow rule does not match, and a block rule does
+		// (see unclear_test.go).
+		{name: "ne: a present attribute of another type cannot be told, so an allow rule does not match", m: cond("n", policy.OpNe, 5), attrs: attrs("n", "five"), want: false},
+		// Decide on a policy Validate refuses: a condition that cannot be
+		// evaluated does not match an allow rule, ne no less than eq.
 		{name: "ne: a nil value never holds", m: cond("n", policy.OpNe, nil), attrs: attrs("n", 5), want: false},
 		{name: "ne: a list value never holds", m: cond("n", policy.OpNe, []any{"a"}), attrs: attrs("n", "b"), want: false},
 		{name: "ne: a map value never holds", m: cond("n", policy.OpNe, map[string]any{}), attrs: attrs("n", "b"), want: false},
@@ -577,12 +581,21 @@ func TestDecide_AnUnknownEffectIsBlock(t *testing.T) {
 	}
 }
 
-func TestDecide_APatternThatDoesNotCompileDoesNotMatch(t *testing.T) {
-	p := policy.Policy{Default: policy.Allow, Rules: []policy.Rule{
+// A block rule whose pattern does not compile is a rule that cannot be told, not
+// a rule that does not apply: it blocks, and says why. Only an allow rule is
+// passed over.
+func TestDecide_APatternThatDoesNotCompileBlocksUnderABlockRule(t *testing.T) {
+	block := policy.Policy{Default: policy.Allow, Rules: []policy.Rule{
 		{Name: "broken", Effect: policy.Block, When: policy.Match{Target: "email:["}},
 	}}
-	got := p.Decide(policy.Action{Kind: "send", Target: "email:["})
-	assert.Equal(t, policy.Decision{Effect: policy.Allow, Rule: policy.RuleDefault, Index: -1}, got)
+	got := block.Decide(policy.Action{Kind: "send", Target: "email:["})
+	assert.Equal(t, policy.Decision{Effect: policy.Block, Rule: "broken", Index: 0, Matched: []string{"broken"}, Uncertain: []string{"target pattern"}}, got)
+
+	allow := policy.Policy{Default: policy.Block, Rules: []policy.Rule{
+		{Name: "broken", Effect: policy.Allow, When: policy.Match{Target: "email:["}},
+	}}
+	got = allow.Decide(policy.Action{Kind: "send", Target: "email:["})
+	assert.Equal(t, policy.Decision{Effect: policy.Block, Rule: policy.RuleDefault, Index: -1}, got)
 }
 
 func TestDecide_IsPure(t *testing.T) {

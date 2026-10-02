@@ -3,6 +3,7 @@ package policy_test
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -70,6 +71,113 @@ func TestMemoryRecorder_CopiesWhatItKeepsAndWhatItReturns(t *testing.T) {
 	})
 }
 
+// tagged is a struct an attribute might hold, with a list inside it.
+type tagged struct {
+	Name string
+	Tags []string
+}
+
+// A nested list or object the caller holds a reference to is as much a part of
+// the record as the attribute map is.
+func TestMemoryRecorder_CopiesNestedValuesToo(t *testing.T) {
+	nested := func() policy.Record {
+		rec := record("send")
+		tags := []string{"p", "q"}
+		rec.Action.Attrs = map[string]any{
+			"list":    []any{"x", []any{"y", "z"}},
+			"obj":     map[string]any{"k": []string{"v"}, "m": map[string]any{"deep": []int{1, 2}}},
+			"typed":   []string{"a", "b"},
+			"array":   [2]int{1, 2},
+			"lists":   [1][]string{{"m", "n"}},
+			"pointer": &tags,
+			"struct":  tagged{Name: "n", Tags: []string{"s", "t"}},
+			"pstruct": &tagged{Name: "m", Tags: []string{"u", "v"}},
+			"scalar":  1,
+		}
+		rec.Decision.Uncertain = []string{"list"}
+		return rec
+	}
+
+	t.Run("a nested value changed after it was recorded is not changed in the log", func(t *testing.T) {
+		m := policy.NewMemoryRecorder()
+		rec := nested()
+		require.NoError(t, m.Record(t.Context(), rec))
+
+		rec.Action.Attrs["list"].([]any)[0] = "changed"
+		rec.Action.Attrs["list"].([]any)[1].([]any)[0] = "changed"
+		rec.Action.Attrs["obj"].(map[string]any)["k"].([]string)[0] = "changed"
+		rec.Action.Attrs["obj"].(map[string]any)["m"].(map[string]any)["deep"].([]int)[0] = 99
+		rec.Action.Attrs["typed"].([]string)[0] = "changed"
+		(*rec.Action.Attrs["pointer"].(*[]string))[0] = "changed"
+		rec.Action.Attrs["lists"].([1][]string)[0][0] = "changed"
+		rec.Action.Attrs["struct"].(tagged).Tags[0] = "changed"
+		rec.Action.Attrs["pstruct"].(*tagged).Tags[0] = "changed"
+		rec.Action.Attrs["pstruct"].(*tagged).Name = "changed"
+		rec.Decision.Uncertain[0] = "changed"
+
+		got := m.Records()
+		require.Len(t, got, 1)
+		assert.Equal(t, nested(), got[0])
+	})
+
+	t.Run("a nested value read back and changed is not changed in the log", func(t *testing.T) {
+		m := policy.NewMemoryRecorder()
+		require.NoError(t, m.Record(t.Context(), nested()))
+
+		got := m.Records()
+		require.Len(t, got, 1)
+		got[0].Action.Attrs["list"].([]any)[1].([]any)[0] = "changed"
+		got[0].Action.Attrs["obj"].(map[string]any)["m"].(map[string]any)["deep"].([]int)[1] = 99
+		(*got[0].Action.Attrs["pointer"].(*[]string))[1] = "changed"
+		got[0].Action.Attrs["pstruct"].(*tagged).Tags[1] = "changed"
+		got[0].Decision.Uncertain[0] = "changed"
+
+		again := m.Records()
+		require.Len(t, again, 1)
+		assert.Equal(t, nested(), again[0])
+	})
+
+	t.Run("two reads share nothing", func(t *testing.T) {
+		m := policy.NewMemoryRecorder()
+		require.NoError(t, m.Record(t.Context(), nested()))
+		a, b := m.Records(), m.Records()
+		a[0].Action.Attrs["list"].([]any)[0] = "changed"
+		assert.Equal(t, "x", b[0].Action.Attrs["list"].([]any)[0])
+	})
+}
+
+// A value that refers to itself cannot be copied to the end, so it is copied to
+// a bound and the rest is shared: Record returns, instead of looping.
+func TestMemoryRecorder_AValueThatRefersToItselfIsCopiedToABound(t *testing.T) {
+	self := map[string]any{"name": "loop"}
+	self["self"] = self
+	rec := record("send")
+	rec.Action.Attrs = map[string]any{"loop": self}
+
+	m := policy.NewMemoryRecorder()
+	require.NoError(t, m.Record(t.Context(), rec))
+	got := m.Records()
+	require.Len(t, got, 1)
+	loop, ok := got[0].Action.Attrs["loop"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "loop", loop["name"])
+
+	// Following the copy's own reference to itself, it comes back to the
+	// original after the bound and not after a million steps.
+	var current any = loop
+	steps := 0
+	for ; steps < 200; steps++ {
+		next, ok := current.(map[string]any)
+		require.True(t, ok)
+		if reflect.ValueOf(next).Pointer() == reflect.ValueOf(self).Pointer() {
+			break
+		}
+		current = next["self"]
+	}
+	assert.Greater(t, steps, 1, "the copy is a copy")
+	assert.Less(t, steps, 200, "and it ends")
+}
+
 func TestMemoryRecorder_IsSafeForConcurrentUse(t *testing.T) {
 	const writers, each = 16, 50
 	m := policy.NewMemoryRecorder()
@@ -117,6 +225,15 @@ func TestRecord_JSON(t *testing.T) {
 			name: "every field",
 			rec:  record("send"),
 			want: `{"at":"2026-10-02T09:00:00Z","action":{"kind":"send","target":"t:send","attrs":{"external":true}},"decision":{"decision":"ask","rule":"r","index":2,"matched":["r","s"]},"version":"v1"}`,
+		},
+		{
+			name: "a decision reached on something that could not be told",
+			rec: policy.Record{
+				At:       recordTime,
+				Action:   policy.Action{Kind: "pay", Attrs: map[string]any{"amount": "1250"}},
+				Decision: policy.Decision{Effect: policy.Ask, Rule: "r", Index: 0, Matched: []string{"r"}, Uncertain: []string{"amount"}},
+			},
+			want: `{"at":"2026-10-02T09:00:00Z","action":{"kind":"pay","attrs":{"amount":"1250"}},"decision":{"decision":"ask","rule":"r","index":0,"matched":["r"],"uncertain":["amount"]}}`,
 		},
 		{
 			name: "no version",

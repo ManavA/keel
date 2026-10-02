@@ -1195,7 +1195,9 @@ this.
 The reference is `web/src/demos/permissions/logic.ts` in the hanaML
 repository, with its tests in `web/test/demos/permissions.test.ts`.
 
-1. Every rule whose `When` matches the action is a match.
+1. A rule whose `When` holds for the action is a match, and one whose
+   `When` cannot be told is a match unless its effect is allow (the three
+   values are set out below).
 2. The effects are ordered allow, ask, block.
 3. The decision is the first match of the greatest strictness: walking the
    rules in order, a match replaces the best so far only when it is strictly
@@ -1206,16 +1208,62 @@ repository, with its tests in `web/test/demos/permissions.test.ts`.
 
 A `Match` holds when every part that is set holds:
 
-- `Kinds`: the action's kind is one of them.
-- `Target`: `path.Match(pattern, action.Target)` is true. A pattern that
-  does not compile is a validation error.
+- `Kinds`: the action's kind is one of them. Empty is every kind.
+- `Target`: `path.Match(pattern, action.Target)` is true. Empty is every
+  target. The target is matched as written, with no normalisation: no case
+  folding, no trimming, no cleaning of dots or slashes. A block rule by
+  target is therefore passed by any other spelling of the same thing, and
+  whatever builds an `Action` (the `app` adapter, the example's tools) puts
+  targets in one canonical spelling before asking for a decision. `*` matches
+  any run of characters but a slash, `?` one character but a slash,
+  `[a-z]` and `[^a-z]` a class, and `\` makes the next character literal.
+  A pattern that does not compile is a validation error, and so is a bare
+  `*`, which matches no target that holds a slash: an empty target is every
+  target.
 - `Attrs`: every `Cond` holds. A condition on an attribute the action does
-  not carry never holds, except `OpExists` with value `false`. Numbers
-  compare as numbers whatever their Go type (`int`, `int64`, `float64`,
-  `json.Number`); `OpEq` and `OpNe` also compare strings and booleans;
-  `OpGt`, `OpGte`, `OpLt`, `OpLte` hold only between numbers; `OpIn` holds
-  when the attribute equals any element of the list in `Value`; `OpExists`
-  compares presence with the boolean in `Value`.
+  not carry does not hold, for every operator, `OpNe` included, except
+  `OpExists` with value `false`; an author who means "block unless the
+  attribute is present and equal" adds an `OpExists` condition, as the
+  package comment shows. Numbers compare as numbers, exactly, whatever
+  holds them (an integer type, a float type, `json.Number`); `OpEq` and
+  `OpNe` also compare strings and booleans; `OpGt`, `OpGte`, `OpLt`, `OpLte`
+  hold only between numbers; `OpIn` holds when the attribute equals any
+  element of the list in `Value`; `OpExists` compares presence with the
+  boolean in `Value`.
+
+**Three values.** A condition holds, does not hold, or cannot be told. It
+cannot be told when the attribute is present but its type is one the
+operator cannot compare: a string where a number is wanted, a boolean, a
+list, a pointer, `null`, NaN, a number written too long to compare, or a
+type different from the one the value is (`OpEq` of the number 5 against the
+string `"5"`). It also cannot be told when the condition itself is
+malformed, which only a `Policy` that skipped `Validate` can have: an
+operator that is not listed, or a value its operator cannot use. A target
+pattern that does not compile, on such a `Policy`, cannot be told either. A
+rule matches for certain when every condition holds, and does not match when
+any condition does not hold, whatever else cannot be told. When no condition
+fails but at least one cannot be told, a rule whose effect is ask or block
+matches and a rule whose effect is allow does not. What cannot be evaluated
+therefore counts toward the stricter outcome, and a model that writes an
+amount as the string `"1250"` cannot walk round a limit by it. Strings are
+never read as numbers.
+
+A decision reached that way says so. `Decision.Uncertain` names each
+attribute whose condition could not be told, in the order of the conditions
+(`"target pattern"` and `"kinds list"` for those parts of a malformed rule),
+so the record explains why a rule whose condition looks unmet decided. It is
+empty when the deciding rule matched for certain, and it belongs to the rule
+that decided, not to others that also matched.
+
+**Numbers.** A number is compared exactly. An integer is itself. A float is
+the shortest decimal that gives it back, so a `float64` 0.1 is the number
+0.1 and meets a threshold written 0.1; comparing the binary value instead
+would leave 0.3 below a threshold of 0.3. A `json.Number` is the decimal it
+spells, of any size or precision up to 4096 bytes of text and an exponent of
+4096, which bounds what a hostile value can cost; text past either bound, or
+that is not a JSON number (no plus sign, no leading zero, no `Infinity`), is
+not a number, so cannot be told. `Parse` keeps every number in a policy as a
+`json.Number`, so a threshold is never passed through a `float64`.
 
 The reference's policy is a fixed shape; in Go it is this rule list, in this
 order, and the port of the reference's tests builds it with a test helper:
@@ -1230,8 +1278,17 @@ order, and the port of the reference's tests builds it with a test helper:
 Under that list every case in the reference's tests gives the same decision
 and the same rule name, including a payment with no amount (the condition
 does not hold, as `undefined ?? 0` is not above the limit) and
-`external: false` (not a match). This was checked against a prototype of
-the algorithm while writing this document.
+`external: false` (not a match). A grid of 21,870 policies and actions, with
+the reference's answer to each stored in `policy/testdata`, holds the Go
+code to it as a standing test.
+
+Go differs from the reference in two places, on purpose. The reference
+reads a missing amount as 0, where Go reads the attribute as absent; the two
+agree for every limit from 0 up, which is the demonstration's range, and
+differ below it. And the reference compares an amount that is not a number
+as JavaScript does, where Go cannot tell: `"1250"` asks in both, but `"50"`,
+`"abc"`, `null` and NaN are allowed by the reference's coercion and asked
+about by Go.
 
 Two names differ, and one function is not carried over:
 
@@ -1240,7 +1297,7 @@ Two names differ, and one function is not carried over:
   person said yes, and a timeline reading "decision: approve" for a call
   still waiting would mislead. `Effect.UnmarshalText` reads `"approve"` as
   `Ask`, so a reference fixture decodes unchanged. A `Decision` marshals as
-  `{"decision": …, "rule": …}`, the reference's `Verdict`.
+  `{"decision": …, "rule": …, …}`, the reference's `Verdict` and more.
 - `sortActions` is `Policy.Group`.
 - `clampLimit` clamps a number typed into the demonstration's form. It is
   not policy and is not ported.
@@ -1347,13 +1404,21 @@ type Decision struct {
 	Index int `json:"index"`
 	// Matched names every rule that matched, in order.
 	Matched []string `json:"matched,omitempty"`
+	// Uncertain is set when Rule decided without every one of its conditions
+	// holding: a condition could not be told, and an ask or block rule counts
+	// that against the action. It names each attribute whose value a condition
+	// could not compare, and "target pattern" or "kinds list" for a part of
+	// the rule that could not be evaluated. It is empty when Rule matched for
+	// certain.
+	Uncertain []string `json:"uncertain,omitempty"`
 }
 
 // Validate reports the first thing wrong with p.
 func (p Policy) Validate() error
 
 // Decide gives the decision for a. It is pure: it reads nothing but p and a,
-// and records nothing.
+// and records nothing. A condition that cannot be told counts toward the
+// stricter outcome: see 5.2.
 func (p Policy) Decide(a Action) Decision
 
 // Judged is an action with its decision.
@@ -1372,8 +1437,10 @@ type Grouped struct {
 // Group decides every action and sorts them by effect.
 func (p Policy) Group(actions []Action) Grouped
 
-// Parse reads a policy from its JSON form and validates it. An unknown field
-// is an error.
+// Parse reads a policy from its JSON form and validates it. The document must
+// be a JSON object. An unknown field is an error, and so is a key repeated in
+// any object, compared without regard to case. Numbers are kept as written,
+// as json.Number.
 func Parse(data []byte) (Policy, error)
 
 // Record is one decision as it is logged.
@@ -1390,7 +1457,8 @@ type Recorder interface {
 	Record(ctx context.Context, rec Record) error
 }
 
-// MemoryRecorder is the in-process Recorder.
+// MemoryRecorder is the in-process Recorder. It keeps the most recent 1000
+// decisions, and what it keeps and returns are deep copies.
 type MemoryRecorder struct{ /* unexported fields */ }
 
 // NewMemoryRecorder builds an empty MemoryRecorder.
@@ -1410,12 +1478,18 @@ type Options struct {
 	Now func() time.Time
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
+	// MemoryRecords is how many of the most recent decisions the default
+	// in-memory recorder keeps. Zero or less keeps 1000. It has no effect when
+	// Recorder is set.
+	MemoryRecords int
 }
 
 // Decider decides actions under one Policy and records every decision.
 type Decider struct{ /* unexported fields */ }
 
 // NewDecider builds a Decider. It returns an error when p does not validate.
+// The Decider takes a deep copy of the rules, every list and every value in
+// them.
 func NewDecider(p Policy, opts Options) (*Decider, error)
 
 // Decide decides a and records the decision. When the record cannot be
@@ -1423,7 +1497,7 @@ func NewDecider(p Policy, opts Options) (*Decider, error)
 // caller may read as Allow.
 func (d *Decider) Decide(ctx context.Context, a Action) (Decision, error)
 
-// Policy returns the rules this Decider decides under.
+// Policy returns the rules this Decider decides under, as a deep copy.
 func (d *Decider) Policy() Policy
 
 var _ Recorder = (*MemoryRecorder)(nil)
@@ -1465,10 +1539,23 @@ has an element that is not a number, a string or a boolean; and a kind in
 `Match.Kinds` that is the empty string, which names no action. The empty
 `Kinds`, `Target` and `Attrs` are not refused: the field comments above say
 each means every kind, every target and no condition. Two conditions that
-contradict one another are not detected.
+contradict one another are not detected, with one exception: `OpExists` with
+value `false`, which says the attribute is absent, is refused together with
+any other condition on the same attribute, since an absent attribute meets
+none. A bare `*` target is refused, with a message that says to leave the
+target empty for every target. A rule named `RuleDefault` is refused, since
+the record would then not say whether a rule matched.
 
-`Parse` decodes with unknown fields disallowed and then validates, so a
-serialised policy with any of these cannot be loaded.
+`Parse` first reads the document once to refuse what the decoder would take
+without a word: a document that is not an object (`null` is not an empty
+policy), a key repeated in any object at any depth (compared without regard
+to case, since the decoder matches keys that way, and the later of
+`"effect":"block","effect":"allow"` would otherwise win), and anything after
+the document. The error names the key and where it is. It then decodes with
+unknown fields disallowed, keeping every number as a `json.Number`, and
+validates, so a serialised policy with any of these cannot be loaded, and a
+`Parse(Marshal(p))` is `p` when `p`'s numbers are `json.Number` values, as
+`Parse` returns them.
 
 *package pg: policy/pg/store.go, migrations.go*
 
@@ -1534,6 +1621,7 @@ CREATE TABLE IF NOT EXISTS policy_decisions (
     rule           TEXT NOT NULL,
     rule_index     INTEGER NOT NULL,
     matched        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    uncertain      JSONB NOT NULL DEFAULT '[]'::jsonb,
     policy_version TEXT NOT NULL DEFAULT ''
 );
 
@@ -1541,6 +1629,12 @@ CREATE TABLE IF NOT EXISTS policy_decisions (
 CREATE INDEX IF NOT EXISTS policy_decisions_decided_idx ON policy_decisions (decided_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS policy_decisions_rule_idx ON policy_decisions (rule, id DESC);
 ```
+
+`attrs`, `matched` and `uncertain` are written as `{}`, `[]` and `[]` when
+the record's own are nil, never as JSON `null`, and `decided_at` is stored in
+UTC. `uncertain` is what `Decision.Uncertain` carries: the attributes a
+decision could not tell, so a reviewer reading the table sees why an ask or
+block rule decided on a condition that looks unmet.
 
 The down file drops the two indexes and the table.
 
@@ -1554,25 +1648,37 @@ unexported interface, as `jobs/pg` does.
 
 `Policy.Decide` is pure and total: it cannot fail, reads nothing but its
 arguments, and may be called from any number of goroutines. A `Decider` is
-immutable after `NewDecider`; changing the rules means building another.
+immutable after `NewDecider`: it holds a deep copy of the policy, every
+list and nested value, and `Policy()` hands out another, so nothing a caller
+does afterwards, from any goroutine, changes the rules it decides under; to
+change the rules, build another. A `Recorder` is handed a deep copy of the
+record, so neither side can change what the other holds. What Go cannot
+copy (a function, a channel, the unexported fields of a struct) is shared.
 
 `Decider.Decide` computes the decision and then records it. If the record
 cannot be written, it returns the error and a zero `Decision`. The zero
 `Effect` is not `Allow`, and every caller in this design treats an effect
 that is not one of the three as block, so a decision that could not be
-recorded is never acted on as an allow. The decision log is append-only:
-`policy/pg` has an insert and a read, and no update or delete.
+recorded is never acted on as an allow. A `Recorder` that panics takes
+`Decide` with it, and no decision is returned. The decision log is
+append-only: `policy/pg` has an insert and a read, and no update or delete.
 
 An invalid policy cannot reach `Decide` through a `Decider`, since
 `NewDecider` validates. Called on a `Policy` value directly, `Decide` treats
-a rule with an unknown effect as block, and a pattern that does not compile,
-or a condition whose operator is not listed or whose value its operator
-cannot use, as not matching. The other forms `Validate` refuses are decided
-as written.
+a rule with an unknown effect as block, and a rule whose match cannot be
+evaluated (a pattern that does not compile, a condition with an operator
+that is not listed or a value its operator cannot use, a list of kinds with
+an empty entry) as cannot be told: it matches unless its effect is allow,
+and says so in `Decision.Uncertain`. "Does not match" would be the safe
+reading only for an allow rule. The other forms `Validate` refuses are
+decided as written.
 
 ### 5.7 In-process default
 
-`MemoryRecorder`, which is what `Options.Recorder` is when nil.
+`MemoryRecorder`, which is what `Options.Recorder` is when nil. It keeps the
+most recent 1000 decisions, or `Options.MemoryRecords`, and drops the
+oldest: with the zero `Options` it cannot be read, so it must not grow with
+every decision.
 
 ### 5.8 Tests
 
@@ -1583,15 +1689,27 @@ Without a database:
   port lives in `policy/reference_test.go` and names the file it mirrors.
 - A table over `Match`: each operator, each Go number type against each,
   an absent attribute under each operator, kinds, target patterns.
+- The three values: each operator against each type it cannot compare;
+  conditions combined; a malformed rule under an allow, an ask and a block
+  effect; numbers exactly, including text of any size within the bounds and
+  past them. The reviewer's case: an allow by kind and an ask above a limit,
+  with the amount as a string, a pointer, a list, NaN and a number too large
+  for a `float64`.
+- The grid comparison with the reference, as a standing test against
+  `policy/testdata/reference_grid.json`.
 - No rule matched: `Block` by default, `Policy.Default` when set,
   `RuleDefault` reported, `Index` -1.
 - `Validate`, one case per refusal above. `Parse` round-trip:
-  `Parse(Marshal(p))` equals `p`; an unknown field is an error; `"approve"`
-  decodes as `Ask`.
+  `Parse(Marshal(p))` equals `p`; an unknown field is an error; a repeated
+  key is an error at each level, in any case; a document that is not an
+  object is an error; `"approve"` decodes as `Ask`; thresholds stay exact.
 - `Decider`: each decision is recorded once with the policy's version; a
   recorder that fails yields an error and a zero decision. The case that
   must fail: a test asserting the zero decision is not `Allow`, so that a
   change making the failure path return the computed decision goes red.
+  A cancelled context; a recorder that panics; a policy with conditions,
+  including an `in` list, changed after `NewDecider` and after `Policy()`,
+  and under `-race`; a recorder handed a copy; the bounded memory log.
 
 With `pg/testdb`: `policy/pg` records and lists; filters by effect, rule,
 kind and time; attributes survive the round trip; concurrent records all
@@ -4114,3 +4232,52 @@ chose them.
     which is analysis this package does not do; and a target of `*`, which
     `path.Match` does not let cross a slash, so it does not match a target
     that holds one.
+
+41. **What cannot be evaluated counts toward the stricter outcome.** A
+    condition holds, does not hold, or cannot be told; a rule with nothing
+    that fails and something that cannot be told matches if it asks or
+    blocks, and does not if it allows; the decision names the attribute in
+    `Decision.Uncertain`. Rejected: reading a present attribute of the wrong
+    type as "does not hold", which the first version did. Attributes come
+    from tool input a model wrote, so under "allow by kind, and a payment
+    above 200 asks", an amount written as `"1250"`, a one-element list, a
+    pointer or NaN was allowed, the cheapest way round any limit. Also
+    rejected: reading `"1250"` as a number, which decides on a guess about
+    what the model meant and leaves `"abc"` to be allowed; and returning an
+    error, which stops the run for what a person could settle with one
+    answer. Asking is the outcome that leaves the decision to a person and
+    leaves the reason on the record. The same reading settles a rule that
+    cannot be evaluated at all: "does not match" is safe for an allow rule and
+    for no other.
+
+42. **Numbers are compared exactly, a float as the shortest decimal that
+    gives it back, and `Parse` keeps every number as written.** Rejected:
+    `float64` for everything, which turns `9007199254740993` into
+    `9007199254740992` and a threshold into a different threshold; and the
+    exact binary value of a float, which leaves a `float64` 0.3 below a
+    threshold of 0.3. Text is read to 4096 bytes and an exponent of 4096, and
+    past that cannot be told, because the value is a model's and an exponent
+    of a million is an allocation of that size.
+
+43. **`Parse` refuses what a reader and the decoder would see differently.** A
+    repeated key at any depth, compared as the decoder compares keys, without
+    regard to case, because the later key wins or merges and the file read
+    is not the policy loaded; a document that is not an object, because
+    `null` would load as the empty policy, which blocks everything or
+    allows by default; and a rule named `RuleDefault`, which would make the
+    record ambiguous. `Validate` also refuses a bare `*` target, which
+    reads as every target and matches no target with a slash in it, and
+    `exists false` with another condition on the same attribute, which an
+    absent attribute can never meet. Not refused: conditions that contradict
+    one another in general, which needs analysis this package does not do.
+
+44. **A `Decider` is immutable by copying, and its default log is bounded.**
+    Every list and nested value of its policy is copied in and out, and a
+    `Recorder` is handed a copy. Rejected: sharing a condition's value, which
+    let a caller change a live rule through an `in` list and race with
+    `Decide`. The in-memory log keeps the most recent 1000 decisions,
+    because with the zero `Options` it cannot be reached and growing with
+    every decision is a leak. Targets are matched as written, with no
+    normalisation, so whatever builds an `Action` puts them in one canonical
+    spelling: normalising inside `policy` would pick one spelling for every
+    caller's idea of what a target is.

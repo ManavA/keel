@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"cmp"
 	"encoding/json"
 	"math"
 	"math/big"
@@ -10,25 +11,52 @@ import (
 	"strconv"
 )
 
+// truth is what a condition, or a whole match, comes to for one action. There
+// are three values, because an attribute can arrive as something an operator
+// cannot compare, and calling that "does not hold" lets a rule be walked round
+// by writing the amount as a string.
+type truth uint8
+
+const (
+	unmet   truth = iota // does not hold
+	met                  // holds
+	unclear              // cannot be told
+)
+
+func fromBool(b bool) truth {
+	if b {
+		return met
+	}
+	return unmet
+}
+
 // Decide gives the decision for a. It is pure: it reads nothing but p and a,
 // and records nothing.
 //
 // The decision is the first match of the greatest strictness: a later match
 // replaces the one held only when it is strictly stricter, so of two equally
-// strict rules the earlier is reported. Called on a Policy that did not come
-// through Validate, a rule with an effect that is none of the three counts as
-// Block, and a target pattern that does not compile, or a condition with an
-// operator or a value its operator cannot use, matches nothing. The other forms
-// Validate refuses, such as an empty list of values, are decided as written.
+// strict rules the earlier is reported.
+//
+// A rule matches for certain when every condition of its match holds, and does
+// not match when any does not hold. When none fails but one cannot be told, an
+// ask or block rule matches and an allow rule does not, and Decision.Uncertain
+// says what could not be told. A condition cannot be told when the attribute is
+// present but of a type its operator cannot compare. The same goes for a rule
+// that did not come through Validate and cannot be evaluated: a target pattern
+// that does not compile, or a condition with an operator or a value its
+// operator cannot use. A rule with an effect that is none of the three counts
+// as Block.
 func (p Policy) Decide(a Action) Decision {
 	d := Decision{Index: -1}
 	for i, r := range p.Rules {
-		if !r.When.holds(a) {
+		t, why := r.When.eval(a)
+		e := r.Effect.effective()
+		if t == unmet || (t == unclear && e == Allow) {
 			continue
 		}
 		d.Matched = append(d.Matched, r.Name)
-		if e := r.Effect.effective(); d.Index < 0 || e.rank() > d.Effect.rank() {
-			d.Effect, d.Rule, d.Index = e, r.Name, i
+		if d.Index < 0 || e.rank() > d.Effect.rank() {
+			d.Effect, d.Rule, d.Index, d.Uncertain = e, r.Name, i, why
 		}
 	}
 	if d.Index < 0 {
@@ -54,106 +82,141 @@ func (p Policy) Group(actions []Action) Grouped {
 	return g
 }
 
-// holds reports whether every part of m that is set holds for a.
-func (m Match) holds(a Action) bool {
+// eval reports what m comes to for a: met when every part holds, unmet when
+// any does not, and otherwise unclear, with the names of what could not be
+// told. A part that does not hold settles it whatever else cannot be told.
+func (m Match) eval(a Action) (truth, []string) {
+	var why []string
+	note := func(what string) {
+		if !slices.Contains(why, what) {
+			why = append(why, what)
+		}
+	}
 	if len(m.Kinds) > 0 && !slices.Contains(m.Kinds, a.Kind) {
-		return false
+		// An empty entry names no kind, so the list is not one that can be read.
+		if !slices.Contains(m.Kinds, "") {
+			return unmet, nil
+		}
+		note("kinds list")
 	}
 	if m.Target != "" {
-		if ok, err := path.Match(m.Target, a.Target); err != nil || !ok {
-			return false
+		switch ok, err := path.Match(m.Target, a.Target); {
+		case err != nil:
+			note("target pattern")
+		case !ok:
+			return unmet, nil
 		}
 	}
-	for _, c := range m.Attrs {
-		if !c.holds(a) {
-			return false
+	for i, c := range m.Attrs {
+		switch c.eval(a) {
+		case unmet:
+			return unmet, nil
+		case unclear:
+			name := c.Attr
+			if name == "" {
+				name = "condition " + strconv.Itoa(i)
+			}
+			note(name)
 		}
 	}
-	return true
+	if len(why) > 0 {
+		return unclear, why
+	}
+	return met, nil
 }
 
-// holds reports whether c holds for a. A condition on an attribute the action
-// does not carry never holds, except that exists is false. A condition whose
-// operator is not listed, or whose value the operator cannot compare with,
-// never holds, ne no less than eq.
-func (c Cond) holds(a Action) bool {
+// eval reports what c comes to for a. A malformed condition cannot be told,
+// whether or not the action carries the attribute. Otherwise an attribute the
+// action does not carry does not hold, for every operator but exists with the
+// value false; and one it carries is compared, or cannot be told.
+func (c Cond) eval(a Action) truth {
+	if c.Attr == "" || c.check() != nil {
+		return unclear
+	}
 	v, present := a.Attrs[c.Attr]
 	if c.Op == OpExists {
-		want, ok := boolOf(c.Value)
-		return ok && present == want
+		want, _ := boolOf(c.Value)
+		return fromBool(present == want)
 	}
 	if !present {
-		return false
+		return unmet
 	}
 	switch c.Op {
 	case OpEq, OpNe:
-		if ok, _ := scalar(c.Value); !ok {
-			return false
+		same, ok := compare(v, c.Value)
+		if !ok {
+			return unclear
 		}
-		return equal(v, c.Value) == (c.Op == OpEq)
+		return fromBool(same == (c.Op == OpEq))
 	case OpIn:
 		return in(v, c.Value)
-	case OpGt, OpGte, OpLt, OpLte:
+	default: // gt, gte, lt, lte: check has refused every other operator
 		return ordered(c.Op, v, c.Value)
-	default:
-		return false
 	}
 }
 
-// equal reports whether x and y are the same number, the same string or the
-// same boolean. Values of any other kind, nil and lists among them, are equal
-// to nothing.
-func equal(x, y any) bool {
+// compare reports whether x equals y, and whether the two can be compared at
+// all: two numbers, two strings or two booleans. A value of any other type, or
+// of another type than its partner, cannot be.
+func compare(x, y any) (equal, comparable bool) {
 	if nx, ok := numberOf(x); ok {
 		ny, ok := numberOf(y)
-		return ok && nx.Cmp(ny) == 0
+		return ok && nx.cmp(ny) == 0, ok
 	}
 	if sx, ok := stringOf(x); ok {
 		sy, ok := stringOf(y)
-		return ok && sx == sy
+		return ok && sx == sy, ok
 	}
 	if bx, ok := boolOf(x); ok {
 		by, ok := boolOf(y)
-		return ok && bx == by
+		return ok && bx == by, ok
 	}
-	return false
+	return false, false
 }
 
-// ordered compares x with y under one of the four ordering operators. It
-// holds only between two numbers.
-func ordered(op Op, x, y any) bool {
+// ordered compares x with y under one of the four ordering operators. It can
+// be told only between two numbers.
+func ordered(op Op, x, y any) truth {
 	nx, ok := numberOf(x)
 	if !ok {
-		return false
+		return unclear
 	}
 	ny, ok := numberOf(y)
 	if !ok {
-		return false
+		return unclear
 	}
-	switch c := nx.Cmp(ny); op {
+	switch c := nx.cmp(ny); op {
 	case OpGt:
-		return c > 0
+		return fromBool(c > 0)
 	case OpGte:
-		return c >= 0
+		return fromBool(c >= 0)
 	case OpLt:
-		return c < 0
+		return fromBool(c < 0)
 	default:
-		return c <= 0
+		return fromBool(c <= 0)
 	}
 }
 
-// in reports whether v equals an element of list.
-func in(v, list any) bool {
+// in reports whether v equals an element of list. When it equals none, that is
+// a finding only if some element could be compared with it; a list of strings
+// says nothing about a number.
+func in(v, list any) truth {
 	rl := reflect.ValueOf(list)
-	if rl.Kind() != reflect.Slice && rl.Kind() != reflect.Array {
-		return false
-	}
+	compared := false
 	for i := range rl.Len() {
-		if equal(v, rl.Index(i).Interface()) {
-			return true
+		equal, ok := compare(v, rl.Index(i).Interface())
+		if !ok {
+			continue
 		}
+		if equal {
+			return met
+		}
+		compared = true
 	}
-	return false
+	if compared {
+		return unmet
+	}
+	return unclear
 }
 
 // isList reports whether v is a slice or an array.
@@ -162,36 +225,120 @@ func isList(v any) bool {
 	return k == reflect.Slice || k == reflect.Array
 }
 
-// numberOf reads v as a number, whatever Go type holds it: any integer or
-// float type, a named type over one, or a json.Number. The result is exact, so
-// an int64 and a float64 that differ in the last place compare as different. A
-// NaN is not a number to compare, and nor is a json.Number that is not finite.
-func numberOf(v any) (*big.Float, bool) {
+// number is an exact number, or an infinity.
+type number struct {
+	inf int      // 1 or -1 for an infinity, else 0
+	r   *big.Rat // the value, when finite
+}
+
+// cmp orders n and o: -1, 0 or 1.
+func (n number) cmp(o number) int {
+	if n.inf != 0 || o.inf != 0 {
+		return cmp.Compare(n.inf, o.inf)
+	}
+	return n.r.Cmp(o.r)
+}
+
+// What is compared of a number written as text, so that a hostile one cannot
+// cost memory or time out of proportion: its length in bytes and the size of
+// its exponent. A number past either cannot be told.
+const (
+	maxNumberText     = 4096
+	maxNumberExponent = 4096
+)
+
+// numberOf reads v as a number, whatever Go type holds it: any integer or float
+// type, a named type over one, or a json.Number. It is exact. An integer is the
+// integer it is; a float is the shortest decimal that gives it back, so a
+// float64 0.1 is the number 0.1 and a threshold written 0.1 meets it; text is
+// the decimal it spells, of any size or precision up to the bounds above, and
+// must be a JSON number. A NaN is not a number, nor is text that is not one.
+func numberOf(v any) (number, bool) {
 	if n, ok := v.(json.Number); ok {
-		if i, err := strconv.ParseInt(string(n), 10, 64); err == nil {
-			return new(big.Float).SetInt64(i), true
-		}
-		f, err := strconv.ParseFloat(string(n), 64)
-		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
-			return nil, false
-		}
-		return new(big.Float).SetFloat64(f), true
+		r, ok := parseNumber(string(n))
+		return number{r: r}, ok
 	}
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return new(big.Float).SetInt64(rv.Int()), true
+		return number{r: new(big.Rat).SetInt64(rv.Int())}, true
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return new(big.Float).SetUint64(rv.Uint()), true
-	case reflect.Float32, reflect.Float64:
-		f := rv.Float()
-		if math.IsNaN(f) {
-			return nil, false
+		return number{r: new(big.Rat).SetUint64(rv.Uint())}, true
+	case reflect.Float32:
+		return floatNumber(rv.Float(), 32)
+	case reflect.Float64:
+		return floatNumber(rv.Float(), 64)
+	default:
+		return number{}, false
+	}
+}
+
+func floatNumber(f float64, bits int) (number, bool) {
+	switch {
+	case math.IsNaN(f):
+		return number{}, false
+	case math.IsInf(f, 1):
+		return number{inf: 1}, true
+	case math.IsInf(f, -1):
+		return number{inf: -1}, true
+	}
+	r, ok := new(big.Rat).SetString(strconv.FormatFloat(f, 'e', -1, bits))
+	return number{r: r}, ok
+}
+
+// parseNumber reads text as a JSON number, and nothing looser: no plus sign, no
+// leading zero, no bare point, no "Infinity", no hex, no underscores.
+func parseNumber(s string) (*big.Rat, bool) {
+	if s == "" || len(s) > maxNumberText {
+		return nil, false
+	}
+	isDigit := func(i int) bool { return i < len(s) && s[i] >= '0' && s[i] <= '9' }
+	i := 0
+	if s[i] == '-' {
+		i++
+	}
+	switch {
+	case i == len(s):
+		return nil, false
+	case s[i] == '0':
+		i++
+	case isDigit(i):
+		for isDigit(i) {
+			i++
 		}
-		return new(big.Float).SetFloat64(f), true
 	default:
 		return nil, false
 	}
+	if i < len(s) && s[i] == '.' {
+		i++
+		digits := i
+		for isDigit(i) {
+			i++
+		}
+		if i == digits {
+			return nil, false
+		}
+	}
+	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		i++
+		if i < len(s) && (s[i] == '+' || s[i] == '-') {
+			i++
+		}
+		digits, exp := i, 0
+		for isDigit(i) {
+			if exp = exp*10 + int(s[i]-'0'); exp > maxNumberExponent {
+				return nil, false
+			}
+			i++
+		}
+		if i == digits {
+			return nil, false
+		}
+	}
+	if i != len(s) {
+		return nil, false
+	}
+	return new(big.Rat).SetString(s)
 }
 
 // stringOf reads v as a string, or a named type over one. A json.Number is

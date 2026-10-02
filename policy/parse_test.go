@@ -25,8 +25,8 @@ const designJSON = `{
   ]
 }`
 
-// designPolicy is that JSON as a Go value, with numbers as encoding/json
-// reads them.
+// designPolicy is that JSON as a Go value, with numbers as Parse reads them:
+// as json.Number, the text as written.
 func designPolicy() policy.Policy {
 	return policy.Policy{
 		Version: "2026-10-02",
@@ -36,7 +36,7 @@ func designPolicy() policy.Policy {
 			{Name: "Sending needs a person", Effect: policy.Ask, When: policy.Match{Kinds: []string{"send"}}},
 			{
 				Name: "Payment above the $200 limit", Effect: policy.Ask,
-				When: policy.Match{Kinds: []string{"pay"}, Attrs: []policy.Cond{{Attr: "amount", Op: policy.OpGt, Value: 200.0}}},
+				When: policy.Match{Kinds: []string{"pay"}, Attrs: []policy.Cond{{Attr: "amount", Op: policy.OpGt, Value: json.Number("200")}}},
 			},
 			{Name: "Deleting documents is never allowed", Effect: policy.Block, When: policy.Match{Kinds: []string{"delete"}}},
 		},
@@ -57,11 +57,11 @@ func everyPart() policy.Policy {
 					Attrs: []policy.Cond{
 						{Attr: "a", Op: policy.OpEq, Value: "x"},
 						{Attr: "b", Op: policy.OpNe, Value: true},
-						{Attr: "c", Op: policy.OpGt, Value: 1.5},
-						{Attr: "d", Op: policy.OpGte, Value: 2.0},
-						{Attr: "e", Op: policy.OpLt, Value: 3.0},
-						{Attr: "f", Op: policy.OpLte, Value: 4.0},
-						{Attr: "g", Op: policy.OpIn, Value: []any{"p", "q", 1.0}},
+						{Attr: "c", Op: policy.OpGt, Value: json.Number("1.5")},
+						{Attr: "d", Op: policy.OpGte, Value: json.Number("2")},
+						{Attr: "e", Op: policy.OpLt, Value: json.Number("3.0")},
+						{Attr: "f", Op: policy.OpLte, Value: json.Number("4e2")},
+						{Attr: "g", Op: policy.OpIn, Value: []any{"p", "q", json.Number("1")}},
 						{Attr: "h", Op: policy.OpExists, Value: false},
 						{Attr: "i", Op: policy.OpExists, Value: true},
 					},
@@ -113,7 +113,7 @@ func TestParse_RoundTrips(t *testing.T) {
 		{name: "a policy of no rules with a default", p: policy.Policy{Default: policy.Allow, Rules: []policy.Rule{}}},
 		{name: "values that are false, zero and empty", p: policy.Policy{Rules: []policy.Rule{
 			{Name: "false", Effect: policy.Block, When: policy.Match{Attrs: []policy.Cond{{Attr: "f", Op: policy.OpEq, Value: false}}}},
-			{Name: "zero", Effect: policy.Block, When: policy.Match{Attrs: []policy.Cond{{Attr: "n", Op: policy.OpNe, Value: 0.0}}}},
+			{Name: "zero", Effect: policy.Block, When: policy.Match{Attrs: []policy.Cond{{Attr: "n", Op: policy.OpNe, Value: json.Number("0")}}}},
 			{Name: "empty", Effect: policy.Block, When: policy.Match{Attrs: []policy.Cond{{Attr: "s", Op: policy.OpEq, Value: ""}}}},
 			{Name: "empty kinds", Effect: policy.Allow, When: policy.Match{Kinds: nil}},
 		}}},
@@ -325,7 +325,7 @@ func TestEffect_UnmarshalText(t *testing.T) {
 			err := e.UnmarshalText([]byte(tt.text))
 			if tt.wantErr {
 				require.Error(t, err)
-				assert.Contains(t, err.Error(), "policy")
+				assert.Contains(t, err.Error(), "effect")
 				assert.Equal(t, policy.Effect("untouched"), e, "an effect that is refused leaves the value alone")
 				return
 			}
@@ -532,4 +532,267 @@ func TestValidate(t *testing.T) {
 			assert.NoError(t, tt.p.Validate())
 		})
 	}
+}
+
+func TestParse_RefusesARepeatedKey(t *testing.T) {
+	tests := []struct {
+		name      string
+		data      string
+		wantKey   string
+		wantWhere string
+	}{
+		{name: "default at the top", data: `{"default": "block", "default": "allow", "rules": []}`, wantKey: `"default"`, wantWhere: "the top level"},
+		{name: "version at the top", data: `{"version": "a", "version": "b", "rules": []}`, wantKey: `"version"`, wantWhere: "the top level"},
+		{name: "rules at the top, which would be merged", data: `{"rules": [], "rules": [{"name": "a", "effect": "allow", "when": {}}]}`, wantKey: `"rules"`, wantWhere: "the top level"},
+		{name: "effect in a rule, the later loosening", data: `{"rules": [{"name": "a", "effect": "block", "effect": "allow", "when": {}}]}`, wantKey: `"effect"`, wantWhere: "rules[0]"},
+		{name: "effect spelt in capitals", data: `{"rules": [{"name": "a", "effect": "block", "EFFECT": "allow", "when": {}}]}`, wantKey: `"EFFECT"`, wantWhere: "rules[0]"},
+		{name: "effect spelt with a mixed case, first", data: `{"rules": [{"Effect": "block", "name": "a", "effect": "allow", "when": {}}]}`, wantKey: `"effect"`, wantWhere: "rules[0]"},
+		{name: "effect spelt with an escape", data: `{"rules": [{"name": "a", "effect": "block", "eff\u0065ct": "allow", "when": {}}]}`, wantKey: `"effect"`, wantWhere: "rules[0]"},
+		{name: "a key spelt with the Kelvin sign, which encoding/json reads as k", data: "{\"rules\": [{\"name\": \"a\", \"effect\": \"block\", \"when\": {\"kinds\": [\"read\"], \"\u212Ainds\": []}}]}", wantKey: "kinds", wantWhere: "rules[0].when"},
+		{name: "a key spelt with the long s, which folds with s but not by lower case", data: `{"rules": [], "rule\u017f": []}`, wantKey: "rules", wantWhere: "the top level"},
+		{name: "name in the second rule", data: `{"rules": [{"name": "a", "effect": "allow", "when": {}}, {"name": "b", "name": "c", "effect": "allow", "when": {}}]}`, wantKey: `"name"`, wantWhere: "rules[1]"},
+		{name: "when in a rule, which would be merged", data: `{"rules": [{"name": "a", "effect": "block", "when": {"kinds": ["x"]}, "when": {}}]}`, wantKey: `"when"`, wantWhere: "rules[0]"},
+		{name: "kinds in a match", data: `{"rules": [{"name": "a", "effect": "block", "when": {"kinds": ["x"], "kinds": []}}]}`, wantKey: `"kinds"`, wantWhere: "rules[0].when"},
+		{name: "target in a match", data: `{"rules": [{"name": "a", "effect": "block", "when": {"target": "a", "target": ""}}]}`, wantKey: `"target"`, wantWhere: "rules[0].when"},
+		{name: "attrs in a match", data: `{"rules": [{"name": "a", "effect": "block", "when": {"attrs": [], "attrs": []}}]}`, wantKey: `"attrs"`, wantWhere: "rules[0].when"},
+		{name: "attr in a condition", data: `{"rules": [{"name": "a", "effect": "block", "when": {"attrs": [{"attr": "x", "attr": "y", "op": "eq", "value": 1}]}}]}`, wantKey: `"attr"`, wantWhere: "rules[0].when.attrs[0]"},
+		{name: "op in the second condition", data: `{"rules": [{"name": "a", "effect": "block", "when": {"attrs": [{"attr": "x", "op": "eq", "value": 1}, {"attr": "x", "op": "eq", "op": "ne", "value": 1}]}}]}`, wantKey: `"op"`, wantWhere: "rules[0].when.attrs[1]"},
+		{name: "value in a condition, the later replacing a threshold", data: `{"rules": [{"name": "a", "effect": "block", "when": {"attrs": [{"attr": "x", "op": "gt", "value": 200, "value": 20000}]}}]}`, wantKey: `"value"`, wantWhere: "rules[0].when.attrs[0]"},
+		{name: "a key inside an object value", data: `{"rules": [{"name": "a", "effect": "block", "when": {"attrs": [{"attr": "x", "op": "eq", "value": {"k": 1, "K": 2}}]}}]}`, wantKey: `"K"`, wantWhere: "rules[0].when.attrs[0].value"},
+		{name: "a key inside an object in a list value", data: `{"rules": [{"name": "a", "effect": "block", "when": {"attrs": [{"attr": "x", "op": "in", "value": [{"k": 1, "k": 2}]}]}}]}`, wantKey: `"k"`, wantWhere: "rules[0].when.attrs[0].value[0]"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := policy.Parse([]byte(tt.data))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "policy: parse")
+			assert.Contains(t, err.Error(), tt.wantKey)
+			assert.Contains(t, err.Error(), tt.wantWhere)
+			assert.Contains(t, err.Error(), "twice")
+			assert.Equal(t, policy.Policy{}, got)
+		})
+	}
+
+	t.Run("the same key in different objects is not a repeat", func(t *testing.T) {
+		got, err := policy.Parse([]byte(`{"rules": [
+			{"name": "a", "effect": "allow", "when": {"kinds": ["x"], "attrs": [{"attr": "n", "op": "gt", "value": 1}, {"attr": "n", "op": "lt", "value": 9}]}},
+			{"name": "b", "effect": "block", "when": {"kinds": ["y"], "attrs": [{"attr": "n", "op": "eq", "value": {"k": 1}}]}}
+		]}`))
+		// The second rule's object value is refused for another reason, and not
+		// for its keys.
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "twice")
+		assert.Equal(t, policy.Policy{}, got)
+
+		got, err = policy.Parse([]byte(`{"rules": [
+			{"name": "a", "effect": "allow", "when": {"kinds": ["x"], "attrs": [{"attr": "n", "op": "gt", "value": 1}, {"attr": "n", "op": "lt", "value": 9}]}},
+			{"name": "b", "effect": "block", "when": {"kinds": ["y"]}}
+		]}`))
+		require.NoError(t, err)
+		assert.Len(t, got.Rules, 2)
+	})
+}
+
+func TestParse_RefusesADocumentThatIsNotAnObject(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{name: "null", data: `null`, want: "not null"},
+		{name: "null with space around it", data: " \n null \n", want: "not null"},
+		{name: "a list", data: `[]`, want: "not a list"},
+		{name: "a list holding a policy", data: `[{"rules": []}]`, want: "not a list"},
+		{name: "a string", data: `"rules"`, want: "not a string"},
+		{name: "a number", data: `5`, want: "not a number"},
+		{name: "true", data: `true`, want: "not a boolean"},
+		{name: "false", data: `false`, want: "not a boolean"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := policy.Parse([]byte(tt.data))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "policy: parse")
+			assert.Contains(t, err.Error(), "a policy is a JSON object")
+			assert.Contains(t, err.Error(), tt.want)
+			assert.Equal(t, policy.Policy{}, got)
+		})
+	}
+
+	t.Run("an empty object is the empty policy", func(t *testing.T) {
+		got, err := policy.Parse([]byte(` {} `))
+		require.NoError(t, err)
+		assert.Equal(t, policy.Policy{}, got)
+	})
+}
+
+func TestParse_RefusesARuleNamedForNoRuleMatched(t *testing.T) {
+	data := `{"rules": [{"name": "` + policy.RuleDefault + `", "effect": "allow", "when": {}}]}`
+	got, err := policy.Parse([]byte(data))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "policy: parse")
+	assert.Contains(t, err.Error(), `rule 0`)
+	assert.Contains(t, err.Error(), policy.RuleDefault)
+	assert.Equal(t, policy.Policy{}, got)
+
+	p := policy.Policy{Rules: []policy.Rule{{Name: "a", Effect: policy.Allow}, {Name: policy.RuleDefault, Effect: policy.Block}}}
+	err = p.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `rule 1`)
+	_, err = policy.NewDecider(p, policy.Options{})
+	assert.Error(t, err)
+
+	t.Run("a name that only contains it is fine", func(t *testing.T) {
+		p := policy.Policy{Rules: []policy.Rule{{Name: policy.RuleDefault + " for reads", Effect: policy.Allow}}}
+		assert.NoError(t, p.Validate())
+	})
+}
+
+// A threshold is kept as the text it was written as, so a number too large or
+// too precise for a float64 is compared as written.
+func TestParse_KeepsNumbersExact(t *testing.T) {
+	cases := []struct {
+		name      string
+		op        string
+		threshold string
+		attr      any
+		want      string
+	}{
+		{name: "0.1 is 0.1", op: "gte", threshold: "0.1", attr: 0.1, want: holdsT},
+		{name: "0.1 is not above 0.1", op: "gt", threshold: "0.1", attr: 0.1, want: unmetT},
+		{name: "a threshold a float64 would round up to the attribute", op: "gt", threshold: "9007199254740993", attr: float64(1 << 53), want: unmetT},
+		{name: "the attribute above that threshold", op: "gte", threshold: "9007199254740993", attr: int64(9007199254740993), want: holdsT},
+		{name: "one below it is not enough", op: "gte", threshold: "9007199254740993", attr: int64(9007199254740992), want: unmetT},
+		{name: "a threshold with thirty digits", op: "gt", threshold: "123456789012345678901234567890.123456789", attr: json.Number("123456789012345678901234567890.123456790"), want: holdsT},
+		{name: "and the same figure is not above it", op: "gt", threshold: "123456789012345678901234567890.123456789", attr: json.Number("123456789012345678901234567890.123456789"), want: unmetT},
+		{name: "a threshold above any float64", op: "lt", threshold: "1e400", attr: math.MaxFloat64, want: holdsT},
+		{name: "an attribute below a threshold written with an exponent", op: "lte", threshold: "2e2", attr: 200, want: holdsT},
+		{name: "a threshold with trailing zeros", op: "gt", threshold: "200.00", attr: 200.0, want: unmetT},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			p, err := policy.Parse([]byte(`{"rules": [{"name": "r", "effect": "block", "when": {"attrs": [{"attr": "x", "op": "` + tt.op + `", "value": ` + tt.threshold + `}]}}]}`))
+			require.NoError(t, err)
+			require.Len(t, p.Rules, 1)
+			require.Len(t, p.Rules[0].When.Attrs, 1)
+			assert.Equal(t, json.Number(tt.threshold), p.Rules[0].When.Attrs[0].Value, "the threshold is the text as written")
+			assert.Equal(t, tt.want, truthOf(p.Rules[0].When.Attrs[0], attrs("x", tt.attr)))
+		})
+	}
+
+	t.Run("numbers in a list are kept as text too", func(t *testing.T) {
+		p, err := policy.Parse([]byte(`{"rules": [{"name": "r", "effect": "block", "when": {"attrs": [{"attr": "x", "op": "in", "value": [1, 2.50, 9007199254740993]}]}}]}`))
+		require.NoError(t, err)
+		assert.Equal(t, []any{json.Number("1"), json.Number("2.50"), json.Number("9007199254740993")}, p.Rules[0].When.Attrs[0].Value)
+		assert.Equal(t, holdsT, truthOf(p.Rules[0].When.Attrs[0], attrs("x", int64(9007199254740993))))
+		assert.Equal(t, unmetT, truthOf(p.Rules[0].When.Attrs[0], attrs("x", float64(1<<53))))
+		assert.Equal(t, holdsT, truthOf(p.Rules[0].When.Attrs[0], attrs("x", 2.5)))
+	})
+
+	t.Run("a threshold the comparison cannot hold is refused when the policy loads", func(t *testing.T) {
+		_, err := policy.Parse([]byte(`{"rules": [{"name": "r", "effect": "block", "when": {"attrs": [{"attr": "x", "op": "gt", "value": 1e99999}]}}]}`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "gt needs a number")
+	})
+
+	t.Run("and a threshold written back is the text it was", func(t *testing.T) {
+		in := `{"rules":[{"name":"r","effect":"block","when":{"attrs":[{"attr":"x","op":"gt","value":200.50}]}}]}`
+		p, err := policy.Parse([]byte(in))
+		require.NoError(t, err)
+		out, err := json.Marshal(p)
+		require.NoError(t, err)
+		assert.JSONEq(t, in, string(out))
+		assert.Contains(t, string(out), `"value":200.50`)
+	})
+}
+
+func TestParse_ErrorTextNamesThePackageOnce(t *testing.T) {
+	_, err := policy.Parse([]byte(`{"rules": [{"name": "a", "effect": "deny", "when": {}}]}`))
+	require.Error(t, err)
+	assert.Equal(t, 1, strings.Count(err.Error(), "policy:"), err.Error())
+	assert.Contains(t, err.Error(), `effect "deny"`)
+
+	_, err = policy.Parse([]byte(`{"rules": [{"name": "a", "effect": "allow", "when": {"attrs": [{"attr": "x", "op": "gt", "value": 1}, {"attr": "", "op": "eq", "value": 1}]}}]}`))
+	require.Error(t, err)
+	assert.Equal(t, 1, strings.Count(err.Error(), "policy:"), err.Error())
+}
+
+func TestValidate_NamesNaNAsNaN(t *testing.T) {
+	for _, op := range []policy.Op{policy.OpEq, policy.OpNe, policy.OpGt, policy.OpGte, policy.OpLt, policy.OpLte} {
+		for name, v := range map[string]any{"float64": math.NaN(), "float32": float32(math.NaN())} {
+			p := policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: cond("x", op, v)}}}
+			err := p.Validate()
+			require.Error(t, err, "%s %s", op, name)
+			assert.Contains(t, err.Error(), "not NaN", "%s %s", op, name)
+			assert.NotContains(t, err.Error(), "not float", "%s %s", op, name)
+		}
+	}
+}
+
+func TestValidate_RefusesWhatCannotMatchOrMatchesTooMuchByMistake(t *testing.T) {
+	existsFalse := policy.Cond{Attr: "x", Op: policy.OpExists, Value: false}
+	rule := func(conds ...policy.Cond) policy.Policy {
+		return policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: policy.Match{Attrs: conds}}}}
+	}
+	target := func(pattern string) policy.Policy {
+		return policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: policy.Match{Target: pattern}}}}
+	}
+
+	refused := []struct {
+		name string
+		p    policy.Policy
+		want []string
+	}{
+		{name: "exists false with eq on the same attribute", p: rule(existsFalse, policy.Cond{Attr: "x", Op: policy.OpEq, Value: 1}), want: []string{`rule 0 ("r")`, "conditions 0 and 1", `"x"`, "exists false"}},
+		{name: "exists false after another condition on the attribute", p: rule(policy.Cond{Attr: "x", Op: policy.OpGt, Value: 1}, existsFalse), want: []string{"conditions 0 and 1", `"x"`, "exists false"}},
+		{name: "exists false with exists true", p: rule(existsFalse, policy.Cond{Attr: "x", Op: policy.OpExists, Value: true}), want: []string{"conditions 0 and 1", "exists false"}},
+		{name: "exists false with another exists false", p: rule(existsFalse, existsFalse), want: []string{"conditions 0 and 1", "exists false"}},
+		{name: "exists false with in", p: rule(existsFalse, policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{"a"}}), want: []string{"exists false"}},
+		{name: "exists false with ne", p: rule(existsFalse, policy.Cond{Attr: "x", Op: policy.OpNe, Value: "a"}), want: []string{"exists false"}},
+		{name: "exists false with a condition between them", p: rule(existsFalse, policy.Cond{Attr: "y", Op: policy.OpEq, Value: 1}, policy.Cond{Attr: "x", Op: policy.OpLt, Value: 1}), want: []string{"conditions 0 and 2", `"x"`}},
+		{name: "a bare star target", p: target("*"), want: []string{`rule 0 ("r")`, `target "*"`, "leave the target empty for every target"}},
+		{name: "a target of stars", p: target("**"), want: []string{`target "**"`, "leave the target empty for every target"}},
+		{name: "a target of three stars", p: target("***"), want: []string{"leave the target empty for every target"}},
+	}
+	for _, tt := range refused {
+		t.Run("refuses "+tt.name, func(t *testing.T) {
+			err := tt.p.Validate()
+			require.Error(t, err)
+			for _, want := range tt.want {
+				assert.Contains(t, err.Error(), want)
+			}
+			_, perr := policy.NewDecider(tt.p, policy.Options{})
+			assert.Error(t, perr)
+		})
+	}
+
+	accepted := []struct {
+		name string
+		p    policy.Policy
+	}{
+		{name: "exists false alone", p: rule(existsFalse)},
+		{name: "exists false with conditions on other attributes", p: rule(existsFalse, policy.Cond{Attr: "y", Op: policy.OpEq, Value: 1}, policy.Cond{Attr: "z", Op: policy.OpExists, Value: false})},
+		{name: "exists true with eq on the same attribute", p: rule(policy.Cond{Attr: "x", Op: policy.OpExists, Value: true}, policy.Cond{Attr: "x", Op: policy.OpEq, Value: 1})},
+		{name: "two conditions on one attribute, a range", p: rule(policy.Cond{Attr: "x", Op: policy.OpGt, Value: 1}, policy.Cond{Attr: "x", Op: policy.OpLt, Value: 9})},
+		{name: "an empty target, which is every target", p: target("")},
+		{name: "a star with something around it", p: target("doc:*")},
+		{name: "a star at the front", p: target("*.txt")},
+		{name: "a question mark alone", p: target("?")},
+		{name: "a class holding a star", p: target("[*]")},
+		{name: "a star after an escape", p: target(`\**`)},
+	}
+	for _, tt := range accepted {
+		t.Run("accepts "+tt.name, func(t *testing.T) {
+			assert.NoError(t, tt.p.Validate())
+		})
+	}
+
+	t.Run("Parse refuses them too", func(t *testing.T) {
+		_, err := policy.Parse([]byte(`{"rules": [{"name": "r", "effect": "block", "when": {"target": "*"}}]}`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "leave the target empty")
+		_, err = policy.Parse([]byte(`{"rules": [{"name": "r", "effect": "block", "when": {"attrs": [{"attr": "x", "op": "exists", "value": false}, {"attr": "x", "op": "eq", "value": 1}]}}]}`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "conditions 0 and 1")
+	})
 }

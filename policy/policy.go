@@ -127,6 +127,13 @@ type Decision struct {
 	Index int `json:"index"`
 	// Matched names every rule that matched, in order.
 	Matched []string `json:"matched,omitempty"`
+	// Uncertain is set when Rule decided without every one of its conditions
+	// holding: a condition could not be told, and an ask or block rule counts
+	// that against the action. It names each attribute whose value a condition
+	// could not compare, and "target pattern" or "kinds list" for a part of
+	// the rule that could not be evaluated. It is empty when Rule matched for
+	// certain.
+	Uncertain []string `json:"uncertain,omitempty"`
 }
 
 // Judged is an action with its decision.
