@@ -32,19 +32,23 @@ type EventStreamOptions struct {
 	// reconnecting. Zero sends none.
 	Retry time.Duration
 
-	// SendTimeout bounds each Send, SendJSON and Comment, so that a client
-	// that stays connected and stops reading cannot hold the handler in a
-	// write for ever. Zero means 30 seconds, and a negative value means no
-	// bound. A send that passes it returns an error, and the stream is
-	// unusable afterwards. Time between sends does not count.
+	// SendTimeout bounds each write the stream makes, the opening and every
+	// Send, SendJSON and Comment, so that a client that stays connected and
+	// stops reading cannot hold the handler in a write for ever. It takes
+	// the place of the server's WriteTimeout, which no longer applies to the
+	// stream once it is open. Zero means 30 seconds. A negative value means
+	// no bound, and so does a writer that cannot carry deadlines; writes are
+	// then unbounded. A send that passes the limit returns an error, and the
+	// stream is unusable afterwards. Time between sends does not count.
 	SendTimeout time.Duration
 }
 
 // defaultSendTimeout is what a zero EventStreamOptions.SendTimeout means.
 const defaultSendTimeout = 30 * time.Second
 
-// EventStream writes server-sent events to one response. It is not safe
-// for concurrent use.
+// EventStream writes server-sent events to one response. It is for the one
+// goroutine that owns the response, and is not safe for concurrent use: a
+// handler that sends from several goroutines serializes them itself.
 //
 // It does not outlive the request: once the request's context ends, Send,
 // SendJSON and Comment write nothing and return an error wrapping the
@@ -67,17 +71,21 @@ type EventStream struct {
 // NewEventStream starts an event stream on w: it sets the headers, lifts
 // the server's write deadline for this response, and flushes.
 //
-// The write deadline stays lifted between sends, so the stream outlives the
-// server's WriteTimeout; each send sets one of its own, EventStreamOptions
-// SendTimeout, for the length of that write.
+// Once the stream is open the server's own WriteTimeout no longer applies to
+// it. The write deadline is lifted, and what bounds a write is
+// EventStreamOptions.SendTimeout, set for the length of that write and lifted
+// again after it, the opening included. Writes are unbounded when SendTimeout
+// is negative or w cannot carry deadlines.
 //
 // The router's timeout is not lifted: it ends the request's context, and the
 // stream with it. A service that wants one long connection builds its router
 // with RouterOptions.Timeout set to -1.
 //
-// It returns ErrStreamUnsupported, before writing anything, when no writer
-// in the Unwrap chain can flush, so the handler can still answer with an
-// error. Any other error means the client has gone.
+// It returns ErrStreamUnsupported, before writing anything, when the writer
+// at the end of the Unwrap chain cannot flush, so the handler can still answer
+// with an error. A wrapper's flush passes down the chain, so one that stops
+// short would leave events in a buffer whatever the wrappers above it offer.
+// Any other error means the client has gone.
 func NewEventStream(w http.ResponseWriter, r *http.Request, opts EventStreamOptions) (*EventStream, error) {
 	if !canFlush(w) {
 		return nil, ErrStreamUnsupported
@@ -111,26 +119,26 @@ func NewEventStream(w http.ResponseWriter, r *http.Request, opts EventStreamOpti
 	if opts.Retry > 0 {
 		// Under a millisecond it would read as zero, a reconnect with no wait.
 		s.buf = fmt.Appendf(nil, "retry: %d\n\n", max(opts.Retry.Milliseconds(), 1))
-		if _, err := w.Write(s.buf); err != nil {
-			return nil, fmt.Errorf("httpx: write retry: %w", err)
-		}
 	}
-	if err := rc.Flush(); err != nil {
+	if err := s.writeBounded(); err != nil {
 		return nil, fmt.Errorf("httpx: start event stream: %w", err)
 	}
 	return s, nil
 }
 
-// canFlush reports whether a flush on w would reach a writer that does it,
-// walking the same chain http.ResponseController walks, so that the answer is
-// known before anything is written.
+// canFlush reports whether a flush on w ends at a writer that does it. It walks
+// the chain http.ResponseController walks, to its last writer, since a flush a
+// wrapper passes down only reaches the client if the writer it ends at can,
+// and the answer is known before anything is written.
 func canFlush(w http.ResponseWriter) bool {
 	for {
-		switch t := w.(type) {
+		if u, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
+			w = u.Unwrap()
+			continue
+		}
+		switch w.(type) {
 		case interface{ FlushError() error }, http.Flusher:
 			return true
-		case interface{ Unwrap() http.ResponseWriter }:
-			w = t.Unwrap()
 		default:
 			return false
 		}
@@ -201,31 +209,33 @@ func (s *EventStream) usable() error {
 
 // write sends s.buf and ends the stream if that fails.
 func (s *EventStream) write() error {
-	err := s.writeBounded()
-	if err != nil {
-		s.err = err
+	if err := s.writeBounded(); err != nil {
+		s.err = fmt.Errorf("httpx: send event: %w", err)
 	}
-	return err
+	return s.err
 }
 
 // writeBounded sends s.buf as one Write, so a failure never leaves half an
 // event on the wire without the stream knowing, and flushes it, all under the
-// send's own deadline.
+// write's own deadline. With nothing in s.buf, as at the start of a stream with
+// no retry line, it only flushes.
 func (s *EventStream) writeBounded() error {
 	if s.limit > 0 {
 		if err := s.rc.SetWriteDeadline(time.Now().Add(s.limit)); err != nil {
-			return fmt.Errorf("httpx: bound send: %w", err)
+			return fmt.Errorf("bound write: %w", err)
 		}
-		// Lifted again after the send. Left to run out, the deadline would
+		// Lifted again after the write. Left to run out, the deadline would
 		// expire while the stream sat idle, and the write that ends the
 		// response would be the one to fail.
 		defer func() { _ = s.rc.SetWriteDeadline(time.Time{}) }()
 	}
-	if _, err := s.w.Write(s.buf); err != nil {
-		return fmt.Errorf("httpx: write event: %w", err)
+	if len(s.buf) > 0 {
+		if _, err := s.w.Write(s.buf); err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
 	}
 	if err := s.rc.Flush(); err != nil {
-		return fmt.Errorf("httpx: flush event: %w", err)
+		return fmt.Errorf("flush: %w", err)
 	}
 	return nil
 }

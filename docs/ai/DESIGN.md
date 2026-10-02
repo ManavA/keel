@@ -3545,16 +3545,19 @@ type EventStreamOptions struct {
 	// reconnecting. Zero sends none.
 	Retry time.Duration
 
-	// SendTimeout bounds each Send, SendJSON and Comment, so that a client
-	// that stays connected and stops reading cannot hold the handler in a
-	// write for ever. Zero means 30 seconds, and a negative value means no
-	// bound. A send that passes it returns an error, and the stream is
-	// unusable afterwards. Time between sends does not count.
+	// SendTimeout bounds each write the stream makes, the opening and every
+	// Send, SendJSON and Comment, so that a client that stays connected and
+	// stops reading cannot hold the handler in a write for ever. It takes
+	// the place of the server's WriteTimeout, which no longer applies to the
+	// stream once it is open. Zero means 30 seconds. A negative value means
+	// no bound, and so does a writer that cannot carry deadlines; writes are
+	// then unbounded. A send that passes the limit returns an error, and the
+	// stream is unusable afterwards. Time between sends does not count.
 	SendTimeout time.Duration
 }
 
-// EventStream writes server-sent events to one response. It is not safe
-// for concurrent use.
+// EventStream writes server-sent events to one response. It is for the one
+// goroutine that owns the response, and is not safe for concurrent use.
 type EventStream struct{ /* unexported fields */ }
 
 // NewEventStream starts an event stream on w: it sets the headers, lifts
@@ -3580,9 +3583,13 @@ func LastEventID(r *http.Request) string
 `http.NewResponseController(w).SetWriteDeadline(time.Time{})` to lift the
 write deadline for this response (ignoring `http.ErrNotSupported`), writes
 the `retry:` line when asked, and flushes. It returns
-`ErrStreamUnsupported` when no writer in the `Unwrap` chain can flush,
-which it finds out before writing any header, so the handler can still
-answer with an error. `Send` writes
+`ErrStreamUnsupported` when the writer at the end of the `Unwrap` chain
+cannot flush, which it finds out before writing any header, so the handler
+can still answer with an error. It is the end of the chain that has to
+flush, not any writer in it: a wrapper's flush is passed down, so one that
+stops short would leave events in a buffer whatever the wrappers above it
+offer, and the router's recorders offer `Flush` over whatever they wrap.
+`Send` writes
 `id:` and `event:` when set and one `data:` line per line of `Data`, a line
 ending in a line feed, a carriage return or both, then a blank line, then
 flushes. It refuses, and writes nothing for, an `ID` containing a line break
@@ -3591,20 +3598,26 @@ would lose the resume point without a sign), a `Type` containing a line
 break, and `Comment` text containing one.
 
 The write deadline stays lifted between sends, which is what lets a stream
-outlive `WriteTimeout`, but it is not lifted for a send. Each send sets the
+outlive `WriteTimeout`: once a stream is open the server's own
+`WriteTimeout` no longer applies to it, and the per-send limit takes its
+place. Each write the stream makes, the opening and every send, sets the
 deadline to now plus `SendTimeout` before it writes and lifts it again
 after, so a client that stays connected and stops reading holds the
-handler's write for at most that long, and the time between sends does not
-count against the next one. A send that hits the deadline returns its error
-and ends the stream: the write may have left part of an event on the wire,
-so every later call returns the same error.
+handler's write for at most that long, and the time between writes does not
+count against the next one. Writes are unbounded when `SendTimeout` is
+negative, or when the writer cannot carry deadlines. A send that hits the
+deadline returns its error and ends the stream: the write may have left part
+of an event on the wire, so every later call returns the same error.
 
 The stream does not outlive the request context: once `r.Context()` ends,
 `Send`, `SendJSON` and `Comment` write nothing and return an error wrapping
 the context's, and the handler returns. The router's timeout ends that
 context, so under the default router a stream lasts 30 seconds, and a
 deployment that wants a longer one builds its router with `Timeout: -1`
-(6.13).
+(6.13). Through a writer that discards flush errors, such as chi's
+compressor, the send that was held up reports success and the handler has
+been held for one limit; net/http closes the connection after the failed
+write, which ends the request's context, and the next send fails.
 
 Two defects in the recorder that `RequestLog`, `Observe` and `Recoverer`
 put round the writer (`httpx/middleware/responsewriter.go`) would have
@@ -3614,8 +3627,10 @@ offers `FlushError`, which `http.ResponseController` prefers. And it
 forwarded every `WriteHeader` it was given, so the 504 that chi's `Timeout`
 writes after a stream its deadline has ended made net/http log a superfluous
 call, a warning for every stream every 30 seconds; it now forwards only a
-response's first status, and passes a 1xx through as the informational
-response it is.
+response's first status, however that status was written or implied, and
+passes a 1xx through as the informational response it is, if no final status
+has gone out. After a hijack it forwards nothing and reports
+`http.ErrHijacked` for a write or a flush.
 
 It belongs in `httpx` and not in `agent/httpapi` because it is what any
 service streaming model output to a browser would otherwise write itself.
@@ -3627,6 +3642,8 @@ break in an id; `LastEventID`; and, against a real `httpx.Server` with a
 including past its own `SendTimeout`. Also against a real server: a client
 that stops reading, whose send returns an error within `SendTimeout`, and a
 stream ended by the router's timeout, which logs nothing at warning level.
+Without a server: a router mounted under a writer that cannot flush, which
+leaves the handler able to answer.
 
 ## 8. How the packages meet
 
@@ -4129,7 +4146,10 @@ chose them.
     negative), and lifts it again after. Rejected: lifting the deadline
     outright, as section 7 first said; and one deadline for the whole
     stream, which is `WriteTimeout` again. A send that fails ends the stream,
-    since the write may have left half an event on the wire. This also
-    supersedes the last sentence of 8: the recorder in `httpx/middleware`
-    changed too, to forward only a response's first status and to report
-    flush errors.
+    since the write may have left half an event on the wire. The server's
+    `WriteTimeout` therefore no longer applies to a stream once it is open;
+    `SendTimeout` is what bounds it. This also supersedes the last sentence
+    of 8: the recorder in `httpx/middleware` changed too, to forward only a
+    response's first status, to report flush errors, and to take no part in a
+    hijacked connection, and `NewEventStream` asks that a flush reach the
+    end of the writer chain, which the recorders cannot promise on their own.

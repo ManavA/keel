@@ -34,13 +34,17 @@ import (
 type plainWriter struct {
 	header      http.Header
 	wroteHeader bool
+	status      int
 	body        bytes.Buffer
 }
 
 func newPlainWriter() *plainWriter { return &plainWriter{header: http.Header{}} }
 
 func (w *plainWriter) Header() http.Header { return w.header }
-func (w *plainWriter) WriteHeader(int)     { w.wroteHeader = true }
+func (w *plainWriter) WriteHeader(code int) {
+	w.wroteHeader = true
+	w.status = code
+}
 func (w *plainWriter) Write(b []byte) (int, error) {
 	w.wroteHeader = true
 	return w.body.Write(b)
@@ -51,6 +55,13 @@ func (w *plainWriter) Write(b []byte) (int, error) {
 type unwrapper struct{ http.ResponseWriter }
 
 func (u unwrapper) Unwrap() http.ResponseWriter { return u.ResponseWriter }
+
+// passThrough offers Flush whatever is below it, as the router's recorder does
+// without asking what its own writer can do.
+type passThrough struct{ http.ResponseWriter }
+
+func (p passThrough) Unwrap() http.ResponseWriter { return p.ResponseWriter }
+func (p passThrough) Flush()                      {}
 
 // flushErrorWriter can flush only through FlushError, the form
 // http.ResponseController looks for first.
@@ -411,6 +422,12 @@ func TestNewEventStreamRefusesAWriterThatCannotFlush(t *testing.T) {
 		{"two wrappers over a writer that cannot flush", func(w *plainWriter) http.ResponseWriter {
 			return unwrapper{unwrapper{w}}
 		}},
+		{"a wrapper that offers Flush over a writer that cannot, whose flush would reach nothing", func(w *plainWriter) http.ResponseWriter {
+			return passThrough{w}
+		}},
+		{"a wrapper that offers Flush under another that does not", func(w *plainWriter) http.ResponseWriter {
+			return unwrapper{passThrough{w}}
+		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -482,7 +499,8 @@ func TestNewEventStreamLiftsTheWriteDeadline(t *testing.T) {
 				w = unwrapper{dw}
 			}
 
-			s, err := httpx.NewEventStream(w, getRequest(), httpx.EventStreamOptions{})
+			// No send limit, so the lift is the only deadline call there is.
+			s, err := httpx.NewEventStream(w, getRequest(), httpx.EventStreamOptions{SendTimeout: -1})
 
 			if tc.wantErr != nil {
 				require.ErrorIs(t, err, tc.wantErr)
@@ -502,25 +520,27 @@ func TestNewEventStreamLiftsTheWriteDeadline(t *testing.T) {
 	}
 }
 
-func TestEventStreamBoundsEachSend(t *testing.T) {
+func TestEventStreamBoundsItsOpeningAndEachSend(t *testing.T) {
 	tests := []struct {
 		name      string
 		limit     time.Duration
+		retry     time.Duration
 		errs      []error
-		wantLimit time.Duration // zero: no deadline is set around a send
+		wantLimit time.Duration // zero: no deadline is set around a write
 	}{
 		{name: "the default is thirty seconds", wantLimit: 30 * time.Second},
 		{name: "a limit set", limit: 5 * time.Second, wantLimit: 5 * time.Second},
+		{name: "a limit set, with a retry line to write", limit: 5 * time.Second, retry: time.Second, wantLimit: 5 * time.Second},
 		{name: "a negative limit sets none", limit: -time.Second},
 		{name: "a writer that does not support deadlines is not asked again", errs: []error{http.ErrNotSupported}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			dw := &deadlineWriter{spyWriter: newSpyWriter(), errs: tc.errs}
-			s, err := httpx.NewEventStream(dw, getRequest(), httpx.EventStreamOptions{SendTimeout: tc.limit})
-			require.NoError(t, err)
 
 			before := time.Now()
+			s, err := httpx.NewEventStream(dw, getRequest(), httpx.EventStreamOptions{SendTimeout: tc.limit, Retry: tc.retry})
+			require.NoError(t, err)
 			require.NoError(t, s.Send(httpx.ServerEvent{Data: []byte("a")}))
 			require.NoError(t, s.Comment("c"))
 			after := time.Now()
@@ -529,22 +549,35 @@ func TestEventStreamBoundsEachSend(t *testing.T) {
 				assert.Len(t, dw.deadlines, 1, "only the deadline lifted at the start")
 				return
 			}
-			// Lifted at the start, then for each send: set, and lifted again so
-			// that the time between sends does not count against the next one.
-			require.Len(t, dw.deadlines, 5)
-			for _, i := range []int{0, 2, 4} {
+			// Lifted at the start; then the opening and each of the two sends
+			// set one and lift it again, so that the time between writes does
+			// not count against the next.
+			require.Len(t, dw.deadlines, 7)
+			for _, i := range []int{0, 2, 4, 6} {
 				assert.True(t, dw.deadlines[i].IsZero(), "deadline %d should be lifted", i)
 			}
-			for _, i := range []int{1, 3} {
-				assert.WithinRange(t, dw.deadlines[i], before.Add(tc.wantLimit), after.Add(tc.wantLimit))
+			for _, i := range []int{1, 3, 5} {
+				assert.WithinRange(t, dw.deadlines[i], before.Add(tc.wantLimit), after.Add(tc.wantLimit), "deadline %d", i)
 			}
 		})
 	}
 }
 
-func TestASendWhoseDeadlineCannotBeSetFailsAndEndsTheStream(t *testing.T) {
+func TestAnOpeningWhoseDeadlineCannotBeSetFails(t *testing.T) {
 	boom := errors.New("connection is gone")
 	dw := &deadlineWriter{spyWriter: newSpyWriter(), errs: []error{nil, boom}}
+
+	s, err := httpx.NewEventStream(dw, getRequest(), httpx.EventStreamOptions{})
+
+	require.ErrorIs(t, err, boom)
+	assert.Nil(t, s)
+}
+
+func TestASendWhoseDeadlineCannotBeSetFailsAndEndsTheStream(t *testing.T) {
+	boom := errors.New("connection is gone")
+	// Calls 0 to 2 are the lift and the opening's own deadline and its lifting;
+	// the fourth is the first send's.
+	dw := &deadlineWriter{spyWriter: newSpyWriter(), errs: []error{nil, nil, nil, boom}}
 	s := newStream(t, dw)
 
 	require.ErrorIs(t, s.Send(httpx.ServerEvent{Data: []byte("a")}), boom)
@@ -698,9 +731,9 @@ func dial(ctx context.Context, t *testing.T, url string, header http.Header) (*h
 	return resp, nil
 }
 
-func openStream(ctx context.Context, t *testing.T, url string, header http.Header) (*http.Response, *bufio.Reader) {
+func openStream(ctx context.Context, t *testing.T, url string) (*http.Response, *bufio.Reader) {
 	t.Helper()
-	resp, err := dial(ctx, t, url, header)
+	resp, err := dial(ctx, t, url, nil)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	return resp, bufio.NewReader(resp.Body)
@@ -813,7 +846,7 @@ func TestEventStreamDeliversEachEventAsItIsSentThroughTheRouter(t *testing.T) {
 			})
 			base := serve(t, 0, router)
 
-			resp, br := openStream(streamContext(t), t, base+"/stream", nil)
+			resp, br := openStream(streamContext(t), t, base+"/stream")
 
 			// Reaching here means the headers were flushed with no event sent.
 			assert.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
@@ -840,13 +873,18 @@ const (
 // tickingHandler sends tickCount events, one every tickEvery, through
 // whatever open returns. The two streams below differ only in open.
 func tickingHandler(open func(http.ResponseWriter, *http.Request) (func(id int) error, error)) http.HandlerFunc {
+	return spacedTickingHandler(tickEvery, open)
+}
+
+// spacedTickingHandler is tickingHandler with the time between events given.
+func spacedTickingHandler(every time.Duration, open func(http.ResponseWriter, *http.Request) (func(id int) error, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		send, err := open(w, r)
 		if err != nil {
 			httpx.InternalError(w, r, err)
 			return
 		}
-		ticker := time.NewTicker(tickEvery)
+		ticker := time.NewTicker(every)
 		defer ticker.Stop()
 		for i := 1; i <= tickCount; i++ {
 			select {
@@ -888,19 +926,23 @@ func TestEventStreamOutlivesTheServersWriteTimeout(t *testing.T) {
 	// The router's own timeout is off, as the design says a long stream's must
 	// be; only the server's write timeout is left, and a stream five times as
 	// long as it must still arrive whole. Each send has its own limit, so a
-	// limit shorter than the whole stream must not end it either.
+	// limit shorter than the whole stream must not end it either. That limit
+	// is wide enough that a stall in the scheduler of half a second does not
+	// fail a send, and the stream is longer than it.
+	const wideLimit = 600 * time.Millisecond
 	tests := []struct {
-		name string
-		opts httpx.EventStreamOptions
+		name  string
+		opts  httpx.EventStreamOptions
+		every time.Duration
 	}{
-		{"with the default send limit", httpx.EventStreamOptions{}},
-		{"with a send limit shorter than the stream", httpx.EventStreamOptions{SendTimeout: 3 * tickEvery}},
-		{"with no send limit", httpx.EventStreamOptions{SendTimeout: -1}},
+		{"with the default send limit", httpx.EventStreamOptions{}, tickEvery},
+		{"with a send limit shorter than the stream", httpx.EventStreamOptions{SendTimeout: wideLimit}, 80 * time.Millisecond},
+		{"with no send limit", httpx.EventStreamOptions{SendTimeout: -1}, tickEvery},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			router := newTestRouter(t, httpx.RouterOptions{Timeout: -1})
-			router.Get("/stream", tickingHandler(viaEventStream(tc.opts)))
+			router.Get("/stream", spacedTickingHandler(tc.every, viaEventStream(tc.opts)))
 			base := serve(t, shortWriteTimeout, router)
 
 			start := time.Now()
@@ -1040,7 +1082,7 @@ func TestASendToAClientThatStopsReadingIsBounded(t *testing.T) {
 			base := serve(t, 0, router)
 			// The client reads the headers and then nothing, so its socket
 			// buffers fill and stay full.
-			openStream(streamContext(t), t, base+"/stream", nil)
+			openStream(streamContext(t), t, base+"/stream")
 
 			select {
 			case res := <-ended:
@@ -1058,24 +1100,64 @@ func TestASendToAClientThatStopsReadingIsBounded(t *testing.T) {
 	}
 }
 
+func TestASendBehindAWriterThatLosesFlushErrorsIsStillBounded(t *testing.T) {
+	// chi's compressor flushes through http.Flusher, which cannot return an
+	// error, so the send that was held up reports success. The handler is held
+	// for one limit and no more: net/http closes the connection after the
+	// failed write, which ends the request's context, and the next send fails.
+	const limit = 200 * time.Millisecond
+	type result struct {
+		err   error
+		total time.Duration
+	}
+	ended := make(chan result, 1)
+	router := newTestRouter(t, httpx.RouterOptions{CompressLevel: 5})
+	router.Get("/stream", func(w http.ResponseWriter, r *http.Request) {
+		s, err := httpx.NewEventStream(w, r, httpx.EventStreamOptions{SendTimeout: limit})
+		if !assert.NoError(t, err) {
+			return
+		}
+		event := httpx.ServerEvent{Data: bytes.Repeat([]byte("x"), 1500)}
+		start := time.Now()
+		for {
+			if err := s.Send(event); err != nil {
+				ended <- result{err, time.Since(start)}
+				return
+			}
+		}
+	})
+	base := serve(t, 0, router)
+	openStream(streamContext(t), t, base+"/stream")
+
+	select {
+	case res := <-ended:
+		require.Error(t, res.err)
+		assert.Less(t, res.total, 2*time.Second, "the handler was held far longer than one send limit")
+	case <-time.After(4 * time.Second):
+		t.Fatal("a handler behind a writer that loses flush errors was still sending after four seconds")
+	}
+}
+
 func TestAnIdleStreamStillEndsCleanlyAfterItsSendLimit(t *testing.T) {
 	// The deadline around a send is lifted again once the event is out. Left in
 	// place it would run out while the stream sat idle, and the write that ends
 	// the response would be the one to fail: the client would see a cut stream.
-	const limit = 50 * time.Millisecond
+	// The limit is wide enough that a stall in the scheduler of half a second
+	// does not fail the live send, and the idle time passes it.
+	const (
+		limit = 600 * time.Millisecond
+		idle  = limit + 200*time.Millisecond
+	)
 	router := newTestRouter(t, httpx.RouterOptions{Timeout: -1})
 	router.Get("/stream", func(w http.ResponseWriter, r *http.Request) {
 		s, err := httpx.NewEventStream(w, r, httpx.EventStreamOptions{SendTimeout: limit})
 		if !assert.NoError(t, err) {
 			return
 		}
-		for _, data := range []string{"first", "second"} {
-			assert.NoError(t, s.Send(httpx.ServerEvent{Data: []byte(data)}))
-			select {
-			case <-time.After(4 * limit):
-			case <-r.Context().Done():
-				return
-			}
+		assert.NoError(t, s.Send(httpx.ServerEvent{Data: []byte("only")}))
+		select {
+		case <-time.After(idle):
+		case <-r.Context().Done():
 		}
 	})
 	base := serve(t, 0, router)
@@ -1083,7 +1165,7 @@ func TestAnIdleStreamStillEndsCleanlyAfterItsSendLimit(t *testing.T) {
 	events, err := collectEvents(streamContext(t), t, base+"/stream")
 
 	require.NoError(t, err, "the stream was cut instead of ending")
-	assert.Equal(t, []string{"data: first\n\n", "data: second\n\n"}, events)
+	assert.Equal(t, []string{"data: only\n\n"}, events)
 }
 
 func TestAClientThatGoesAwayEndsTheHandlerThroughTheRequestContext(t *testing.T) {
@@ -1101,7 +1183,7 @@ func TestAClientThatGoesAwayEndsTheHandlerThroughTheRequestContext(t *testing.T)
 	})
 	base := serve(t, 0, router)
 	ctx, goAway := context.WithCancel(streamContext(t))
-	_, br := openStream(ctx, t, base+"/stream", nil)
+	_, br := openStream(ctx, t, base+"/stream")
 	assert.Equal(t, "data: hello\n\n", readEvent(t, br))
 
 	goAway()
@@ -1147,6 +1229,30 @@ func TestAReconnectingClientIsServedFromItsLastEventID(t *testing.T) {
 	br := bufio.NewReader(resp.Body)
 	assert.Equal(t, "id: 3\ndata: event 3\n\n", readEvent(t, br))
 	assert.Equal(t, "id: 4\ndata: event 4\n\n", readEvent(t, br))
+}
+
+func TestAHandlerCanStillAnswerBehindAWriterOutsideTheRouterThatCannotFlush(t *testing.T) {
+	// The router's recorders offer Flush, and know nothing of the writer they
+	// wrap: a service that mounts the router under a wrapper of its own that
+	// hides flushing leaves them flushing into nothing. The stream has to see
+	// that before it writes a status, or the handler cannot answer.
+	router := newTestRouter(t, httpx.RouterOptions{})
+	router.Get("/stream", func(w http.ResponseWriter, r *http.Request) {
+		_, err := httpx.NewEventStream(w, r, httpx.EventStreamOptions{})
+		if errors.Is(err, httpx.ErrStreamUnsupported) {
+			httpx.Error(w, r, http.StatusNotImplemented, err)
+			return
+		}
+		assert.Fail(t, "the stream should have been refused", "err: %v", err)
+	})
+	outer := newPlainWriter()
+
+	router.ServeHTTP(outer, getRequest())
+
+	assert.Equal(t, http.StatusNotImplemented, outer.status, "the only status written is the handler's own")
+	assert.Equal(t, "application/json; charset=utf-8", outer.header.Get("Content-Type"))
+	assert.Empty(t, outer.header.Get("Cache-Control"))
+	assert.Empty(t, outer.header.Get("X-Accel-Buffering"))
 }
 
 func TestAHandlerCanStillAnswerWhenTheWriterCannotFlush(t *testing.T) {
