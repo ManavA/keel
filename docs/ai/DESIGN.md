@@ -1237,7 +1237,8 @@ A `Match` holds when every part that is set holds:
 **Three values.** A condition holds, does not hold, or cannot be told. It
 cannot be told when the attribute is present but its type is one the
 operator cannot compare: a string where a number is wanted, a boolean, a
-list, a pointer, `null`, NaN, a number written too long to compare, or a
+list, a pointer, `null`, NaN, a number written too long to compare, a float
+whose two readings disagree about the condition (below), or a
 type different from the one the value is (`OpEq` of the number 5 against the
 string `"5"`). `OpIn` is `OpEq` on each element joined by "or", and in three
 values: it holds if any element equals the attribute; it does not hold only
@@ -1263,17 +1264,24 @@ empty when the deciding rule matched for certain, and it belongs to the rule
 that decided, not to others that also matched.
 
 **Numbers.** A number is compared exactly. An integer is itself. A float
-with an integer value is that integer, so a `float64` 2^70 is
-1180591620717411303424 and is above a threshold of 1180591620717411303000,
-and a `float32` 1000000064 is above 1000000062 (above 2^53 every float is an
-integer, and its shortest decimal is not the number it is). Any other float
-is the shortest decimal that gives it back, so a `float64` 0.1 is the number
-0.1 and meets a threshold written 0.1; comparing the binary value instead
-would leave 0.3 below a threshold of 0.3. The price of the first rule is
-that a `float64` 1e23, which is 99999999999999991611392, is below a
-threshold written 1e23. A number must reach the package unrounded: tool
-input decoded into a `float64` has already lost its digits, so decode it
-with `json.Decoder.UseNumber` and pass the `json.Number` on. A `json.Number` is the decimal it
+without an integer value is the shortest decimal that gives it back, so a
+`float64` 0.1 is the number 0.1 and meets a threshold written 0.1; comparing
+the binary value instead would leave 0.3 below a threshold of 0.3. A float
+with an integer value has two readings, that integer and its shortest
+decimal. Below 2^53 (below 2^24 for a `float32`) they are one number. Above
+they are two: a `float64` 2^70 is 1180591620717411303424 and also
+1180591620717411300000, and a `float64` 1e23 is 99999999999999991611392 and
+also 1e23. A condition is told under both readings. Where they give the same
+outcome that is the outcome: a `float64` 1e23 is above 1e22 and is not above
+1e24 or 1e23 whichever it is. Where they differ the condition cannot be told,
+and the attribute is named in `Uncertain` like any other: a `float64` 1e23
+against `gte 1e23`, or 2^70 against `gt 1180591620717411303000`. When both
+sides are such floats their readings are paired, exact with exact and
+shortest with shortest, so a float equals itself. So a float cannot be told
+against a threshold that lies within its rounding, and a number that is
+meant to be exact should reach the package as a `json.Number`, not as a
+`float64` that has already rounded it: tool input is decoded with
+`json.Decoder.UseNumber`, and the `json.Number` passed on. A `json.Number` is the decimal it
 spells, of any size or precision up to 4096 bytes of text and an exponent of
 4096, which bounds what a hostile value can cost; text past either bound, or
 that is not a JSON number (no plus sign, no leading zero, no `Infinity`), is
@@ -4280,20 +4288,22 @@ chose them.
     cannot be evaluated at all: "does not match" is safe for an allow rule and
     for no other.
 
-42. **Numbers are compared exactly, a float with an integer value as that
-    integer and any other float as the shortest decimal that gives it back,
-    and `Parse` keeps every number as written.** Rejected: `float64` for
-    everything, which turns `9007199254740993` into `9007199254740992` and a
-    threshold into a different threshold; the exact binary value of every
-    float, which leaves a `float64` 0.3 below a threshold of 0.3; and the
-    shortest decimal of every float, which turns a `float64` 2^70 into
-    1180591620717411300000 and puts it below a threshold of
-    1180591620717411303000. The mixed rule has a price: a `float64` 1e23, which
-    is 99999999999999991611392, is below a threshold written 1e23. Tool input
-    must reach the package as `json.Number`, not as a `float64` that has
-    already rounded it. Text is read to 4096 bytes and an exponent of 4096, and
-    past that cannot be told, because the value is a model's and an exponent
-    of a million is an allocation of that size.
+42. **Numbers are compared exactly, and a float whose integer value is
+    rounded is told under both of its readings.** `Parse` keeps every number
+    as written. Rejected: `float64` for everything, which turns
+    `9007199254740993` into `9007199254740992` and a threshold into a
+    different threshold; the exact binary value of every float, which leaves a
+    `float64` 0.3 below a threshold of 0.3; and, for a float with an integer
+    value, either single reading. As the exact integer, a `float64` 1e23
+    (99999999999999991611392) is below a threshold written 1e23; as its
+    shortest decimal, a `float64` 2^70 (1180591620717411300000) is below a
+    threshold of 1180591620717411303000 that it is above. Each is a wrong answer
+    given with certainty, and the package's rule is that what cannot be told
+    counts toward the stricter outcome. So both readings are compared; one
+    outcome is the outcome; two make the condition uncertain. Below 2^53 the
+    readings are one number and nothing changes. Text is read to 4096 bytes
+    and an exponent of 4096, and past that cannot be told, because the value is
+    a model's and an exponent of a million is an allocation of that size.
 
 43. **`Parse` refuses what a reader and the decoder would see differently.** A
     repeated key at any depth, compared as the decoder compares keys, without

@@ -80,16 +80,19 @@
 //
 // Numbers compare as numbers, exactly, whatever holds them: any integer or float
 // type, or a [encoding/json.Number], which [Parse] uses for every number so a
-// threshold keeps the digits it was written with. A float with an integer value
-// is that integer, so a float64 2^70 is above 1180591620717411303000; any other
-// float is the shortest decimal that gives it back, so a float64 0.1 meets a
-// threshold of 0.1. Text of a number is read to a length of 4096 bytes and an
-// exponent of 4096; past that it cannot be told. Strings and booleans compare
-// with eq and ne only.
+// threshold keeps the digits it was written with. A float without an integer
+// value is the shortest decimal that gives it back, so a float64 0.1 meets a
+// threshold of 0.1. A float with an integer value has two readings, that integer
+// and its shortest decimal, which are one number below 2^53 and two above; a
+// condition is told under both, and where they disagree it cannot be told, so a
+// float64 1e23 against gte 1e23 asks or blocks, and is named in Uncertain. A
+// float cannot be told against a threshold within its rounding. Text of a number
+// is read to a length of 4096 bytes and an exponent of 4096; past that it
+// cannot be told. Strings and booleans compare with eq and ne only.
 //
-// A number must reach the package unrounded: one decoded into a float64 has
-// already lost its digits. Decode tool input with [encoding/json.Decoder.UseNumber],
-// as Parse does, and pass the json.Number on.
+// A number that is meant to be exact must reach the package as a json.Number:
+// one decoded into a float64 has already rounded. Decode tool input with
+// [encoding/json.Decoder.UseNumber], as Parse does, and pass the json.Number on.
 //
 // # Ask
 //

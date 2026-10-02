@@ -8,6 +8,7 @@ package policy_test
 import (
 	"encoding/json"
 	"math"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -264,7 +265,7 @@ func TestDecide_AMixedListBlocksWhatItCannotCompare(t *testing.T) {
 // does not hold only if every element could be compared and none equalled, and
 // otherwise it cannot be told.
 func TestCond_InIsEqJoinedByOr(t *testing.T) {
-	pool := []any{22, "ssh", true, "yes", 1.5, "22", false}
+	pool := []any{22, "ssh", true, "yes", 1.5, "22", false, 1e23, json.Number("1e23")}
 	attrPool := append([]any{nil, "other", 80, json.Number("22"), []any{22}}, pool...)
 
 	or := func(results []string) string {
@@ -307,7 +308,14 @@ func TestCond_InIsEqJoinedByOr(t *testing.T) {
 			checked++
 		}
 	}
-	assert.Greater(t, checked, 3000)
+	assert.Greater(t, checked, 5000)
+
+	t.Run("a float that cannot be told against an element makes the list uncertain, not false", func(t *testing.T) {
+		in := policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{json.Number("1e23"), json.Number("5")}}
+		assert.Equal(t, unclearT, truthOf(in, attrs("x", 1e23)))
+		assert.Equal(t, unmetT, truthOf(in, attrs("x", 1e22)))
+		assert.Equal(t, holdsT, truthOf(in, attrs("x", 5)))
+	})
 
 	t.Run("an attribute that is absent does not hold under in, as under eq", func(t *testing.T) {
 		assert.Equal(t, unmetT, truthOf(policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{22, "ssh"}}, nil))
@@ -513,6 +521,85 @@ func TestDecide_ARuleThatCannotBeEvaluatedMatchesUnlessItAllows(t *testing.T) {
 	})
 }
 
+// A float with an integer value that is large enough to be rounded has two
+// readings, and a comparison they disagree on cannot be told: an ask or block
+// rule on it matches and an allow rule does not, and the attribute is named.
+func TestDecide_AFloatAgainstAThresholdWithinItsRoundingCountsAgainstTheAction(t *testing.T) {
+	rule := func(effect policy.Effect, op policy.Op, threshold string) policy.Policy {
+		return policy.Policy{Default: policy.Allow, Rules: []policy.Rule{{
+			Name: "r", Effect: effect,
+			When: policy.Match{Attrs: []policy.Cond{{Attr: "amount", Op: op, Value: json.Number(threshold)}}},
+		}}}
+	}
+	for name, attr := range map[string]any{"float64 1e23": 1e23, "float32 1000000064 against 1e9": float32(1000000064)} {
+		threshold := "1e23"
+		if _, ok := attr.(float32); ok {
+			threshold = "1000000064"
+		}
+		a := policy.Action{Kind: "pay", Attrs: attrs("amount", attr)}
+
+		// gte: the readings differ, so it cannot be told.
+		for _, effect := range []policy.Effect{policy.Ask, policy.Block} {
+			got := rule(effect, policy.OpGte, threshold).Decide(a)
+			assert.Equal(t, effect, got.Effect, "%s, %s", name, effect)
+			assert.Equal(t, "r", got.Rule, "%s, %s", name, effect)
+			assert.Equal(t, []string{"amount"}, got.Uncertain, "%s, %s", name, effect)
+		}
+		got := rule(policy.Allow, policy.OpGte, threshold).Decide(a)
+		assert.Equal(t, policy.RuleDefault, got.Rule, "%s: an allow rule does not match what cannot be told", name)
+		assert.Empty(t, got.Matched, name)
+
+		// gt: neither reading is above the threshold, so it does not hold, for certain.
+		for _, effect := range []policy.Effect{policy.Ask, policy.Block, policy.Allow} {
+			assert.Equal(t, policy.RuleDefault, rule(effect, policy.OpGt, threshold).Decide(a).Rule, "%s, %s", name, effect)
+		}
+
+		// lte: both readings are at or below it, so it holds, for certain.
+		for _, effect := range []policy.Effect{policy.Ask, policy.Block, policy.Allow} {
+			got := rule(effect, policy.OpLte, threshold).Decide(a)
+			assert.Equal(t, effect, got.Effect, "%s, %s", name, effect)
+			assert.Equal(t, "r", got.Rule, "%s, %s", name, effect)
+			assert.Empty(t, got.Uncertain, "%s, %s: the readings agree", name, effect)
+		}
+	}
+
+	t.Run("the limit the review wrote, with the float on either side", func(t *testing.T) {
+		limit := func(op policy.Op, threshold string) policy.Decision {
+			p := rule(policy.Ask, op, threshold)
+			return p.Decide(policy.Action{Kind: "pay", Attrs: attrs("amount", math.Ldexp(1, 70))})
+		}
+		between := limit(policy.OpGt, "1180591620717411303000")
+		assert.Equal(t, policy.Ask, between.Effect)
+		assert.Equal(t, []string{"amount"}, between.Uncertain)
+		below := limit(policy.OpGt, "1180591620717411299000")
+		assert.Equal(t, policy.Ask, below.Effect)
+		assert.Empty(t, below.Uncertain, "above both readings, for certain")
+		above := limit(policy.OpGt, "1180591620717411304000")
+		assert.Equal(t, policy.RuleDefault, above.Rule, "above neither reading, for certain")
+	})
+
+	t.Run("the same float against a threshold well inside what it can be told", func(t *testing.T) {
+		got := rule(policy.Ask, policy.OpGt, "1e22").Decide(policy.Action{Kind: "pay", Attrs: attrs("amount", 1e23)})
+		assert.Equal(t, policy.Ask, got.Effect)
+		assert.Empty(t, got.Uncertain)
+	})
+
+	t.Run("an integer below 2^53 as a float is one number, so nothing is uncertain", func(t *testing.T) {
+		for _, f := range []float64{0, 1, 100, 3000, 1e15, float64(1<<53 - 1), float64(1 << 53)} {
+			for _, op := range []policy.Op{policy.OpGt, policy.OpGte, policy.OpLt, policy.OpLte, policy.OpEq, policy.OpNe} {
+				c := policy.Cond{Attr: "x", Op: op, Value: json.Number(strconv.FormatFloat(f, 'f', 0, 64))}
+				assert.NotEqual(t, unclearT, truthOf(c, attrs("x", f)), "float64 %v %s", f, op)
+			}
+		}
+		for _, f := range []float32{0, 1, 100, 1 << 20, 1 << 24} {
+			for _, op := range []policy.Op{policy.OpGt, policy.OpGte, policy.OpLt, policy.OpLte, policy.OpEq, policy.OpNe} {
+				c := policy.Cond{Attr: "x", Op: op, Value: json.Number(strconv.FormatFloat(float64(f), 'f', 0, 32))}
+				assert.NotEqual(t, unclearT, truthOf(c, attrs("x", f)), "float32 %v %s", f, op)
+			}
+		}
+	})
+}
+
 func TestCond_NumbersAreExact(t *testing.T) {
 	big := "123456789012345678901234567890.123456789"
 	bigPlus := "123456789012345678901234567890.123456790"
@@ -535,23 +622,73 @@ func TestCond_NumbersAreExact(t *testing.T) {
 		{name: "float32 0.1 equals the threshold 0.1", op: policy.OpEq, value: json.Number("0.1"), attr: float32(0.1), want: holdsT},
 		{name: "float64 0.1 plus 0.2 is above 0.3, as it is", op: policy.OpGt, value: json.Number("0.3"), attr: sum, want: holdsT},
 		{name: "a float threshold and a float attribute agree", op: policy.OpLte, value: 0.7, attr: 0.7, want: holdsT},
-		// A float with an integer value is that integer, not its shortest decimal.
-		{name: "float64 2^70 is above a threshold a little below it", op: policy.OpGt, value: json.Number("1180591620717411303000"), attr: math.Ldexp(1, 70), want: holdsT},
-		{name: "float64 2^70 equals the integer it is", op: policy.OpEq, value: json.Number("1180591620717411303424"), attr: math.Ldexp(1, 70), want: holdsT},
-		{name: "float64 2^70 is above the same integer written with a decimal point", op: policy.OpGte, value: json.Number("1180591620717411303424.0"), attr: math.Ldexp(1, 70), want: holdsT},
-		{name: "float64 2^70 is not above the integer it is", op: policy.OpGt, value: json.Number("1180591620717411303424"), attr: math.Ldexp(1, 70), want: unmetT},
-		{name: "float64 -2^70 is below a threshold a little above it", op: policy.OpLt, value: json.Number("-1180591620717411303000"), attr: -math.Ldexp(1, 70), want: holdsT},
-		{name: "float32 1000000064 is above 1000000062", op: policy.OpGt, value: 1000000062, attr: float32(1000000064), want: holdsT},
-		{name: "float32 1000000064 equals the integer it is", op: policy.OpEq, value: json.Number("1000000064"), attr: float32(1000000064), want: holdsT},
-		{name: "float32 1000000064 is not above 1000000064", op: policy.OpGt, value: json.Number("1000000064"), attr: float32(1000000064), want: unmetT},
-		{name: "float32 2^40 is the integer it is", op: policy.OpEq, value: int64(1) << 40, attr: float32(1 << 40), want: holdsT},
+		// A float with an integer value has two readings, the exact integer and the
+		// shortest decimal that gives the float back, and they are the same number
+		// below 2^53. Where they give one outcome for the condition that is the
+		// outcome; where they differ the condition cannot be told.
+		//
+		// float64 2^70: exact 1180591620717411303424, shortest 1180591620717411300000.
+		{name: "float64 2^70 against a threshold between its readings, gt", op: policy.OpGt, value: json.Number("1180591620717411303000"), attr: math.Ldexp(1, 70), want: unclearT},
+		{name: "float64 2^70 against a threshold between its readings, lt", op: policy.OpLt, value: json.Number("1180591620717411303000"), attr: math.Ldexp(1, 70), want: unclearT},
+		{name: "float64 2^70 against a threshold between its readings, gte", op: policy.OpGte, value: json.Number("1180591620717411303000"), attr: math.Ldexp(1, 70), want: unclearT},
+		{name: "float64 2^70 above a threshold below both readings", op: policy.OpGt, value: json.Number("1180591620717411299000"), attr: math.Ldexp(1, 70), want: holdsT},
+		{name: "float64 2^70 is not below a threshold below both readings", op: policy.OpLt, value: json.Number("1180591620717411299000"), attr: math.Ldexp(1, 70), want: unmetT},
+		{name: "float64 2^70 is not above a threshold above both readings", op: policy.OpGt, value: json.Number("1180591620717411304000"), attr: math.Ldexp(1, 70), want: unmetT},
+		{name: "float64 2^70 is below a threshold above both readings", op: policy.OpLt, value: json.Number("1180591620717411304000"), attr: math.Ldexp(1, 70), want: holdsT},
+		{name: "float64 2^70 equals neither reading for certain: its exact integer", op: policy.OpEq, value: json.Number("1180591620717411303424"), attr: math.Ldexp(1, 70), want: unclearT},
+		{name: "float64 2^70 equals neither reading for certain: its shortest decimal", op: policy.OpEq, value: json.Number("1180591620717411300000"), attr: math.Ldexp(1, 70), want: unclearT},
+		{name: "float64 2^70 is not above its exact integer under either reading", op: policy.OpGt, value: json.Number("1180591620717411303424"), attr: math.Ldexp(1, 70), want: unmetT},
+		{name: "float64 2^70 is below or at its exact integer under either reading", op: policy.OpLte, value: json.Number("1180591620717411303424"), attr: math.Ldexp(1, 70), want: holdsT},
+		{name: "float64 2^70 meets its shortest decimal under either reading", op: policy.OpGte, value: json.Number("1180591620717411300000"), attr: math.Ldexp(1, 70), want: holdsT},
+		{name: "float64 -2^70 against a threshold between its readings", op: policy.OpLt, value: json.Number("-1180591620717411303000"), attr: -math.Ldexp(1, 70), want: unclearT},
+		// float64 1e23: exact 99999999999999991611392, shortest 100000000000000000000000.
+		{name: "float64 1e23 against 1e23, gte", op: policy.OpGte, value: json.Number("1e23"), attr: 1e23, want: unclearT},
+		{name: "float64 1e23 against 1e23, gt: neither reading is above it", op: policy.OpGt, value: json.Number("1e23"), attr: 1e23, want: unmetT},
+		{name: "float64 1e23 against 1e23, eq", op: policy.OpEq, value: json.Number("1e23"), attr: 1e23, want: unclearT},
+		{name: "float64 1e23 against 1e23, ne", op: policy.OpNe, value: json.Number("1e23"), attr: 1e23, want: unclearT},
+		{name: "float64 1e23 against 1e23, lt", op: policy.OpLt, value: json.Number("1e23"), attr: 1e23, want: unclearT},
+		{name: "float64 1e23 against 1e23, lte: both readings are at or below it", op: policy.OpLte, value: json.Number("1e23"), attr: 1e23, want: holdsT},
+		{name: "float64 1e23 is above 1e22 under both readings", op: policy.OpGt, value: json.Number("1e22"), attr: 1e23, want: holdsT},
+		{name: "float64 1e23 is not above 1e24 under either", op: policy.OpGt, value: json.Number("1e24"), attr: 1e23, want: unmetT},
+		{name: "float64 1e23 is below 1e24 under both readings", op: policy.OpLt, value: json.Number("1e24"), attr: 1e23, want: holdsT},
+		{name: "float64 1e23 is not at or below 1e22 under either", op: policy.OpLte, value: json.Number("1e22"), attr: 1e23, want: unmetT},
+		{name: "float64 1e23 does not equal 1e22 under either", op: policy.OpEq, value: json.Number("1e22"), attr: 1e23, want: unmetT},
+		{name: "float64 1e23 against a threshold between its readings", op: policy.OpGt, value: json.Number("99999999999999995000000"), attr: 1e23, want: unclearT},
+		{name: "float64 1e23 against a threshold between its readings, lt", op: policy.OpLt, value: json.Number("99999999999999995000000"), attr: 1e23, want: unclearT},
+		// float32 1000000064: exact 1000000064, shortest 1000000060.
+		{name: "float32 1000000064 against a threshold between its readings", op: policy.OpGt, value: 1000000062, attr: float32(1000000064), want: unclearT},
+		{name: "float32 1000000064 equals the integer it is, for certain under neither", op: policy.OpEq, value: json.Number("1000000064"), attr: float32(1000000064), want: unclearT},
+		{name: "float32 1000000064 equals its shortest decimal, for certain under neither", op: policy.OpEq, value: json.Number("1000000060"), attr: float32(1000000064), want: unclearT},
+		{name: "float32 1000000064 meets its exact integer", op: policy.OpGte, value: json.Number("1000000064"), attr: float32(1000000064), want: unclearT},
+		{name: "float32 1000000064 is not above its exact integer", op: policy.OpGt, value: json.Number("1000000064"), attr: float32(1000000064), want: unmetT},
+		{name: "float32 1000000064 is above a threshold below both readings", op: policy.OpGt, value: 1000000059, attr: float32(1000000064), want: holdsT},
+		{name: "float32 1000000064 is below a threshold above both", op: policy.OpLt, value: 1000000070, attr: float32(1000000064), want: holdsT},
+		{name: "float32 2^40 against the integer it is", op: policy.OpEq, value: int64(1) << 40, attr: float32(1 << 40), want: unclearT},
+		{name: "float32 2^40 is above 2^39 under both readings", op: policy.OpGt, value: int64(1) << 39, attr: float32(1 << 40), want: holdsT},
+		// A float against a float of its own kind is the same number on both
+		// readings, and equals itself.
+		{name: "a float64 1e23 equals a float64 1e23", op: policy.OpEq, value: 1e23, attr: 1e23, want: holdsT},
+		{name: "a float64 1e23 meets a float64 1e23", op: policy.OpGte, value: 1e23, attr: 1e23, want: holdsT},
+		{name: "a float64 1e23 is not above a float64 1e23", op: policy.OpGt, value: 1e23, attr: 1e23, want: unmetT},
+		{name: "a float64 2^70 equals a float64 2^70", op: policy.OpEq, value: math.Ldexp(1, 70), attr: math.Ldexp(1, 70), want: holdsT},
+		{name: "a float64 2^70 is not equal to the next float64", op: policy.OpEq, value: math.Nextafter(math.Ldexp(1, 70), math.Inf(1)), attr: math.Ldexp(1, 70), want: unmetT},
+		{name: "a float64 2^70 is below the next float64", op: policy.OpLt, value: math.Nextafter(math.Ldexp(1, 70), math.Inf(1)), attr: math.Ldexp(1, 70), want: holdsT},
+		// The threshold may be the float, and the attribute the text.
+		{name: "text 1e23 against a float64 1e23 threshold, gte", op: policy.OpGte, value: 1e23, attr: json.Number("1e23"), want: holdsT},
+		{name: "text 1e23 against a float64 1e23 threshold, gt", op: policy.OpGt, value: 1e23, attr: json.Number("1e23"), want: unclearT},
+		{name: "text 1e23 against a float64 1e23 threshold, eq", op: policy.OpEq, value: 1e23, attr: json.Number("1e23"), want: unclearT},
+		// Below the point where the readings part they are one number, and nothing
+		// changes.
 		{name: "a float64 2^53 is as before", op: policy.OpEq, value: int64(1) << 53, attr: float64(1 << 53), want: holdsT},
 		{name: "a float64 with a small integer value is as before", op: policy.OpEq, value: json.Number("5"), attr: 5.0, want: holdsT},
+		{name: "a float64 1e15 is as before", op: policy.OpEq, value: json.Number("1e15"), attr: 1e15, want: holdsT},
 		{name: "a float32 1e9 is exactly 1000000000", op: policy.OpEq, value: json.Number("1000000000"), attr: float32(1e9), want: holdsT},
+		{name: "a float32 2^24 is as before", op: policy.OpEq, value: int64(1) << 24, attr: float32(1 << 24), want: holdsT},
 		{name: "a float64 1e22 is exactly 10^22", op: policy.OpEq, value: json.Number("1e22"), attr: 1e22, want: holdsT},
-		// The other side of that: a round number written large is not always a
-		// float. float64 1e23 is 99999999999999991611392, and is below 1e23.
-		{name: "a float64 1e23 is the integer it is, which is below 1e23", op: policy.OpLt, value: json.Number("1e23"), attr: 1e23, want: holdsT},
+		{name: "a float64 1e22 is not above 10^22", op: policy.OpGt, value: json.Number("1e22"), attr: 1e22, want: unmetT},
+		// The largest float64, against its shortest spelling.
+		{name: "the largest float64 against its shortest spelling, gt", op: policy.OpGt, value: json.Number("1.7976931348623157e308"), attr: math.MaxFloat64, want: unclearT},
+		{name: "the largest float64 against its shortest spelling, gte", op: policy.OpGte, value: json.Number("1.7976931348623157e308"), attr: math.MaxFloat64, want: holdsT},
 		// A float without an integer value is still the number it was written as.
 		{name: "float64 0.5 is the number it is", op: policy.OpEq, value: json.Number("0.5"), attr: 0.5, want: holdsT},
 		{name: "float32 0.1 still equals the threshold 0.1", op: policy.OpEq, value: json.Number("0.1"), attr: float32(0.1), want: holdsT},

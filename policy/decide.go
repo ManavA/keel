@@ -143,11 +143,11 @@ func (c Cond) eval(a Action) truth {
 	}
 	switch c.Op {
 	case OpEq, OpNe:
-		same, ok := compare(v, c.Value)
+		orders, ok := compare(v, c.Value)
 		if !ok {
 			return unclear
 		}
-		return fromBool(same == (c.Op == OpEq))
+		return agree(orders, func(order int) bool { return (order == 0) == (c.Op == OpEq) })
 	case OpIn:
 		return in(v, c.Value)
 	default: // gt, gte, lt, lte: check has refused every other operator
@@ -155,27 +155,58 @@ func (c Cond) eval(a Action) truth {
 	}
 }
 
-// compare reports whether x equals y, and whether the two can be compared at
-// all: two numbers, two strings or two booleans. A value of any other type, or
-// of another type than its partner, cannot be.
-func compare(x, y any) (equal, comparable bool) {
+// compare orders x against y, and says whether the two can be compared at all:
+// two numbers, two strings or two booleans. A value of any other type, or of
+// another type than its partner, cannot be. For numbers the result is the
+// ordering, -1, 0 or 1, under each reading of the two (one, unless a number is a
+// float with an integer value too large to be told from its shortest decimal);
+// for strings and booleans it is 0 when they are equal and 1 when they are not.
+func compare(x, y any) (orders []int, comparable bool) {
 	if nx, ok := numberOf(x); ok {
 		ny, ok := numberOf(y)
-		return ok && nx.cmp(ny) == 0, ok
+		if !ok {
+			return nil, false
+		}
+		return nx.orders(ny), true
 	}
 	if sx, ok := stringOf(x); ok {
 		sy, ok := stringOf(y)
-		return ok && sx == sy, ok
+		if !ok {
+			return nil, false
+		}
+		return []int{boolOrder(sx == sy)}, true
 	}
 	if bx, ok := boolOf(x); ok {
 		by, ok := boolOf(y)
-		return ok && bx == by, ok
+		if !ok {
+			return nil, false
+		}
+		return []int{boolOrder(bx == by)}, true
 	}
-	return false, false
+	return nil, false
+}
+
+func boolOrder(equal bool) int {
+	if equal {
+		return 0
+	}
+	return 1
+}
+
+// agree is what a condition comes to over the orderings compare gave: the one
+// outcome when every reading gives it, and otherwise cannot be told.
+func agree(orders []int, holds func(order int) bool) truth {
+	t := fromBool(holds(orders[0]))
+	for _, order := range orders[1:] {
+		if fromBool(holds(order)) != t {
+			return unclear
+		}
+	}
+	return t
 }
 
 // ordered compares x with y under one of the four ordering operators. It can
-// be told only between two numbers.
+// be told only between two numbers, and only if every reading of them agrees.
 func ordered(op Op, x, y any) truth {
 	nx, ok := numberOf(x)
 	if !ok {
@@ -185,36 +216,42 @@ func ordered(op Op, x, y any) truth {
 	if !ok {
 		return unclear
 	}
-	switch c := nx.cmp(ny); op {
-	case OpGt:
-		return fromBool(c > 0)
-	case OpGte:
-		return fromBool(c >= 0)
-	case OpLt:
-		return fromBool(c < 0)
-	default:
-		return fromBool(c <= 0)
-	}
+	return agree(nx.orders(ny), func(order int) bool {
+		switch op {
+		case OpGt:
+			return order > 0
+		case OpGte:
+			return order >= 0
+		case OpLt:
+			return order < 0
+		default:
+			return order <= 0
+		}
+	})
 }
 
 // in is eq on each element of list, joined by "or": it holds if any element
 // equals v, and does not hold only if every element could be compared with v
-// and none equalled it. An element that could not be compared leaves the rest
-// unable to say, since it might have been the one: a list of 22 and "ssh" does
-// not rule out the string "22".
+// and none equalled it. An element that could not be compared, or could not be
+// told, leaves the rest unable to say, since it might have been the one: a list
+// of 22 and "ssh" does not rule out the string "22".
 func in(v, list any) truth {
 	rl := reflect.ValueOf(list)
-	allCompared := true
+	allTold := true
 	for i := range rl.Len() {
-		equal, ok := compare(v, rl.Index(i).Interface())
-		switch {
-		case !ok:
-			allCompared = false
-		case equal:
+		orders, ok := compare(v, rl.Index(i).Interface())
+		if !ok {
+			allTold = false
+			continue
+		}
+		switch agree(orders, func(order int) bool { return order == 0 }) {
+		case met:
 			return met
+		case unclear:
+			allTold = false
 		}
 	}
-	if allCompared {
+	if allTold {
 		return unmet
 	}
 	return unclear
@@ -226,18 +263,39 @@ func isList(v any) bool {
 	return k == reflect.Slice || k == reflect.Array
 }
 
-// number is an exact number, or an infinity.
+// number is an exact number, or an infinity. A float with an integer value too
+// large to be told from its shortest decimal has two readings: r is the exact
+// integer, and alt is the shortest decimal that gives the float back. Every
+// other number has one, and alt is nil.
 type number struct {
 	inf int      // 1 or -1 for an infinity, else 0
 	r   *big.Rat // the value, when finite
+	alt *big.Rat // the second reading, when there is one
 }
 
-// cmp orders n and o: -1, 0 or 1.
-func (n number) cmp(o number) int {
-	if n.inf != 0 || o.inf != 0 {
-		return cmp.Compare(n.inf, o.inf)
+// order is the ordering of the reading xr of x against the reading yr of y.
+func order(x number, xr *big.Rat, y number, yr *big.Rat) int {
+	if x.inf != 0 || y.inf != 0 {
+		return cmp.Compare(x.inf, y.inf)
 	}
-	return n.r.Cmp(o.r)
+	return xr.Cmp(yr)
+}
+
+// orders is the ordering of n against o under each reading: one, or two when
+// either has a second. When both have, their readings are paired, exact with
+// exact and shortest with shortest, so that a float is the same number as
+// itself; when one has, each of its readings meets the other's one.
+func (n number) orders(o number) []int {
+	out := []int{order(n, n.r, o, o.r)}
+	switch {
+	case n.alt != nil && o.alt != nil:
+		out = append(out, order(n, n.alt, o, o.alt))
+	case n.alt != nil:
+		out = append(out, order(n, n.alt, o, o.r))
+	case o.alt != nil:
+		out = append(out, order(n, n.r, o, o.alt))
+	}
+	return out
 }
 
 // What is compared of a number written as text, so that a hostile one cannot
@@ -250,13 +308,15 @@ const (
 
 // numberOf reads v as a number, whatever Go type holds it: any integer or float
 // type, a named type over one, or a json.Number. It is exact. An integer is the
-// integer it is. A float with an integer value is that integer, so a float64
-// 2^70 is 1180591620717411303424 and is above a threshold of
-// 1180591620717411303000. Any other float is the shortest decimal that gives it
-// back, so a float64 0.1 is the number 0.1 and a threshold written 0.1 meets
-// it. Text is the decimal it spells, of any size or precision up to the bounds
-// above, and must be a JSON number. A NaN is not a number, nor is text that is
-// not one.
+// integer it is. A float without an integer value is the shortest decimal that
+// gives it back, so a float64 0.1 is the number 0.1 and a threshold written 0.1
+// meets it. A float with an integer value has two readings, that integer and
+// its shortest decimal, which are one number below 2^53 (below 2^24 for a
+// float32) and two numbers above: a float64 2^70 is 1180591620717411303424 and
+// is also 1180591620717411300000, and neither is the better answer, so a
+// comparison they disagree on cannot be told. Text is the decimal it spells, of
+// any size or precision up to the bounds above, and must be a JSON number. A NaN
+// is not a number, nor is text that is not one.
 func numberOf(v any) (number, bool) {
 	if n, ok := v.(json.Number); ok {
 		r, fault := parseNumber(string(n))
@@ -286,11 +346,18 @@ func floatNumber(f float64, bits int) (number, bool) {
 	case math.IsInf(f, -1):
 		return number{inf: -1}, true
 	}
-	if f == math.Trunc(f) {
-		return number{r: new(big.Rat).SetFloat64(f)}, true
+	shortest, ok := new(big.Rat).SetString(strconv.FormatFloat(f, 'e', -1, bits))
+	if !ok {
+		return number{}, false
 	}
-	r, ok := new(big.Rat).SetString(strconv.FormatFloat(f, 'e', -1, bits))
-	return number{r: r}, ok
+	if f != math.Trunc(f) {
+		return number{r: shortest}, true
+	}
+	exact := new(big.Rat).SetFloat64(f)
+	if exact.Cmp(shortest) == 0 {
+		return number{r: exact}, true
+	}
+	return number{r: exact, alt: shortest}, true
 }
 
 // Why text is not a number that can be compared, as a phrase to follow "a
