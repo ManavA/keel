@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 
 	"github.com/ManavA/keel/agent"
 	"github.com/ManavA/keel/httpx"
@@ -66,6 +67,15 @@ type Options struct {
 	// keep proxies from closing it. Default 15 seconds; zero or less means
 	// the default.
 	Heartbeat time.Duration
+	// CrossOrigin guards the three routes that change something against a
+	// request a browser makes for a page on another origin: one that is
+	// cross-origin by Sec-Fetch-Site or by Origin is refused with 403, before
+	// Actor is asked. A request with neither header is not a browser acting
+	// for a page, and passes. Nil means a protection with no trusted origins;
+	// a service whose front end is on another origin supplies one that trusts
+	// it. Its deny handler is not used: the answer is the same generic 403 as
+	// any other refusal. Reading, and the event stream, are not guarded.
+	CrossOrigin *http.CrossOriginProtection
 	// Logger defaults to slog.Default. A logger that httpx.NewRouter put on
 	// the request is preferred to it, as everywhere in this module.
 	Logger *slog.Logger
@@ -73,11 +83,12 @@ type Options struct {
 
 // API is the HTTP surface of an engine.
 type API struct {
-	runs      Runs
-	actor     func(r *http.Request) string
-	poll      time.Duration
-	heartbeat time.Duration
-	log       *slog.Logger
+	runs        Runs
+	actor       func(r *http.Request) string
+	crossOrigin *http.CrossOriginProtection
+	poll        time.Duration
+	heartbeat   time.Duration
+	log         *slog.Logger
 }
 
 // New builds an API. It returns an error when Runs is nil.
@@ -86,11 +97,15 @@ func New(opts Options) (*API, error) {
 		return nil, errors.New("agent/httpapi: Options.Runs is required")
 	}
 	a := &API{
-		runs:      opts.Runs,
-		actor:     opts.Actor,
-		poll:      opts.PollInterval,
-		heartbeat: opts.Heartbeat,
-		log:       opts.Logger,
+		runs:        opts.Runs,
+		actor:       opts.Actor,
+		crossOrigin: opts.CrossOrigin,
+		poll:        opts.PollInterval,
+		heartbeat:   opts.Heartbeat,
+		log:         opts.Logger,
+	}
+	if a.crossOrigin == nil {
+		a.crossOrigin = http.NewCrossOriginProtection()
 	}
 	// Negative would be a timer that is always ready, and a stream that reads
 	// the store in a loop.
@@ -120,9 +135,10 @@ func New(opts Options) (*API, error) {
 //	POST /approvals/{id}/approve  the approval as decided; 409 when already decided
 //	POST /approvals/{id}/decline  the same
 //
-// A request to change something carries {"reason": "..."} or nothing, and needs
-// an actor. An id the engine does not know is 404, a request that cannot be
-// acted on is 400, and anything else the engine says is 500.
+// A request to change something carries {"reason": "..."} or nothing, needs an
+// actor, and is refused with 403 when a browser makes it for another origin. An
+// id the engine does not know is 404, a request that cannot be acted on is 400,
+// and anything else the engine says is 500.
 func (a *API) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Use(a.withLogger)
@@ -134,12 +150,27 @@ func (a *API) Routes() chi.Router {
 	// Registered for itself so that a HEAD reaches the handler whether or not
 	// the router above turns HEAD into GET: the handler must see it either way.
 	r.Head("/runs/{id}/events", a.events)
-	r.Post("/runs/{id}/cancel", a.cancel)
-
 	r.Get("/approvals", a.listApprovals)
-	r.Post("/approvals/{id}/approve", a.decide(a.runs.Approve, "approve"))
-	r.Post("/approvals/{id}/decline", a.decide(a.runs.Decline, "decline"))
+
+	// The routes that change something, behind the cross-origin check.
+	guarded := r.With(a.refuseCrossOrigin)
+	guarded.Post("/runs/{id}/cancel", a.cancel)
+	guarded.Post("/approvals/{id}/approve", a.decide(a.runs.Approve, "approve"))
+	guarded.Post("/approvals/{id}/decline", a.decide(a.runs.Decline, "decline"))
 	return r
+}
+
+// refuseCrossOrigin answers 403 to a request that a browser makes for a page
+// on another origin. It is not authentication: it says nothing of who is
+// asking, which is Options.Actor's to say.
+func (a *API) refuseCrossOrigin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := a.crossOrigin.Check(r); err != nil {
+			httpx.Error(w, r, http.StatusForbidden, fmt.Errorf("agent/httpapi: %w", err))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // logger is the request's logger when httpx.NewRouter put one there, and the
@@ -377,8 +408,11 @@ func encodeCursor(c agent.Cursor) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
-// decodeCursor reads a token that encodeCursor made. What the id inside it
-// names is the engine's to judge, as with any id.
+// decodeCursor reads a token that encodeCursor made. A cursor comes from the
+// client, so it is input and is read strictly: a time that is not one, or an id
+// that is not a UUID in the canonical form the stores keep (uuid.Parse also
+// reads upper case, braces, a URN and no hyphens, which would reach a store as
+// a name it does not know), is an error here and is never given to the engine.
 func decodeCursor(token string) (*agent.Cursor, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil {
@@ -388,8 +422,11 @@ func decodeCursor(token string) (*agent.Cursor, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("cursor is not one this API made: %w", err)
 	}
-	if c.T.IsZero() || c.ID == "" {
-		return nil, errors.New("cursor names no position")
+	if c.T.IsZero() {
+		return nil, errors.New("cursor has no time")
+	}
+	if id, err := uuid.Parse(c.ID); err != nil || id.String() != c.ID {
+		return nil, errors.New("cursor's id is not a UUID in the canonical form")
 	}
 	return &agent.Cursor{CreatedAt: c.T, ID: c.ID}, nil
 }

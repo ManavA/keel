@@ -3488,6 +3488,12 @@ type Options struct {
 	// Heartbeat is how often an idle event stream sends a comment line, to
 	// keep proxies from closing it. Default 15 seconds.
 	Heartbeat time.Duration
+	// CrossOrigin guards the three routes that change something against a
+	// request a browser makes for a page on another origin: 403, before
+	// Actor is asked. Nil means a protection with no trusted origins; a
+	// service whose front end is on another origin supplies one that trusts
+	// it. Reading and the stream are not guarded.
+	CrossOrigin *http.CrossOriginProtection
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
 }
@@ -3507,7 +3513,7 @@ var _ Runs = (*agent.Engine)(nil)
 
 | Route | Answers |
 |---|---|
-| `GET /runs` | `{"runs": […], "next": "<cursor>"}`, newest first. Query: `status`, `agent`, `parent`, `limit` (1 to 200, default 50), `cursor`. An unknown status or a limit out of range is 400, as `pg.ParsePage` refuses rather than clamps |
+| `GET /runs` | `{"runs": […], "next": "<cursor>"}`, newest first. Query: `status`, `agent`, `parent`, `limit` (1 to 200, default 50), `cursor`. An unknown status or a limit out of range is 400, as `pg.ParsePage` refuses rather than clamps; so is a cursor that does not decode, whose time does not parse, or whose id is not a UUID in the canonical lower-case hyphenated form |
 | `GET /runs/{id}` | The run, or 404 |
 | `GET /runs/{id}/timeline` | `{"run": …, "steps": […], "approvals": […]}`: `Changes` since 0 |
 | `GET /runs/{id}/events` | A server-sent event stream, below |
@@ -3526,6 +3532,21 @@ The three routes that change something need `Options.Actor` to return a
 name, and answer 403 without one. The zero `Options` therefore serves a
 read-only surface. A request body is read through `http.MaxBytesReader` at
 4 KiB and decoded with unknown fields disallowed.
+
+Those three routes are also behind `http.CrossOriginProtection`
+(`Options.CrossOrigin`), checked before `Actor` is asked. A request that
+`Sec-Fetch-Site` marks as anything but same-origin or none, or that has no
+such header and an `Origin` other than its host, is refused with 403 unless
+the protection trusts that origin; a request with neither header, which is a
+server-side client and not a browser acting for a page, passes. It closes the
+cross-site form post against a cookie session, and nothing more: it is not
+authentication, `Actor` still decides who is acting, and it does not guard
+the reads or the stream, which change nothing.
+
+A cursor comes from the client, so it is input and is decoded strictly, in
+the package and before the engine is asked: a token that is not what the
+package made, a time that does not parse, or an id that `uuid.Parse` does not
+read back to the same string is 400.
 
 The package has no route that starts a run. What a run's input is, and who
 may start one, belong to the service; the example has its own.
@@ -4421,3 +4442,27 @@ lead confirmed its choices, and the table now states each of them.
     was not given). `Metadata` goes through JSON as `Action.Attrs` does.
     What a NUL character inside a string of either does is left to the
     Postgres store to settle with its column types in front of it.
+
+**The routes that change something refuse a cross-origin browser request, and
+    a cursor is input.** Approve, decline and cancel are how people govern a
+    run, and each accepts a POST with no body of any content type, which a form
+    on another site can make a browser send with the user's cookie. They are
+    therefore guarded in the package, with the standard library's
+    `http.CrossOriginProtection` (Go 1.25), and `Options.CrossOrigin` lets a
+    service trust the origin of its own front end. The guard refuses by
+    `Sec-Fetch-Site` or by `Origin`, answers the generic 403 and runs before
+    `Actor`. Rejected: leaving it to the mount, which `Routes` documents as
+    guarding operator traffic and which cannot know that these three routes
+    accept a request that carries nothing to tell a form from a client;
+    requiring a content type, which a form can send as `text/plain` and which
+    would refuse a client that sends none; and `CrossOriginProtection.Handler`,
+    whose refusal is plain text. The package calls `Check` and answers with its
+    own generic 403, so a deny handler set on a supplied protection is not
+    used. The guard is not authentication, and does not cover the reads or
+    the stream. A cursor is the client's to send, so it is decoded strictly
+    before the engine is asked: a token that does not decode, a time that does
+    not parse, or an id that is not a UUID in the canonical form (`uuid.Parse`
+    reads upper case, braces, a URN and no hyphens, and a store would be given
+    a name it does not know) is 400. Rejected: handing the id to the store to
+    judge as the ids in a path are, which for a cursor has no 404 to answer
+    with and, against a `uuid` column, a 500.

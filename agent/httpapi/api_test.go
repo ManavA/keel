@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -424,22 +425,46 @@ func TestListRuns_CursorCarriesOnePageToTheNext(t *testing.T) {
 
 func TestListRuns_RefusesACursorItCannotRead(t *testing.T) {
 	enc := func(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
+	cursorOf := func(at, id string) string { return "?cursor=" + enc(`{"t":`+at+`,"id":`+id+`}`) }
+	const when = `"2026-01-02T03:04:05Z"`
+	quoted := strconv.Quote
 	for _, tt := range []struct{ name, query string }{
 		{"not base64", "?cursor=!!!"},
 		{"not JSON", "?cursor=" + enc("not json")},
 		{"an empty object", "?cursor=" + enc(`{}`)},
-		{"no id", "?cursor=" + enc(`{"t":"2026-01-02T03:04:05Z"}`)},
-		{"no time", "?cursor=" + enc(`{"id":"`+uid(1)+`"}`)},
-		{"a time that is not one", "?cursor=" + enc(`{"t":"yesterday","id":"`+uid(1)+`"}`)},
+		{"no id", "?cursor=" + enc(`{"t":`+when+`}`)},
+		{"no time", "?cursor=" + enc(`{"id":`+quoted(uid(1))+`}`)},
+		{"an empty id", cursorOf(when, `""`)},
+		{"a time that is not one", cursorOf(`"yesterday"`, quoted(uid(1)))},
+		{"a time with no zone", cursorOf(`"2026-01-02T03:04:05"`, quoted(uid(1)))},
+		{"a time that is a number", cursorOf(`1767323045`, quoted(uid(1)))},
+		{"an id that is a number", cursorOf(when, `5`)},
+		{"an id that is not a UUID", cursorOf(when, `"abc"`)},
+		{"an id with a space after it", cursorOf(when, quoted(uid(1)+" "))},
+		// Each of these is a UUID that uuid.Parse reads, in a spelling other
+		// than the one ids are kept in.
+		{"an id in upper case", cursorOf(when, quoted(strings.ToUpper(letterID)))},
+		{"an id in braces", cursorOf(when, quoted("{"+letterID+"}"))},
+		{"an id as a URN", cursorOf(when, quoted("urn:uuid:"+letterID))},
+		{"an id with no hyphens", cursorOf(when, quoted(strings.ReplaceAll(letterID, "-", "")))},
 		{"given twice", "?cursor=a&cursor=b"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFake()
 			rec := do(t, newAPI(t, f), http.MethodGet, "/runs"+tt.query, "")
 			requireError(t, rec, http.StatusBadRequest)
-			assert.Empty(t, f.calls, "a cursor that does not read is never an empty first page")
+			assert.Empty(t, f.calls, "a cursor that does not read is refused before the store is asked, and is never an empty first page")
 		})
 	}
+
+	t.Run("an id in the canonical form is read", func(t *testing.T) {
+		f := newFake()
+		rec := do(t, newAPI(t, f), http.MethodGet, "/runs"+cursorOf(when, quoted(letterID)), "")
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		require.Len(t, f.runFilters, 1)
+		require.NotNil(t, f.runFilters[0].Before)
+		assert.Equal(t, letterID, f.runFilters[0].Before.ID)
+	})
 }
 
 func TestListApprovals(t *testing.T) {
@@ -731,6 +756,83 @@ func TestMutations(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// The three routes that decide things refuse a browser request that comes from
+// another origin, whatever it carries, before the actor or the engine is
+// asked: a page on another site cannot approve anything by making a browser
+// post a form. A request with no Sec-Fetch-Site and no Origin is not a browser
+// speaking for a page, and is passed to the actor like any other.
+func TestMutations_RefuseACrossOriginBrowserRequest(t *testing.T) {
+	trusting := func(origin string) *http.CrossOriginProtection {
+		p := http.NewCrossOriginProtection()
+		require.NoError(t, p.AddTrustedOrigin(origin))
+		return p
+	}
+	const front = "https://front.example"
+	tests := []struct {
+		name       string
+		headers    []string
+		protection *http.CrossOriginProtection // nil is the default
+		allowed    bool
+	}{
+		{"cross-site", []string{"Sec-Fetch-Site", "cross-site"}, nil, false},
+		{"same-site, which is another origin", []string{"Sec-Fetch-Site", "same-site"}, nil, false},
+		{"same-origin", []string{"Sec-Fetch-Site", "same-origin"}, nil, true},
+		{"none, a request the user made", []string{"Sec-Fetch-Site", "none"}, nil, true},
+		{"neither header", nil, nil, true},
+		{"an Origin that differs from the host", []string{"Origin", "https://other.example"}, nil, false},
+		{"an Origin that is the host", []string{"Origin", "http://example.com"}, nil, true},
+		{"cross-site from an origin that is trusted", []string{"Sec-Fetch-Site", "cross-site", "Origin", front}, trusting(front), true},
+		{"an Origin that is trusted", []string{"Origin", front}, trusting(front), true},
+		{"the same, when none is trusted", []string{"Sec-Fetch-Site", "cross-site", "Origin", front}, nil, false},
+		{"cross-site from another origin than the trusted one", []string{"Sec-Fetch-Site", "cross-site", "Origin", "https://other.example"}, trusting(front), false},
+	}
+	for _, m := range mutations() {
+		t.Run(m.name, func(t *testing.T) {
+			path := fmt.Sprintf(m.path, m.pending)
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					f := mutationFake()
+					var asked int
+					h := newAPI(t, f, func(o *httpapi.Options) {
+						o.CrossOrigin = tt.protection
+						o.Actor = func(r *http.Request) string { asked++; return "sam" }
+					})
+					rec := do(t, h, http.MethodPost, path, `{"reason":"x"}`, tt.headers...)
+					if tt.allowed {
+						require.Equal(t, m.status, rec.Code, rec.Body.String())
+						call, ok := m.seen(f)
+						require.True(t, ok)
+						assert.Equal(t, "sam", call.By)
+						return
+					}
+					requireError(t, rec, http.StatusForbidden)
+					assert.Empty(t, f.calls, "a refused request reaches nothing")
+					assert.Zero(t, asked, "and the actor is not asked about it")
+				})
+			}
+		})
+	}
+}
+
+// What the guard is for is changing something. Reading is not, and a page on
+// another site is not made safe by being refused a read the user could make.
+func TestReadRoutes_AreNotGuardedAgainstCrossOrigin(t *testing.T) {
+	f := endedRun(agent.StatusCompleted)
+	h := newAPI(t, f, quick)
+	for _, path := range []string{
+		"/runs", "/runs/" + uid(1), "/runs/" + uid(1) + "/timeline", "/approvals", "/runs/" + uid(1) + "/events",
+	} {
+		for _, headers := range [][]string{
+			{"Sec-Fetch-Site", "cross-site"},
+			{"Origin", "https://other.example"},
+			{"Sec-Fetch-Site", "cross-site", "Origin", "https://other.example"},
+		} {
+			rec := do(t, h, http.MethodGet, path, "", headers...)
+			assert.Equal(t, http.StatusOK, rec.Code, "%s with %v", path, headers)
+		}
 	}
 }
 

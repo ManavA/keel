@@ -18,6 +18,18 @@
 // Message.Opaque, which can hold the model's own reasoning, is removed from
 // every step before it is served, on the timeline and on the stream.
 //
+// Those three routes also refuse a browser request made for a page on another
+// origin, with 403 and before [Options.Actor] is asked, using the standard
+// library's [net/http.CrossOriginProtection] ([Options.CrossOrigin]; the
+// default trusts no origin, and a service whose front end is on another origin
+// supplies one that trusts it). A request is cross-origin when Sec-Fetch-Site
+// says so or, with no such header, when its Origin is not its host; one with
+// neither header is a server-side client or a tool such as curl, and passes.
+// This closes the hole of a cookie session being driven by a form on another
+// site. It is not authentication: it says nothing of who is asking, which is
+// Actor's to say, and it does not guard reading or the stream, which change
+// nothing.
+//
 // # Ids and errors
 //
 // An id in a path or a filter is given to the engine as written. Whether it
@@ -25,7 +37,10 @@
 // nothing: 404, not 400. A failure answers with httpx's generic body and the
 // cause goes to the log. A listing's limit and status, a cursor, and a body
 // that is over 4 KiB or says more than a reason are refused with 400 rather
-// than clamped or ignored.
+// than clamped or ignored. A cursor is the client's input, and is read
+// strictly: one that does not decode, or whose time does not parse, or whose
+// id is not a UUID in the canonical lower-case hyphenated form, is refused
+// before the engine is asked.
 //
 // # The event stream
 //
