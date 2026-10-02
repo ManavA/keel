@@ -293,6 +293,16 @@ func TestStream_BuildsWhatGenerateBuilds(t *testing.T) {
 			wantDeltas: []llm.Delta{{Text: "hi"}},
 		},
 		{
+			name: "an error that is empty, null or an empty object on a chunk with real choices is no error",
+			events: []string{
+				`{"id":"chatcmpl-1","model":"m","error":"","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}`,
+				`{"id":"chatcmpl-1","model":"m","error":{},"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}`,
+				`{"id":"chatcmpl-1","model":"m","error":null,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			},
+			equivalent: completion(`{"role":"assistant","content":"Hello"}`, `"stop"`, ""),
+			wantDeltas: []llm.Delta{{Text: "Hel"}, {Text: "lo"}},
+		},
+		{
 			name: "no id or model on any chunk",
 			events: []string{
 				`{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`,
@@ -473,7 +483,7 @@ func TestStream_CallbackErrorStopsTheStream(t *testing.T) {
 	}
 }
 
-func TestStream_CancelledContextIsNotRetryable(t *testing.T) {
+func TestStream_ACancelledContextIsItsOwnError(t *testing.T) {
 	srv, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprintf(w, "data: %s\n\n", chunk(textDelta("one"), ""))
@@ -488,9 +498,8 @@ func TestStream_CancelledContextIsNotRetryable(t *testing.T) {
 		return nil
 	})
 
-	require.Error(t, err)
-	assert.ErrorIs(t, err, context.Canceled)
-	assert.False(t, llm.Retryable(err))
+	require.ErrorIs(t, err, context.Canceled)
+	notAnLLMError(t, err)
 }
 
 func TestStream_ErrorChunk(t *testing.T) {
@@ -522,6 +531,40 @@ func TestStream_ErrorChunk(t *testing.T) {
 			wantRetry: true,
 		},
 		{
+			name:      "a rate limit, by its type",
+			payload:   `{"error":{"message":"slow","type":"rate_limit_error","param":null,"code":null}}`,
+			wantType:  "rate_limit_error",
+			wantMsg:   "slow",
+			wantRetry: true,
+		},
+		{
+			name:      "a rate limit, by its code",
+			payload:   `{"error":{"message":"slow","type":"error","param":null,"code":"rate_limit_exceeded"}}`,
+			wantType:  "error",
+			wantMsg:   "slow",
+			wantRetry: true,
+		},
+		{
+			name:      "a server error, by its type",
+			payload:   `{"error":{"message":"oops","type":"server_error","param":null,"code":null}}`,
+			wantType:  "server_error",
+			wantMsg:   "oops",
+			wantRetry: true,
+		},
+		{
+			name:      "a server error, by its code",
+			payload:   `{"error":{"message":"oops","type":"error","param":null,"code":"server_error"}}`,
+			wantType:  "error",
+			wantMsg:   "oops",
+			wantRetry: true,
+		},
+		{
+			name:     "a rate limit that is a spend limit is final",
+			payload:  `{"error":{"message":"limit","type":"rate_limit_error","param":null,"code":"project_spend_limit_exceeded"}}`,
+			wantType: "rate_limit_error",
+			wantMsg:  "limit",
+		},
+		{
 			name:     "a code that is a number",
 			payload:  `{"error":{"object":"error","message":"bad input","type":"BadRequestError","param":null,"code":400}}`,
 			wantType: "BadRequestError",
@@ -531,7 +574,10 @@ func TestStream_ErrorChunk(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			body := sseBody(chunk(textDelta("one"), ""), tt.payload)
-			_, deltas, err := stream(t, serveStream(body))
+			_, deltas, err := stream(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Request-Id", "req_9")
+				serveStream(body)(w, r)
+			})
 
 			var apiErr *llm.Error
 			require.ErrorAs(t, err, &apiErr)
@@ -540,6 +586,8 @@ func TestStream_ErrorChunk(t *testing.T) {
 			assert.Equal(t, tt.wantMsg, apiErr.Message)
 			assert.Equal(t, tt.wantRetry, apiErr.Retryable)
 			assert.Equal(t, tt.wantRetry, llm.Retryable(err))
+			assert.Equal(t, "req_9", apiErr.RequestID)
+			assert.Equal(t, http.StatusOK, apiErr.Status)
 			assert.NoError(t, apiErr.Err, "the server answered, so this is not a transport failure")
 			assert.Equal(t, []llm.Delta{{Text: "one"}}, deltas, "what arrived before the error was delivered")
 		})
@@ -578,6 +626,7 @@ func TestStream_CutShort(t *testing.T) {
 		{name: "in the middle of DONE, with no finish chunk", body: head + "data: [DO"},
 		{name: "DONE with no blank line, so the event is never delivered, and no finish chunk", body: head + "data: [DONE]\n"},
 		{name: "after the usage chunk, with neither a finish chunk nor DONE", body: head + usage},
+		{name: "nothing but DONE", body: "data: [DONE]\n\n"},
 		{name: "an empty stream", body: ""},
 		{name: "only comments", body: ": keep-alive\n\n"},
 
@@ -702,13 +751,63 @@ func TestStream_NoFinishReasonButACleanDone(t *testing.T) {
 		assert.Equal(t, llm.StopToolUse, resp.Stop)
 		require.Len(t, resp.Message.ToolCalls, 1)
 	})
-	t.Run("a stream of nothing but DONE is an empty reply, as the server said", func(t *testing.T) {
-		resp, deltas, err := stream(t, serveStream("data: [DONE]\n\n"))
-		require.NoError(t, err)
-		assert.Equal(t, llm.StopEnd, resp.Stop)
-		assert.Empty(t, resp.Message.Text)
-		assert.Empty(t, deltas)
-	})
+}
+
+// A stream that says nothing before DONE has not answered. A stream whose
+// server said it finished, with a finish reason, and said no more than that, is
+// an empty reply.
+func TestStream_ADoneThatFollowsNothing(t *testing.T) {
+	failures := []struct {
+		name string
+		body string
+	}{
+		{name: "nothing but DONE", body: "data: [DONE]\n\n"},
+		{name: "comments and empty events, then DONE", body: ": keep-alive\n\ndata:\n\ndata: [DONE]\n\n"},
+		{name: "a usage chunk with no id and no choice, then DONE", body: sseBody(`{"object":"chat.completion.chunk","choices":[],"usage":` + finalUsage + `}`)},
+	}
+	for _, tt := range failures {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, deltas, err := stream(t, serveStream(tt.body))
+			assertTransportFailure(t, err)
+			assert.Nil(t, resp)
+			assert.Empty(t, deltas)
+		})
+	}
+
+	replies := []struct {
+		name string
+		body string
+		want *llm.Response
+	}{
+		{
+			name: "a finish reason and no content is an empty reply",
+			body: sseBody(chunk(`{}`, "stop")),
+			want: &llm.Response{ID: "chatcmpl-1", Model: "m", Message: llm.Message{Role: llm.RoleAssistant}, Stop: llm.StopEnd},
+		},
+		{
+			name: "a finish reason of length and no content is an empty reply, cut at the bound",
+			body: sseBody(chunk(`{}`, "length")),
+			want: &llm.Response{ID: "chatcmpl-1", Model: "m", Message: llm.Message{Role: llm.RoleAssistant}, Stop: llm.StopMaxTokens},
+		},
+		{
+			name: "a chunk with an id and an empty delta, then DONE, is the server's empty reply",
+			body: sseBody(chunk(`{"role":"assistant","content":""}`, "")),
+			want: &llm.Response{ID: "chatcmpl-1", Model: "m", Message: llm.Message{Role: llm.RoleAssistant}, Stop: llm.StopEnd},
+		},
+		{
+			name: "a usage chunk that has an id, then DONE",
+			body: sseBody(usageChunk(finalUsage)),
+			want: &llm.Response{ID: "chatcmpl-1", Model: "m", Message: llm.Message{Role: llm.RoleAssistant}, Stop: llm.StopEnd, Usage: llm.Usage{InputTokens: 9, OutputTokens: 2}},
+		},
+	}
+	for _, tt := range replies {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, deltas, err := stream(t, serveStream(tt.body))
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, resp)
+			assert.Empty(t, deltas)
+		})
+	}
 }
 
 // The reply carries no field for it, so the missing finish reason is a debug
@@ -739,4 +838,114 @@ func TestStream_NoFinishReasonIsLoggedAtDebug(t *testing.T) {
 			assert.Contains(t, written(), "level=DEBUG")
 		})
 	}
+}
+
+// rawPiece is a piece of a tool call from a server that sends no index.
+func rawPiece(id, name, args string) string {
+	fn := `"arguments":` + strconv.Quote(args)
+	if name != "" {
+		fn = `"name":` + strconv.Quote(name) + "," + fn
+	}
+	head := ""
+	if id != "" {
+		head = `"id":` + strconv.Quote(id) + `,"type":"function",`
+	}
+	return `{` + head + `"function":{` + fn + `}}`
+}
+
+// With no index to tell calls apart, a new id is a new call and a piece with
+// none belongs to the latest, so distinct calls are not merged into one
+// malformed call.
+func TestStream_ToolCallPiecesWithNoIndex(t *testing.T) {
+	tests := []struct {
+		name       string
+		events     []string
+		wantCalls  []llm.ToolCall
+		wantDeltas []llm.Delta
+	}{
+		{
+			name: "two calls, each in pieces",
+			events: []string{
+				chunk(callsDelta(rawPiece("call_a", "first", `{"x":`)), ""),
+				chunk(callsDelta(rawPiece("", "", `1}`)), ""),
+				chunk(callsDelta(rawPiece("call_b", "second", `{"y":`)), ""),
+				chunk(callsDelta(rawPiece("", "", `2}`)), ""),
+				chunk(`{}`, "tool_calls"),
+			},
+			wantCalls: []llm.ToolCall{
+				{ID: "call_a", Name: "first", Input: json.RawMessage(`{"x":1}`)},
+				{ID: "call_b", Name: "second", Input: json.RawMessage(`{"y":2}`)},
+			},
+			wantDeltas: []llm.Delta{
+				{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_a", Name: "first", InputJSON: `{"x":`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 0, InputJSON: `1}`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 1, ID: "call_b", Name: "second", InputJSON: `{"y":`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 1, InputJSON: `2}`}},
+			},
+		},
+		{
+			name: "two whole calls, one per chunk",
+			events: []string{
+				chunk(callsDelta(rawPiece("call_a", "first", `{}`)), ""),
+				chunk(callsDelta(rawPiece("call_b", "second", `{}`)), ""),
+				chunk(`{}`, "tool_calls"),
+			},
+			wantCalls: []llm.ToolCall{
+				{ID: "call_a", Name: "first", Input: json.RawMessage(`{}`)},
+				{ID: "call_b", Name: "second", Input: json.RawMessage(`{}`)},
+			},
+			wantDeltas: []llm.Delta{
+				{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_a", Name: "first", InputJSON: `{}`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 1, ID: "call_b", Name: "second", InputJSON: `{}`}},
+			},
+		},
+		{
+			name: "one call that repeats its id on every piece stays one call",
+			events: []string{
+				chunk(callsDelta(rawPiece("call_a", "first", `{"x":`)), ""),
+				chunk(callsDelta(rawPiece("call_a", "", `1}`)), ""),
+				chunk(`{}`, "tool_calls"),
+			},
+			wantCalls: []llm.ToolCall{{ID: "call_a", Name: "first", Input: json.RawMessage(`{"x":1}`)}},
+			wantDeltas: []llm.Delta{
+				{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_a", Name: "first", InputJSON: `{"x":`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 0, InputJSON: `1}`}},
+			},
+		},
+		{
+			name: "an index that is given but reused by a call with another id is a new call",
+			events: []string{
+				chunk(callsDelta(callPiece(0, "call_a", "first", `{}`)), ""),
+				chunk(callsDelta(callPiece(0, "call_b", "second", `{}`)), ""),
+				chunk(`{}`, "tool_calls"),
+			},
+			wantCalls: []llm.ToolCall{
+				{ID: "call_a", Name: "first", Input: json.RawMessage(`{}`)},
+				{ID: "call_b", Name: "second", Input: json.RawMessage(`{}`)},
+			},
+			wantDeltas: []llm.Delta{
+				{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_a", Name: "first", InputJSON: `{}`}},
+				{ToolCall: &llm.ToolCallDelta{Index: 1, ID: "call_b", Name: "second", InputJSON: `{}`}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, deltas, err := stream(t, serveStream(sseBody(tt.events...)))
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantCalls, resp.Message.ToolCalls)
+			assert.Equal(t, tt.wantDeltas, deltas)
+		})
+	}
+}
+
+// A chunk with a choice began a reply, whether or not the server gave it an id.
+func TestStream_AChoiceWithNoIdThenDone(t *testing.T) {
+	body := sseBody(`{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`)
+
+	resp, deltas, err := stream(t, serveStream(body))
+
+	require.NoError(t, err)
+	assert.Equal(t, &llm.Response{Model: "test-model", Message: llm.Message{Role: llm.RoleAssistant, Text: "hi"}, Stop: llm.StopEnd}, resp)
+	assert.Equal(t, []llm.Delta{{Text: "hi"}}, deltas)
 }

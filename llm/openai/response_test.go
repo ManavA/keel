@@ -111,6 +111,21 @@ func TestGenerate_Text(t *testing.T) {
 			want: &llm.Response{ID: "x", Model: "m", Message: llm.Message{Role: llm.RoleAssistant, Text: "hi"}, Stop: llm.StopEnd},
 		},
 		{
+			name: "an error that is empty, null or an empty object does not stand in the way of a reply",
+			body: `{"id":"x","model":"m","error":{},"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`,
+			want: &llm.Response{ID: "x", Model: "m", Message: llm.Message{Role: llm.RoleAssistant, Text: "hi"}, Stop: llm.StopEnd},
+		},
+		{
+			name: "an error that is an empty string does not either",
+			body: `{"id":"x","model":"m","error":"","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`,
+			want: &llm.Response{ID: "x", Model: "m", Message: llm.Message{Role: llm.RoleAssistant, Text: "hi"}, Stop: llm.StopEnd},
+		},
+		{
+			name: "an error with a code only is not an error to report",
+			body: `{"id":"x","model":"m","error":{"code":"x"},"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`,
+			want: &llm.Response{ID: "x", Model: "m", Message: llm.Message{Role: llm.RoleAssistant, Text: "hi"}, Stop: llm.StopEnd},
+		},
+		{
 			name: "only the first choice is read",
 			body: `{"id":"x","model":"m","choices":[` +
 				`{"index":0,"message":{"role":"assistant","content":"first"},"finish_reason":"stop"},` +
@@ -399,6 +414,8 @@ func TestGenerate_RefusesAReplyItCannotRead(t *testing.T) {
 	}{
 		{name: "no choices", body: `{"id":"x","model":"m","choices":[]}`, wantErr: "no choices"},
 		{name: "no choices key", body: `{"id":"x","model":"m"}`, wantErr: "no choices"},
+		{name: "no choices and an error that says nothing", body: `{"id":"x","model":"m","error":{},"choices":[]}`, wantErr: "no choices"},
+		{name: "no choices and an error that is an empty string", body: `{"id":"x","model":"m","error":"","choices":[]}`, wantErr: "no choices"},
 		{name: "not JSON", body: `<html>welcome to the gateway</html>`, wantErr: "decode"},
 		{name: "a JSON array", body: `[1,2]`, wantErr: "decode"},
 		{name: "empty", body: ``, wantErr: "decode"},
@@ -408,7 +425,7 @@ func TestGenerate_RefusesAReplyItCannotRead(t *testing.T) {
 			_, err := generate(t, tt.body)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
-			assert.False(t, llm.Retryable(err), "the same request will get the same unreadable answer")
+			notAnLLMError(t, err)
 		})
 	}
 }
@@ -541,6 +558,36 @@ func TestGenerate_AnErrorInsideASuccessfulResponse(t *testing.T) {
 			name:     "overloaded, by its code",
 			body:     apiErr("error", "server_is_overloaded", "busy"),
 			wantType: "error", wantMsg: "busy", wantRetry: true,
+		},
+		{
+			name:     "a rate limit, by its type",
+			body:     apiErr("rate_limit_error", "", "slow"),
+			wantType: "rate_limit_error", wantMsg: "slow", wantRetry: true,
+		},
+		{
+			name:     "a rate limit, by its code",
+			body:     apiErr("error", "rate_limit_exceeded", "slow"),
+			wantType: "error", wantMsg: "slow", wantRetry: true,
+		},
+		{
+			name:     "a server error, by its type",
+			body:     apiErr("server_error", "", "oops"),
+			wantType: "server_error", wantMsg: "oops", wantRetry: true,
+		},
+		{
+			name:     "a server error, by its code",
+			body:     apiErr("error", "server_error", "oops"),
+			wantType: "error", wantMsg: "oops", wantRetry: true,
+		},
+		{
+			name:     "a rate limit that is a spend limit is final",
+			body:     apiErr("rate_limit_error", "project_spend_limit_exceeded", "limit"),
+			wantType: "rate_limit_error", wantMsg: "limit",
+		},
+		{
+			name:     "out of quota is final whatever else the error says",
+			body:     apiErr("insufficient_quota", "rate_limit_exceeded", "quota"),
+			wantType: "insufficient_quota", wantMsg: "quota",
 		},
 		{
 			name:     "an error with no message",

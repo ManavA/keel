@@ -3,7 +3,9 @@ package openai
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"math"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,18 +31,36 @@ var finalCodes = map[string]bool{
 	"organization_usage_limit_exceeded": true,
 }
 
-// transientCodes are the error types and codes the guide gives for a failure
-// that passes, used for an error that arrives inside a 200 response, where no
-// status says so.
+// transientCodes are the error types and codes the reference gives for a
+// failure that passes: the error guide's overload and rate limit, and the
+// server error and rate limit the specification lists. They stand in for a
+// status on an error that arrives inside a 200 response, which has none to
+// say so. The final codes above take precedence.
 var transientCodes = map[string]bool{
 	"service_unavailable_error": true,
 	"server_is_overloaded":      true,
 	"slow_down":                 true,
+	"rate_limit_error":          true,
+	"rate_limit_exceeded":       true,
+	"server_error":              true,
 }
 
 // errorBody is what an error object says.
 type errorBody struct {
 	Type, Message, Code string
+}
+
+// present reports whether the object is an error to report: it says what went
+// wrong or what kind. An empty string or an empty object, which some servers
+// send beside a good reply, is not.
+func (f errorBody) present() bool { return f.Message != "" || f.Type != "" }
+
+// isFinal reports whether the error is one that no wait fixes.
+func (f errorBody) isFinal() bool { return finalCodes[f.Code] || finalCodes[f.Type] }
+
+// isTransient reports whether the error is one the reference gives as passing.
+func (f errorBody) isTransient() bool {
+	return !f.isFinal() && (transientCodes[f.Type] || transientCodes[f.Code])
 }
 
 // httpError maps a response that is not 2xx. body is as much of the body as
@@ -49,6 +69,9 @@ func httpError(resp *http.Response, body []byte) *llm.Error {
 	fields, ok := errorFromBody(body)
 	if !ok {
 		fields.Message = snippet(body)
+	}
+	if loc, err := resp.Location(); err == nil && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		fields.Message = fmt.Sprintf("redirect to %s not followed", loc.Scheme+"://"+loc.Host+loc.Path)
 	}
 	if fields.Message == "" {
 		fields.Message = http.StatusText(resp.StatusCode)
@@ -67,18 +90,39 @@ func httpError(resp *http.Response, body []byte) *llm.Error {
 // embeddedError maps an error object that arrived in a 200 response, in the
 // body or in the middle of a stream. The server answered, so it is not a
 // transport failure, and it is retryable only when the error says it passes.
-func embeddedError(resp *http.Response, fields errorBody) *llm.Error {
+func embeddedError(status int, requestID string, fields errorBody) *llm.Error {
 	if fields.Message == "" {
 		fields.Message = "the server reported an error in a successful response"
 	}
 	return &llm.Error{
 		Provider:  Name,
-		Status:    resp.StatusCode,
+		Status:    status,
 		Type:      typeOf(fields),
 		Message:   fields.Message,
-		RequestID: resp.Header.Get("X-Request-Id"),
-		Retryable: transientCodes[fields.Type] || transientCodes[fields.Code],
+		RequestID: requestID,
+		Retryable: fields.isTransient(),
 	}
+}
+
+// notAStream is the error for a 200 that is not an event stream, in answer to
+// a request for one. Asking again gets the same answer, so it is not retryable.
+func notAStream(resp *http.Response) *llm.Error {
+	what := "no content type"
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		what = fmt.Sprintf("content type %q", ct)
+	}
+	return &llm.Error{
+		Provider:  Name,
+		Status:    resp.StatusCode,
+		Message:   "expected an event stream in answer to a streaming request, got " + what,
+		RequestID: resp.Header.Get("X-Request-Id"),
+	}
+}
+
+// isEventStream reports whether the response is a server-sent event stream.
+func isEventStream(resp *http.Response) bool {
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	return err == nil && mediaType == "text/event-stream"
 }
 
 // typeOf is the error's type, or its code for a server that sends only that.
@@ -96,30 +140,30 @@ func retryableStatus(status int, f errorBody) bool {
 	case status == http.StatusRequestTimeout, status >= 500 && status < 600:
 		return true
 	case status == http.StatusTooManyRequests:
-		return !finalCodes[f.Code] && !finalCodes[f.Type]
+		return !f.isFinal()
 	}
 	return false
 }
 
 // errorFromBody reads an error response body: the documented
 // {"error":{"message","type","param","code"}}, an error that is only a
-// string, or a message at the top level. It reports false for a body that is
-// none of these.
+// string, or the message, type and code at the top level, as some local
+// servers send them. It reports false for a body that is none of these.
 func errorFromBody(body []byte) (errorBody, bool) {
 	var env struct {
 		Error   json.RawMessage `json:"error"`
 		Message string          `json:"message"`
+		Type    string          `json:"type"`
+		Code    json.RawMessage `json:"code"`
 	}
 	if json.Unmarshal(body, &env) != nil {
 		return errorBody{}, false
 	}
-	if f, ok := errorFields(env.Error); ok {
+	if f, ok := errorFields(env.Error); ok && f != (errorBody{}) {
 		return f, true
 	}
-	if env.Message != "" {
-		return errorBody{Message: env.Message}, true
-	}
-	return errorBody{}, false
+	top := errorBody{Message: env.Message, Type: env.Type, Code: codeString(env.Code)}
+	return top, top.present()
 }
 
 // errorFields reads the value of an "error" key.

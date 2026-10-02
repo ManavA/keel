@@ -93,6 +93,10 @@ func TestGenerate_ErrorStatuses(t *testing.T) {
 			body: apiErr("billing", "project_spend_limit_exceeded", "project limit"), wantType: "billing", wantMsg: "project limit",
 		},
 
+		{name: "429 out of credit, in the shape some servers send at the top level, code only", status: 429, body: `{"message":"no credits","code":"credit_balance_exhausted"}`, wantType: "credit_balance_exhausted", wantMsg: "no credits"},
+		{name: "429 out of quota, in the top level shape, type only", status: 429, body: `{"message":"quota","type":"insufficient_quota"}`, wantType: "insufficient_quota", wantMsg: "quota"},
+		{name: "429 rate limit, in the top level shape", status: 429, body: `{"message":"slow","type":"rate_limit_error","code":"rate_limit_exceeded"}`, wantType: "rate_limit_error", wantMsg: "slow", wantRetry: true},
+
 		{name: "500 server error", status: 500, body: apiErr("server_error", "", "The server had an error"), wantType: "server_error", wantMsg: "The server had an error", wantRetry: true},
 		{name: "502 bad gateway", status: 502, body: apiErr("", "", "bad gateway"), wantType: "", wantMsg: "bad gateway", wantRetry: true},
 		{name: "503 model overloaded", status: 503, header: http.Header{"Retry-After": {"2"}}, body: apiErr("service_unavailable_error", "server_is_overloaded", "overloaded"), wantType: "service_unavailable_error", wantMsg: "overloaded", wantRetry: true},
@@ -192,6 +196,10 @@ func TestGenerate_ErrorBodies(t *testing.T) {
 		{name: "a code that is a number", status: 400, body: `{"error":{"message":"bad field","type":"","code":400}}`, wantType: "400", wantMsg: "bad field"},
 		{name: "error is a plain string", status: 400, body: `{"error":"model not loaded"}`, wantMsg: "model not loaded"},
 		{name: "a message at the top level", status: 400, body: `{"message":"no such route"}`, wantMsg: "no such route"},
+		{name: "message, type and code at the top level, as some local servers send them", status: 400, body: `{"message":"bad field","type":"invalid_request_error","code":"bad_field"}`, wantType: "invalid_request_error", wantMsg: "bad field"},
+		{name: "a type and a numeric code at the top level", status: 400, body: `{"message":"bad field","type":"BadRequestError","code":400}`, wantType: "BadRequestError", wantMsg: "bad field"},
+		{name: "a message and a code at the top level, the code standing in for the type", status: 400, body: `{"message":"bad field","code":"bad_field"}`, wantType: "bad_field", wantMsg: "bad field"},
+		{name: "an empty error object and a message at the top level", status: 400, body: `{"error":{},"message":"bad field","type":"t"}`, wantType: "t", wantMsg: "bad field"},
 		{name: "error null", status: 500, body: `{"error":null}`, wantMsg: `{"error":null}`},
 		{name: "html from a gateway", status: 502, body: "<html>\n<body>Bad Gateway</body>\n</html>\n", wantMsg: "<html>\n<body>Bad Gateway</body>\n</html>"},
 		{name: "plain text", status: 503, body: "upstream connect error", wantMsg: "upstream connect error"},
@@ -313,22 +321,19 @@ func TestErrors_TransportFailures(t *testing.T) {
 		assert.True(t, llm.Retryable(err))
 	})
 
-	t.Run("a context cancelled before the call", func(t *testing.T) {
+	t.Run("a context cancelled before the call is its own error, and not a provider failure", func(t *testing.T) {
 		srv, rec := newServer(t, serveJSON(simpleReply))
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 
 		_, err := newClient(t, srv).Generate(ctx, llm.Request{Messages: userMsg("hi")})
 
-		var got *llm.Error
-		require.ErrorAs(t, err, &got)
-		assert.ErrorIs(t, err, context.Canceled)
-		assert.False(t, got.Retryable, "the call ended because its context did")
-		assert.False(t, llm.Retryable(err))
+		require.ErrorIs(t, err, context.Canceled)
+		notAnLLMError(t, err)
 		assert.Zero(t, rec.count())
 	})
 
-	t.Run("a deadline that passes while waiting for the answer", func(t *testing.T) {
+	t.Run("a deadline that passes while waiting for the answer is the context's error", func(t *testing.T) {
 		release := make(chan struct{})
 		srv, _ := newServer(t, func(_ http.ResponseWriter, r *http.Request) {
 			select {
@@ -342,10 +347,65 @@ func TestErrors_TransportFailures(t *testing.T) {
 
 		_, err := newClient(t, srv).Generate(ctx, llm.Request{Messages: userMsg("hi")})
 
-		var got *llm.Error
-		require.ErrorAs(t, err, &got)
-		assert.ErrorIs(t, err, context.DeadlineExceeded)
-		assert.False(t, got.Retryable)
-		assert.False(t, llm.Retryable(err))
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		notAnLLMError(t, err)
+	})
+
+	t.Run("a context that ends while the body is being read is the context's error", func(t *testing.T) {
+		srv, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", "1000")
+			_, _ = io.WriteString(w, `{"id":"`)
+			w.(http.Flusher).Flush()
+			holdOpen(r)
+		})
+		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+		defer cancel()
+
+		_, err := newClient(t, srv).Generate(ctx, llm.Request{Messages: userMsg("hi")})
+
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		notAnLLMError(t, err)
+	})
+}
+
+// The client's own timeout is not the caller's: the caller's context is live,
+// so the call failed for a reason the same request may not meet again.
+func TestErrors_ATimeoutOfTheClientIsRetryable(t *testing.T) {
+	t.Run("waiting for the answer", func(t *testing.T) {
+		srv, _ := newServer(t, func(_ http.ResponseWriter, r *http.Request) { holdOpen(r) })
+		c := newClient(t, srv, func(o *openai.Options) { o.HTTPClient = &http.Client{Timeout: 100 * time.Millisecond} })
+
+		_, err := c.Generate(t.Context(), llm.Request{Messages: userMsg("hi")})
+
+		got := asLLMError(t, err)
+		assert.Equal(t, "openai", got.Provider)
+		assert.Zero(t, got.Status)
+		assert.True(t, got.Retryable)
+		require.Error(t, got.Err)
+	})
+
+	t.Run("in the middle of a stream", func(t *testing.T) {
+		srv, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+			flushing(event(chunk(textDelta("hi"), "")))(w, r)
+			holdOpen(r)
+		})
+		c := newClient(t, srv, withIdle(-1), func(o *openai.Options) { o.HTTPClient = &http.Client{Timeout: 150 * time.Millisecond} })
+		var log deltaLog
+
+		_, err := c.Stream(t.Context(), llm.Request{Messages: userMsg("hi")}, log.fn)
+
+		got := asLLMError(t, err)
+		assert.True(t, got.Retryable)
+		assert.Equal(t, []llm.Delta{{Text: "hi"}}, log.got)
+	})
+
+	t.Run("embeddings", func(t *testing.T) {
+		srv, _ := newServer(t, func(_ http.ResponseWriter, r *http.Request) { holdOpen(r) })
+		c := newClient(t, srv, func(o *openai.Options) { o.HTTPClient = &http.Client{Timeout: 100 * time.Millisecond} })
+
+		_, err := c.Embed(t.Context(), llm.EmbedRequest{Model: "e", Input: []string{"a"}})
+
+		assert.True(t, asLLMError(t, err).Retryable)
 	})
 }

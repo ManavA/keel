@@ -3,7 +3,6 @@ package openai
 import (
 	"encoding/json"
 	"errors"
-	"net/http"
 	"strings"
 
 	"github.com/ManavA/keel/llm"
@@ -40,9 +39,10 @@ type wireMessage struct {
 }
 
 // wireToolCall is a tool call, whole in a completion and in pieces in a
-// stream. Function is nil for a call of a kind this package never asks for.
+// stream. Index is nil from a server that sends none, and Function is nil for
+// a call of a kind this package never asks for.
 type wireToolCall struct {
-	Index    int           `json:"index"`
+	Index    *int          `json:"index"`
 	ID       string        `json:"id"`
 	Function *wireFunction `json:"function"`
 }
@@ -64,8 +64,12 @@ type wireUsage struct {
 	} `json:"completion_tokens_details"`
 }
 
-// usage maps the counts. Cached and cache-written tokens are counted in
-// prompt_tokens, so they come out of InputTokens, which is never below zero.
+// usage maps the counts. The design takes cached and cache-written tokens to
+// be part of prompt_tokens and takes them out of InputTokens, which is never
+// below zero. The reference says so of cached_tokens ("cached tokens present
+// in the prompt") and does not say it of cache_write_tokens ("the unadjusted
+// number of prompt tokens written to cache"), so for a server that counts
+// those apart from the prompt, InputTokens is the smaller for it.
 func (u *wireUsage) usage() llm.Usage {
 	if u == nil {
 		return llm.Usage{}
@@ -100,10 +104,10 @@ type replyCall struct {
 
 // completionResponse maps a decoded completion. requested is the model the
 // request named, reported when the reply names none.
-func (c *Client) completionResponse(resp *http.Response, comp wireCompletion, requested string) (*llm.Response, error) {
+func (c *Client) completionResponse(ans answer, comp wireCompletion, requested string) (*llm.Response, error) {
 	if len(comp.Choices) == 0 {
-		if e, ok := errorFields(comp.Error); ok {
-			return nil, embeddedError(resp, e)
+		if e, ok := errorFields(comp.Error); ok && e.present() {
+			return nil, embeddedError(ans.status, ans.requestID, e)
 		}
 		return nil, errors.New("openai: response has no choices")
 	}

@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -25,6 +26,7 @@ type wireEmbeddings struct {
 	Usage *struct {
 		PromptTokens int64 `json:"prompt_tokens"`
 	} `json:"usage"`
+	Error json.RawMessage `json:"error"`
 }
 
 type wireEmbedding struct {
@@ -49,31 +51,33 @@ func (c *Client) Embed(ctx context.Context, req llm.EmbedRequest) (*llm.EmbedRes
 	if req.Dimensions > 0 {
 		body.Dimensions = req.Dimensions
 	}
-	raw, err := encode(body)
+	payload, err := encode(body)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.post(ctx, "/embeddings", raw)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var reply wireEmbeddings
-	if err := c.readJSON(ctx, resp.Body, &reply); err != nil {
-		return nil, err
-	}
-	vectors, err := orderVectors(reply.Data, len(req.Input))
+	ans, err := c.fetch(ctx, "/embeddings", payload)
 	if err != nil {
 		return nil, err
 	}
 
-	out := &llm.EmbedResponse{Model: reply.Model, Vectors: vectors}
+	var list wireEmbeddings
+	if err := json.Unmarshal(ans.body, &list); err != nil {
+		return nil, fmt.Errorf("openai: decode response: %w", err)
+	}
+	if e, ok := errorFields(list.Error); ok && e.present() && len(list.Data) == 0 {
+		return nil, embeddedError(ans.status, ans.requestID, e)
+	}
+	vectors, err := orderVectors(list.Data, len(req.Input))
+	if err != nil {
+		return nil, err
+	}
+
+	out := &llm.EmbedResponse{Model: list.Model, Vectors: vectors}
 	if out.Model == "" {
 		out.Model = model
 	}
-	if reply.Usage != nil {
-		out.Usage.InputTokens = reply.Usage.PromptTokens
+	if list.Usage != nil {
+		out.Usage.InputTokens = list.Usage.PromptTokens
 	}
 	return out, nil
 }

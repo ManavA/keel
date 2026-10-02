@@ -201,6 +201,7 @@ func TestEmbed_RefusesAReplyItCannotRead(t *testing.T) {
 		{name: "a vector sent as a string, which base64 would be", input: []string{"a"}, body: `{"data":[{"index":0,"embedding":"AAAAAA=="}]}`, wantErr: "decode"},
 		{name: "not JSON", input: []string{"a"}, body: `<html></html>`, wantErr: "decode"},
 		{name: "no data", input: []string{"a"}, body: `{"model":"e"}`, wantErr: "0 vector"},
+		{name: "no data and an error that says nothing", input: []string{"a"}, body: `{"model":"e","error":{},"data":[]}`, wantErr: "0 vector"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -208,7 +209,55 @@ func TestEmbed_RefusesAReplyItCannotRead(t *testing.T) {
 			_, err := newClient(t, srv).Embed(t.Context(), llm.EmbedRequest{Model: "e", Input: tt.input})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
-			assert.False(t, llm.Retryable(err))
+			notAnLLMError(t, err)
 		})
 	}
+}
+
+// An error object in a 200 reply is an error with the server's own words, as
+// it is for a chat call, and not a count of vectors that are not there.
+func TestEmbed_AnErrorInsideASuccessfulResponse(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		wantType  string
+		wantMsg   string
+		wantRetry bool
+	}{
+		{name: "final", body: apiErr("invalid_request_error", "", "input too long"), wantType: "invalid_request_error", wantMsg: "input too long"},
+		{name: "overloaded", body: apiErr("service_unavailable_error", "server_is_overloaded", "busy"), wantType: "service_unavailable_error", wantMsg: "busy", wantRetry: true},
+		{name: "a rate limit", body: apiErr("rate_limit_error", "", "slow"), wantType: "rate_limit_error", wantMsg: "slow", wantRetry: true},
+		{name: "out of credit", body: apiErr("insufficient_quota", "credit_balance_exhausted", "no credits"), wantType: "insufficient_quota", wantMsg: "no credits"},
+		{name: "an error beside an empty list", body: `{"object":"list","data":[],"error":{"message":"nothing embedded","type":"server_error"}}`, wantType: "server_error", wantMsg: "nothing embedded", wantRetry: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, _ := newServer(t, failWith(http.StatusOK, http.Header{"X-Request-Id": {"req_9"}}, tt.body))
+
+			_, err := newClient(t, srv).Embed(t.Context(), llm.EmbedRequest{Model: "e", Input: []string{"a"}})
+
+			got := asLLMError(t, err)
+			assert.Equal(t, "openai", got.Provider)
+			assert.Equal(t, http.StatusOK, got.Status)
+			assert.Equal(t, tt.wantType, got.Type)
+			assert.Equal(t, tt.wantMsg, got.Message)
+			assert.Equal(t, tt.wantRetry, got.Retryable)
+			assert.Equal(t, "req_9", got.RequestID)
+			assert.NoError(t, got.Err)
+		})
+	}
+
+	t.Run("an error beside all the vectors asked for does not take them away", func(t *testing.T) {
+		srv, _ := newServer(t, serveJSON(`{"model":"e","error":{"message":"deprecated model","type":"warning"},"data":[{"index":0,"embedding":[1]}]}`))
+		got, err := newClient(t, srv).Embed(t.Context(), llm.EmbedRequest{Model: "e", Input: []string{"a"}})
+		require.NoError(t, err)
+		assert.Equal(t, [][]float32{{1}}, got.Vectors)
+	})
+
+	t.Run("an empty error beside the vectors is no error", func(t *testing.T) {
+		srv, _ := newServer(t, serveJSON(`{"model":"e","error":{},"data":[{"index":0,"embedding":[1]}]}`))
+		got, err := newClient(t, srv).Embed(t.Context(), llm.EmbedRequest{Model: "e", Input: []string{"a"}})
+		require.NoError(t, err)
+		assert.Equal(t, [][]float32{{1}}, got.Vectors)
+	})
 }
