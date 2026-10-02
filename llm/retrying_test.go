@@ -245,9 +245,7 @@ func TestRetrying_Context(t *testing.T) {
 		_, err := r.Generate(ctx, fakeRequest(""))
 
 		require.ErrorIs(t, err, context.Canceled)
-		var le *llm.Error
-		assert.ErrorAs(t, err, &le, "the cancel does not hide what the provider said")
-		assert.False(t, llm.Retryable(err), "a cancelled call is not retryable")
+		assert.False(t, llm.Retryable(err), "a cancelled call is not retryable, whatever the provider said")
 		assert.Equal(t, 1, inner.Calls(), "no second attempt after the cancel")
 		assertPrompt(t, time.Since(start), "the call")
 	})
@@ -282,8 +280,96 @@ func TestRetrying_Context(t *testing.T) {
 	})
 }
 
+// An http.Client's own timeout is a failure of the provider, not of the
+// caller, even though it wraps the deadline error: the provider marks it
+// retryable, and Retrying must act on that while the caller's context is live.
+func TestRetrying_AProviderTimeoutIsRetried(t *testing.T) {
+	timeout := &llm.Error{Provider: "fake", Err: httpClientTimeout(t), Retryable: true}
+	require.ErrorIs(t, timeout, context.DeadlineExceeded, "the fixture: it reads as a deadline")
+
+	t.Run("Generate", func(t *testing.T) {
+		inner := newFakeModel(fakeStep{err: timeout}, fakeAnswer("m", llm.Usage{}))
+		r := llm.NewRetrying(inner, llm.RetryOptions{Retry: fastBackoff})
+
+		resp, err := r.Generate(context.Background(), fakeRequest(""))
+
+		require.NoError(t, err)
+		assert.Equal(t, "m", resp.Model)
+		assert.Equal(t, 2, inner.Calls())
+	})
+	t.Run("Stream, before a delta", func(t *testing.T) {
+		inner := newFakeModel(fakeStep{err: timeout}, fakeAnswer("m", llm.Usage{}))
+		r := llm.NewRetrying(inner, llm.RetryOptions{Retry: fastBackoff})
+
+		resp, err := r.Stream(context.Background(), fakeRequest(""), func(llm.Delta) error { return nil })
+
+		require.NoError(t, err)
+		assert.Equal(t, "m", resp.Model)
+		assert.Equal(t, 2, inner.Calls())
+	})
+	t.Run("Generate, every attempt timing out gives up after three", func(t *testing.T) {
+		inner := newFakeModelFunc(func(int, llm.Request) fakeStep { return fakeStep{err: timeout} })
+		r := llm.NewRetrying(inner, llm.RetryOptions{Retry: fastBackoff})
+
+		_, err := r.Generate(context.Background(), fakeRequest(""))
+
+		var re *retry.Error
+		require.ErrorAs(t, err, &re)
+		assert.Equal(t, 3, re.Attempts)
+		assert.Equal(t, 3, inner.Calls())
+	})
+}
+
+// The caller's own context ending is not a provider failure and is not retried,
+// whatever shape the failure comes back in.
+func TestRetrying_TheCallersContextEndingEndsTheLoopAtOnce(t *testing.T) {
+	t.Run("a deadline reached during a call", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		// The call is held until the context ends and returns its error bare,
+		// as a provider does for a caller who gave up.
+		inner := newFakeModel(fakeStep{hold: time.Hour}, fakeAnswer("m", llm.Usage{}))
+		r := llm.NewRetrying(inner, llm.RetryOptions{Retry: fastBackoff})
+
+		start := time.Now()
+		_, err := r.Generate(ctx, fakeRequest(""))
+
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.False(t, llm.Retryable(err))
+		assert.Equal(t, 1, inner.Calls())
+		assertPrompt(t, time.Since(start), "the call")
+	})
+	t.Run("a deadline reached during a stream", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		inner := newFakeModel(fakeStep{hold: time.Hour}, fakeAnswer("m", llm.Usage{}))
+		r := llm.NewRetrying(inner, llm.RetryOptions{Retry: fastBackoff})
+
+		_, err := r.Stream(ctx, fakeRequest(""), func(llm.Delta) error { return nil })
+
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Equal(t, 1, inner.Calls())
+	})
+	t.Run("a provider that still marks its cancelled call retryable", func(t *testing.T) {
+		// The old shape: a retryable *llm.Error wrapping the caller's cancel.
+		// The caller's context decides, so it is still not retried.
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		old := &llm.Error{Provider: "fake", Retryable: true, Err: context.Canceled}
+		inner := newFakeModel(fakeStep{err: old, onCall: cancel}, fakeAnswer("m", llm.Usage{}))
+		r := llm.NewRetrying(inner, llm.RetryOptions{Retry: retry.Options{BaseDelay: time.Hour, MaxDelay: time.Hour}})
+
+		start := time.Now()
+		_, err := r.Generate(ctx, fakeRequest(""))
+
+		require.ErrorIs(t, err, context.Canceled)
+		assert.False(t, llm.Retryable(err))
+		assert.Equal(t, 1, inner.Calls())
+		assertPrompt(t, time.Since(start), "the call")
+	})
+}
+
 func TestRetrying_Stream(t *testing.T) {
-	errStop := errors.New("caller stopped")
 	tests := []struct {
 		name  string
 		steps []fakeStep
@@ -330,35 +416,6 @@ func TestRetrying_Stream(t *testing.T) {
 			wantProvider: true,
 		},
 		{
-			name:  "an error from the callback stops the stream and is returned",
-			steps: []fakeStep{{deltas: fakeDeltas(), resp: fakeAnswer("m", llm.Usage{}).resp}, fakeAnswer("m", llm.Usage{})},
-			fn: func(got *[]llm.Delta) func(llm.Delta) error {
-				return func(d llm.Delta) error {
-					*got = append(*got, d)
-					return errStop
-				}
-			},
-			wantDeltas: fakeDeltas()[:1],
-			wantCalls:  1,
-			wantErr:    errStop,
-		},
-		{
-			name: "a callback error is not retried even when it looks retryable",
-			steps: []fakeStep{
-				{deltas: fakeDeltas(), resp: fakeAnswer("m", llm.Usage{}).resp},
-				{deltas: fakeDeltas(), resp: fakeAnswer("m", llm.Usage{}).resp},
-			},
-			fn: func(got *[]llm.Delta) func(llm.Delta) error {
-				return func(d llm.Delta) error {
-					*got = append(*got, d)
-					return fakeTransient(0)
-				}
-			},
-			wantDeltas:   fakeDeltas()[:1],
-			wantCalls:    1,
-			wantProvider: true,
-		},
-		{
 			name:         "a failure that is not retryable is one call",
 			steps:        []fakeStep{{err: fakePermanent()}, fakeAnswer("m", llm.Usage{})},
 			fn:           collectDeltas,
@@ -393,6 +450,69 @@ func TestRetrying_Stream(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The callback's error is the caller's own signal to stop, not a failure of
+// the model, so it comes back as the caller returned it: not wrapped in a
+// *retry.Error, not wrapped by the provider, not retried however it reads.
+func TestRetrying_TheCallbacksErrorComesBackUntouched(t *testing.T) {
+	errStop := errors.New("caller stopped")
+	looksRetryable := fakeTransient(0)
+	tests := []struct {
+		name    string
+		cbErr   error
+		wrapped bool
+	}{
+		{name: "a plain error", cbErr: errStop},
+		{name: "an error that looks retryable", cbErr: looksRetryable},
+		{name: "an error the provider wrapped on the way out", cbErr: errStop, wrapped: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			step := fakeAnswer("m", llm.Usage{})
+			step.deltas = fakeDeltas()
+			step.wrapCallbackError = tt.wrapped
+			inner := newFakeModel(step, step)
+			r := llm.NewRetrying(inner, llm.RetryOptions{Retry: fastBackoff})
+			var got []llm.Delta
+
+			resp, err := r.Stream(context.Background(), fakeRequest(""), func(d llm.Delta) error {
+				got = append(got, d)
+				return tt.cbErr
+			})
+
+			assert.Nil(t, resp)
+			assert.Same(t, tt.cbErr, err, "the very error the callback returned")
+			assert.Len(t, got, 1, "the stream stopped at once")
+			assert.Equal(t, 1, inner.Calls(), "and was not retried")
+		})
+	}
+}
+
+func TestRetrying_ANilReplyIsAnError(t *testing.T) {
+	// A model that returns neither a reply nor an error is broken, not
+	// transient: it is reported, not retried, and never handed back as a nil
+	// reply with a nil error.
+	t.Run("Generate", func(t *testing.T) {
+		inner := newFakeModel(fakeStep{}, fakeAnswer("m", llm.Usage{}))
+		r := llm.NewRetrying(inner, llm.RetryOptions{Retry: fastBackoff})
+
+		resp, err := r.Generate(context.Background(), fakeRequest(""))
+
+		assert.Nil(t, resp)
+		assert.ErrorContains(t, err, noReplyMessage)
+		assert.Equal(t, 1, inner.Calls())
+	})
+	t.Run("Stream", func(t *testing.T) {
+		inner := newFakeModel(fakeStep{}, fakeAnswer("m", llm.Usage{}))
+		r := llm.NewRetrying(inner, llm.RetryOptions{Retry: fastBackoff})
+
+		resp, err := r.Stream(context.Background(), fakeRequest(""), func(llm.Delta) error { return nil })
+
+		assert.Nil(t, resp)
+		assert.ErrorContains(t, err, noReplyMessage)
+		assert.Equal(t, 1, inner.Calls())
+	})
 }
 
 func TestRetrying_PassesTheRequestThrough(t *testing.T) {

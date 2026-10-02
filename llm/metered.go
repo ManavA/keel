@@ -37,8 +37,10 @@ type MeterOptions struct {
 //
 // A failed call has no usage and is not priced: its record carries the error,
 // and its cost is zero. A reply that more than one model worked on is counted
-// across its Attempts. Record runs after the call, with no lock held, so calls
-// that finish together may be recorded in either order.
+// across its Attempts. A reply from a model the table does not list is priced
+// at the model the request asked for, and Priced is false only when neither is
+// listed. Record runs after the call, with no lock held, so calls that finish
+// together may be recorded in either order.
 type Metered struct {
 	model  Model
 	prices Prices
@@ -63,7 +65,7 @@ func NewMetered(m Model, opts MeterOptions) *Metered {
 // Generate implements Model.
 func (m *Metered) Generate(ctx context.Context, req Request) (*Response, error) {
 	start := m.now()
-	resp, err := m.model.Generate(ctx, req)
+	resp, err := requireReply(m.model.Generate(ctx, req))
 	m.account(ctx, req, start, resp, err)
 	return resp, err
 }
@@ -72,7 +74,11 @@ func (m *Metered) Generate(ctx context.Context, req Request) (*Response, error) 
 // its Duration covers all of it.
 func (m *Metered) Stream(ctx context.Context, req Request, fn func(Delta) error) (*Response, error) {
 	start := m.now()
-	resp, err := m.model.Stream(ctx, req, fn)
+	g := &streamGuard{fn: fn}
+	resp, err := requireReply(m.model.Stream(ctx, req, g.deliver))
+	if cbErr := g.callbackErr(); err != nil && cbErr != nil {
+		err = cbErr
+	}
 	m.account(ctx, req, start, resp, err)
 	return resp, err
 }
@@ -91,9 +97,7 @@ func (m *Metered) account(ctx context.Context, req Request, start time.Time, res
 		c.Model = cmp.Or(resp.Model, req.Model)
 		c.Usage = billed(resp)
 		c.Stop = resp.Stop
-		if cost, perr := m.prices.CostOf(resp); perr == nil {
-			c.CostMicros, c.Priced = cost, true
-		}
+		c.CostMicros, c.Priced = priceReply(m.prices, resp, req.Model)
 	}
 
 	m.mu.Lock()

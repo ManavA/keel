@@ -3,6 +3,7 @@ package llm_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -104,11 +105,31 @@ func TestMetered_Generate(t *testing.T) {
 			},
 		},
 		{
-			name:   "a reply that names no model is recorded under the one asked for",
+			name:   "a reply that names no model is recorded, and priced, as the one asked for",
 			prices: wrapperPrices(),
 			step:   noModel,
 			req:    fakeRequest("model-a"),
-			want:   llm.CallRecord{Model: "model-a", Usage: used, Stop: llm.StopEnd},
+			want: llm.CallRecord{
+				Model: "model-a", Usage: used, Stop: llm.StopEnd, Priced: true,
+				CostMicros: mustCost(t, "model-a", used),
+			},
+		},
+		{
+			name:   "a dated id the table lacks is priced at the model asked for",
+			prices: wrapperPrices(),
+			step:   fakeAnswer("model-a-20251001", used),
+			req:    fakeRequest("model-a"),
+			want: llm.CallRecord{
+				Model: "model-a-20251001", Usage: used, Stop: llm.StopEnd, Priced: true,
+				CostMicros: mustCost(t, "model-a", used),
+			},
+		},
+		{
+			name:   "a reply that names no model, to a request that named none, cannot be priced",
+			prices: wrapperPrices(),
+			step:   noModel,
+			req:    fakeRequest(""),
+			want:   llm.CallRecord{Usage: used, Stop: llm.StopEnd},
 		},
 		{
 			name:   "a refusal is a reply: billed, with its stop reason",
@@ -133,10 +154,22 @@ func TestMetered_Generate(t *testing.T) {
 			},
 		},
 		{
-			name:   "one attempt on a model the table lacks leaves the call not priced",
+			name:   "an attempt on a model the table lacks is priced at the model asked for",
 			prices: wrapperPrices(),
 			step:   partlyListed,
 			req:    fakeRequest("model-a"),
+			want: llm.CallRecord{
+				Model: "model-b", Stop: llm.StopEnd, Priced: true,
+				Usage: llm.Usage{InputTokens: 1000, OutputTokens: 110},
+				CostMicros: mustCost(t, "model-a", llm.Usage{InputTokens: 600, OutputTokens: 10}) +
+					mustCost(t, "model-a", llm.Usage{InputTokens: 400, OutputTokens: 100}),
+			},
+		},
+		{
+			name:   "and with no model asked for, one attempt on a model the table lacks leaves the call not priced",
+			prices: wrapperPrices(),
+			step:   partlyListed,
+			req:    fakeRequest(""),
 			want: llm.CallRecord{
 				Model: "model-b", Stop: llm.StopEnd,
 				Usage: llm.Usage{InputTokens: 1000, OutputTokens: 110},
@@ -299,6 +332,58 @@ func TestMetered_Stream(t *testing.T) {
 	})
 }
 
+func TestMetered_ANilReplyIsRecordedAsAFailedCall(t *testing.T) {
+	t0 := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream %v", stream), func(t *testing.T) {
+			var rec recorder
+			m := llm.NewMetered(newFakeModel(fakeStep{}), llm.MeterOptions{
+				Prices: wrapperPrices(), Record: rec.record, Now: meterClock(t0, t0.Add(time.Second)),
+			})
+
+			var resp *llm.Response
+			var err error
+			if stream {
+				resp, err = m.Stream(context.Background(), fakeRequest("model-a"), func(llm.Delta) error { return nil })
+			} else {
+				resp, err = m.Generate(context.Background(), fakeRequest("model-a"))
+			}
+
+			assert.Nil(t, resp)
+			assert.ErrorContains(t, err, noReplyMessage)
+			records := rec.all()
+			require.Len(t, records, 1, "it was a call, and it failed")
+			assert.Equal(t, "model-a", records[0].Model)
+			assert.Equal(t, err, records[0].Err)
+			assert.Equal(t, llm.Spend{Calls: 1}, m.Totals())
+		})
+	}
+}
+
+// The callback's error is the caller's own signal to stop. It comes back as
+// the caller returned it even when the provider wrapped it, and the record of
+// the call carries that same error.
+func TestMetered_TheCallbacksErrorComesBackUntouched(t *testing.T) {
+	errStop := errors.New("caller stopped")
+	for _, wrapped := range []bool{false, true} {
+		t.Run(fmt.Sprintf("provider wraps it: %v", wrapped), func(t *testing.T) {
+			step := fakeAnswer("model-a", llm.Usage{InputTokens: 3})
+			step.deltas = fakeDeltas()
+			step.wrapCallbackError = wrapped
+			var rec recorder
+			m := llm.NewMetered(newFakeModel(step), llm.MeterOptions{Record: rec.record})
+
+			resp, err := m.Stream(context.Background(), fakeRequest("model-a"), func(llm.Delta) error { return errStop })
+
+			assert.Nil(t, resp)
+			assert.Same(t, errStop, err)
+			records := rec.all()
+			require.Len(t, records, 1)
+			assert.Same(t, errStop, records[0].Err)
+		})
+	}
+}
+
 func TestMetered_NowDefaultsToTimeNow(t *testing.T) {
 	step := fakeAnswer("model-a", llm.Usage{InputTokens: 1})
 	step.hold = 20 * time.Millisecond
@@ -388,7 +473,7 @@ func TestMetered_ConcurrentCallsAreAllCounted(t *testing.T) {
 }
 
 // TestWrappers_ComposeInTheDocumentedOrder builds the stack the package
-// documents, outermost first: Metered, Budgeted, Fallback, then one Retrying
+// documents, outermost first: Budgeted, Metered, Fallback, then one Retrying
 // around each provider.
 func TestWrappers_ComposeInTheDocumentedOrder(t *testing.T) {
 	req := fakeRequest("")
@@ -400,46 +485,45 @@ func TestWrappers_ComposeInTheDocumentedOrder(t *testing.T) {
 	retryOpts := llm.RetryOptions{Retry: fastBackoff}
 	chain := newFallback(t, llm.FallbackOptions{}, llm.NewRetrying(down, retryOpts), llm.NewRetrying(up, retryOpts))
 
-	build := func(t *testing.T, limit int64) (*llm.Metered, *llm.Budgeted, *recorder) {
+	build := func(t *testing.T, limit int64) (*llm.Budgeted, *llm.Metered, *recorder) {
 		t.Helper()
-		budget, err := llm.NewBudgeted(chain, llm.BudgetOptions{MaxTokens: limit, Prices: wrapperPrices(), Model: "model-a"})
-		require.NoError(t, err)
 		var rec recorder
-		return llm.NewMetered(budget, llm.MeterOptions{Prices: wrapperPrices(), Record: rec.record}), budget, &rec
+		meter := llm.NewMetered(chain, llm.MeterOptions{Prices: wrapperPrices(), Record: rec.record})
+		budget, err := llm.NewBudgeted(meter, llm.BudgetOptions{MaxTokens: limit, Prices: wrapperPrices(), Model: "model-a"})
+		require.NoError(t, err)
+		return budget, meter, &rec
 	}
 
 	t.Run("each provider retries before the chain moves on, and the budget and meter see one call", func(t *testing.T) {
-		metered, budget, rec := build(t, 1_000_000)
+		budget, meter, rec := build(t, 1_000_000)
 
-		resp, err := metered.Generate(context.Background(), req)
+		resp, err := budget.Generate(context.Background(), req)
 
 		require.NoError(t, err)
 		assert.Equal(t, "model-b", resp.Model)
 		assert.Equal(t, 3, down.Calls(), "the first provider is tried three times first")
 		assert.Equal(t, 1, up.Calls())
-		assert.Equal(t, llm.Spend{Calls: 1, Tokens: used.Total(), CostMicros: mustCost(t, "model-b", used)}, budget.Spent(),
-			"one call to the budget however many attempts it took")
+		want := llm.Spend{Calls: 1, Tokens: used.Total(), CostMicros: mustCost(t, "model-b", used)}
+		assert.Equal(t, want, budget.Spent(), "one call to the budget however many attempts it took")
+		assert.Equal(t, want, meter.Totals(), "and one to the meter")
 		records := rec.all()
-		require.Len(t, records, 1, "and one to the meter")
+		require.Len(t, records, 1)
 		assert.Equal(t, "model-b", records[0].Model)
 		assert.True(t, records[0].Priced)
 	})
 
-	t.Run("a call the budget refuses reaches no provider and the meter records it as failed", func(t *testing.T) {
-		metered, budget, rec := build(t, 1)
+	t.Run("a call the budget refuses reaches no provider and the meter never sees it", func(t *testing.T) {
+		budget, meter, rec := build(t, 1)
 		downBefore, upBefore := down.Calls(), up.Calls()
 
-		resp, err := metered.Generate(context.Background(), req)
+		resp, err := budget.Generate(context.Background(), req)
 
 		require.ErrorIs(t, err, llm.ErrBudgetExceeded)
 		assert.Nil(t, resp)
 		assert.Equal(t, downBefore, down.Calls())
 		assert.Equal(t, upBefore, up.Calls())
 		assert.Equal(t, llm.Spend{}, budget.Spent())
-		records := rec.all()
-		require.Len(t, records, 1)
-		assert.ErrorIs(t, records[0].Err, llm.ErrBudgetExceeded)
-		assert.Zero(t, records[0].Usage)
-		assert.Equal(t, llm.Spend{Calls: 1}, metered.Totals())
+		assert.Empty(t, rec.all(), "the meter records what the budget let through, and this was not")
+		assert.Equal(t, llm.Spend{}, meter.Totals())
 	})
 }

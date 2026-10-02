@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"runtime"
 	"strings"
 	"sync"
@@ -399,26 +400,127 @@ func TestBudgeted_UsageOfEveryAttemptCounts(t *testing.T) {
 	}, b.Spent(), "a model that ran and was set aside was billed, and is counted")
 }
 
-func TestBudgeted_AReplyThePricesCannotPriceIsChargedTheWorstCase(t *testing.T) {
-	// The request names model-a, which is priced; the reply names a model the
-	// table has never heard of. The call has been made and cannot be priced,
-	// so the budget charges what it reserved rather than nothing.
+// A provider commonly answers an alias with a dated id, so a table keyed by
+// alias would otherwise miss the reply of every call. The real usage is priced
+// at the model the reply names, then at the model the request asked for.
+func TestBudgeted_PricesTheReplyAtTheModelItNames(t *testing.T) {
+	real := llm.Usage{InputTokens: 30, OutputTokens: 20}
+	listed := llm.BudgetOptions{MaxCostMicros: 1 << 40, Prices: wrapperPrices()}
+	tests := []struct {
+		name string
+		opts llm.BudgetOptions
+		req  string
+		// reply is the step the model plays.
+		reply fakeStep
+		// priceAs is the model the real usage must be priced at.
+		priceAs string
+	}{
+		{
+			name:    "a reply naming a listed model is priced at it",
+			opts:    listed,
+			req:     "model-a",
+			reply:   fakeAnswer("model-b", real),
+			priceAs: "model-b",
+		},
+		{
+			name:    "a dated id the table lacks is priced at the model asked for",
+			opts:    listed,
+			req:     "model-a",
+			reply:   fakeAnswer("model-a-20251001", real),
+			priceAs: "model-a",
+		},
+		{
+			name:    "a reply naming no model is priced at the model asked for",
+			opts:    listed,
+			req:     "model-b",
+			reply:   fakeAnswer("", real),
+			priceAs: "model-b",
+		},
+		{
+			name:    "a request naming no model is asked for as BudgetOptions.Model",
+			opts:    llm.BudgetOptions{MaxCostMicros: 1 << 40, Prices: wrapperPrices(), Model: "model-b"},
+			req:     "",
+			reply:   fakeAnswer("model-b-20251001", real),
+			priceAs: "model-b",
+		},
+		{
+			name: "an attempt on a model the table lacks is priced at the model asked for",
+			opts: listed,
+			req:  "model-a",
+			reply: func() fakeStep {
+				s := fakeAnswer("model-b", real)
+				s.resp.Attempts = []llm.Attempt{{Model: "model-a-20251001", Usage: real}}
+				return s
+			}(),
+			priceAs: "model-a",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := fakeRequest(tt.req)
+			req.MaxTokens = 100
+			b, err := llm.NewBudgeted(newFakeModel(tt.reply), tt.opts)
+			require.NoError(t, err)
+
+			_, err = b.Generate(context.Background(), req)
+
+			require.NoError(t, err)
+			assert.Equal(t, llm.Spend{
+				Calls: 1, Tokens: real.Total(), CostMicros: mustCost(t, tt.priceAs, real),
+			}, b.Spent(), "the real usage, not the worst case that was held")
+		})
+	}
+
+	t.Run("with no cost limit a reply nothing can price costs nothing", func(t *testing.T) {
+		// Neither the reply's model nor the request's is listed: with no cost
+		// limit that is allowed, and no cost was held to charge in its place.
+		req := fakeRequest("model-y")
+		req.MaxTokens = 100
+		b, err := llm.NewBudgeted(newFakeModel(fakeAnswer("model-z", real)),
+			llm.BudgetOptions{MaxTokens: 1 << 40, Prices: wrapperPrices()})
+		require.NoError(t, err)
+
+		_, err = b.Generate(context.Background(), req)
+
+		require.NoError(t, err)
+		assert.Equal(t, llm.Spend{Calls: 1, Tokens: real.Total()}, b.Spent())
+	})
+}
+
+func TestBudgeted_NoPriceErrorSaysItsPrefixOnce(t *testing.T) {
+	b, err := llm.NewBudgeted(newFakeModel(), llm.BudgetOptions{MaxCostMicros: 1 << 40, Prices: wrapperPrices()})
+	require.NoError(t, err)
+	req := fakeRequest("model-z")
+
+	_, err = b.Generate(context.Background(), req)
+
+	require.ErrorIs(t, err, llm.ErrNoPrice)
+	assert.Equal(t, 1, strings.Count(err.Error(), "llm:"), "got %q", err.Error())
+	assert.Contains(t, err.Error(), "model-z")
+}
+
+func TestBudgeted_ANilReplyIsAnErrorAndAddsNothing(t *testing.T) {
 	req := fakeRequest("model-a")
 	req.MaxTokens = 100
-	real := llm.Usage{InputTokens: 30, OutputTokens: 20}
-	b, err := llm.NewBudgeted(newFakeModel(fakeAnswer("model-z", real)), llm.BudgetOptions{
-		MaxCostMicros: 1 << 40, Prices: wrapperPrices(),
-	})
+	worstTokens := worstUsage(req, 100).Total()
+	// Room for exactly one worst case, so a nil reply that kept its hold, or
+	// was counted, would refuse the second call.
+	inner := newFakeModel(fakeStep{}, fakeStep{}, fakeAnswer("model-a", llm.Usage{InputTokens: 5}))
+	b, err := llm.NewBudgeted(inner, llm.BudgetOptions{MaxTokens: worstTokens})
 	require.NoError(t, err)
+
+	resp, err := b.Generate(context.Background(), req)
+	assert.Nil(t, resp)
+	assert.ErrorContains(t, err, noReplyMessage)
+	resp, err = b.Stream(context.Background(), req, func(llm.Delta) error { return nil })
+	assert.Nil(t, resp)
+	assert.ErrorContains(t, err, noReplyMessage)
+	assert.Equal(t, llm.Spend{}, b.Spent())
 
 	_, err = b.Generate(context.Background(), req)
 
 	require.NoError(t, err)
-	assert.Equal(t, llm.Spend{
-		Calls:      1,
-		Tokens:     real.Total(),
-		CostMicros: mustCost(t, "model-a", worstUsage(req, 100)),
-	}, b.Spent())
+	assert.Equal(t, llm.Spend{Calls: 1, Tokens: 5}, b.Spent())
 }
 
 func TestBudgeted_DefaultMaxTokens(t *testing.T) {
@@ -545,6 +647,30 @@ func TestBudgeted_Stream(t *testing.T) {
 		require.ErrorIs(t, err, llm.ErrNoPrice)
 		assert.Zero(t, inner.Calls())
 	})
+}
+
+// The callback's error is the caller's own signal to stop. It comes back as
+// the caller returned it even when the provider wrapped it, and it costs the
+// budget nothing.
+func TestBudgeted_TheCallbacksErrorComesBackUntouched(t *testing.T) {
+	req := fakeRequest("model-a")
+	req.MaxTokens = 100
+	errStop := errors.New("caller stopped")
+	for _, wrapped := range []bool{false, true} {
+		t.Run(fmt.Sprintf("provider wraps it: %v", wrapped), func(t *testing.T) {
+			step := fakeAnswer("model-a", llm.Usage{InputTokens: 30, OutputTokens: 20})
+			step.deltas = fakeDeltas()
+			step.wrapCallbackError = wrapped
+			b, err := llm.NewBudgeted(newFakeModel(step), llm.BudgetOptions{MaxTokens: worstUsage(req, 100).Total()})
+			require.NoError(t, err)
+
+			resp, err := b.Stream(context.Background(), req, func(llm.Delta) error { return errStop })
+
+			assert.Nil(t, resp)
+			assert.Same(t, errStop, err)
+			assert.Equal(t, llm.Spend{}, b.Spent())
+		})
+	}
 }
 
 // TestBudgeted_ConcurrentCallsNeverPassTheLimit is the case that must fail

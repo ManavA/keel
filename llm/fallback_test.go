@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -64,6 +65,12 @@ func TestFallback_Generate(t *testing.T) {
 	budget := fmt.Errorf("limit: %w", llm.ErrBudgetExceeded)
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
+	expired, expire := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer expire()
+	// What an HTTP client's own timeout looks like: it wraps the deadline error
+	// while the caller's context is still live.
+	providerTimeout := &llm.Error{Provider: "fake", Err: fmt.Errorf("client timeout: %w", context.DeadlineExceeded), Retryable: true}
+	providerCancel := &llm.Error{Provider: "fake", Err: fmt.Errorf("connection torn down: %w", context.Canceled)}
 	usage := llm.Usage{InputTokens: 10, OutputTokens: 5}
 
 	tests := []struct {
@@ -119,10 +126,27 @@ func TestFallback_Generate(t *testing.T) {
 			wantErrIs: []error{context.Canceled},
 		},
 		{
-			name:      "an expired deadline does not move on",
-			first:     fakeStep{err: fmt.Errorf("slow: %w", context.DeadlineExceeded)},
+			name:      "an expired deadline of the caller's does not move on",
+			ctx:       expired,
+			first:     fakeStep{err: &llm.Error{Provider: "fake", Err: context.DeadlineExceeded}},
 			second:    fakeAnswer("two", usage),
 			wantErrIs: []error{context.DeadlineExceeded},
+		},
+		{
+			name:            "a provider's own timeout moves on while the caller's context is live",
+			first:           fakeStep{err: providerTimeout},
+			second:          fakeAnswer("two", usage),
+			wantSecondCalls: 1,
+			wantModel:       "two",
+			wantStop:        llm.StopEnd,
+		},
+		{
+			name:            "so does a provider error that wraps a cancel the caller did not make",
+			first:           fakeStep{err: providerCancel},
+			second:          fakeAnswer("two", usage),
+			wantSecondCalls: 1,
+			wantModel:       "two",
+			wantStop:        llm.StopEnd,
 		},
 		{
 			name:      "a refused budget does not move on",
@@ -276,19 +300,100 @@ func TestFallback_StopsAtTheFirstErrorThatDoesNotMoveOn(t *testing.T) {
 	assert.Zero(t, m3.Calls())
 }
 
-func TestFallback_RefusalIsErrorWhenAnotherModelFails(t *testing.T) {
-	// A refusal moved past, then a failure: no model answered, and the last
-	// outcome was an error, so the call fails and says what the first model did.
-	failure := fakeTransient(0)
-	f := newFallback(t, llm.FallbackOptions{OnRefusal: true},
-		newFakeModel(fakeRefusal("one", llm.Usage{InputTokens: 4})), newFakeModel(fakeStep{err: failure}))
+// A refusal that was moved past was billed. If no later model answers, the
+// call returns that refusal as its reply, so the budget and the meter see what
+// was paid for and a caller that tries the step again does not pay again for a
+// refusal nobody saw. The failures that followed are logged.
+func TestFallback_ARefusalIsTheReplyWhenNoLaterModelAnswers(t *testing.T) {
+	refusedOne := llm.Usage{InputTokens: 100, OutputTokens: 7}
+	refusedTwo := llm.Usage{InputTokens: 100, OutputTokens: 9}
+	tests := []struct {
+		name  string
+		opts  llm.FallbackOptions
+		steps []fakeStep
+		// cancelOnCall is the number of the call that ends the caller's context.
+		cancelOnCall int
+		wantModel    string
+		// wantAttempts is empty when only one model's refusal was billed.
+		wantAttempts []llm.Attempt
+		// wantLogged are texts the failures must have left in the log.
+		wantLogged []string
+	}{
+		{
+			name:       "a failure after the refusal",
+			steps:      []fakeStep{fakeRefusal("one", refusedOne), {err: fakeTransient(0)}},
+			wantModel:  "one",
+			wantLogged: []string{"slow down"},
+		},
+		{
+			name:       "two refusals and then a failure: the last refusal, with both attempts",
+			steps:      []fakeStep{fakeRefusal("one", refusedOne), fakeRefusal("two", refusedTwo), {err: fakeTransient(0)}},
+			wantModel:  "two",
+			wantLogged: []string{"slow down"},
+			wantAttempts: []llm.Attempt{
+				{Model: "one", Usage: refusedOne}, {Model: "two", Usage: refusedTwo},
+			},
+		},
+		{
+			name:       "several failures after the refusal are each logged",
+			steps:      []fakeStep{fakeRefusal("one", refusedOne), {err: fakeTransient(0)}, {err: errors.New("transport down")}},
+			wantModel:  "one",
+			wantLogged: []string{"slow down", "transport down"},
+		},
+		{
+			name:       "a failure that does not move on, such as a refused budget",
+			steps:      []fakeStep{fakeRefusal("one", refusedOne), {err: fmt.Errorf("limit: %w", llm.ErrBudgetExceeded)}},
+			wantModel:  "one",
+			wantLogged: []string{"limit"},
+		},
+		{
+			name:       "a failure the caller's ShouldFallback refuses to move past",
+			opts:       llm.FallbackOptions{ShouldFallback: func(error) bool { return false }},
+			steps:      []fakeStep{fakeRefusal("one", refusedOne), {err: fakeTransient(0)}},
+			wantModel:  "one",
+			wantLogged: []string{"slow down"},
+		},
+		{
+			name:         "the caller's context ending during the later call",
+			steps:        []fakeStep{fakeRefusal("one", refusedOne), {err: &llm.Error{Provider: "fake", Err: context.Canceled}}},
+			cancelOnCall: 2,
+			wantModel:    "one",
+			wantLogged:   []string{"context canceled"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			tt.opts.OnRefusal = true
+			tt.opts.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+			ctx := context.Background()
+			steps := append([]fakeStep(nil), tt.steps...)
+			if tt.cancelOnCall > 0 {
+				var cancelCtx context.CancelFunc
+				ctx, cancelCtx = context.WithCancel(ctx)
+				defer cancelCtx()
+				steps[tt.cancelOnCall-1].onCall = cancelCtx
+			}
+			models := make([]llm.Model, len(steps))
+			fakes := make([]*fakeModel, len(steps))
+			for i, step := range steps {
+				fakes[i] = newFakeModel(step)
+				models[i] = fakes[i]
+			}
+			f := newFallback(t, tt.opts, models...)
 
-	resp, err := f.Generate(context.Background(), fakeRequest(""))
+			resp, err := f.Generate(ctx, fakeRequest("asked"))
 
-	require.Error(t, err)
-	assert.Nil(t, resp)
-	assert.ErrorIs(t, err, failure)
-	assert.Contains(t, err.Error(), "refused")
+			require.NoError(t, err, "the refusal is the reply")
+			assert.Equal(t, tt.wantModel, resp.Model)
+			assert.Equal(t, llm.StopRefusal, resp.Stop)
+			assert.Equal(t, tt.wantAttempts, resp.Attempts)
+			for _, text := range tt.wantLogged {
+				assert.Contains(t, buf.String(), text, "the later failure is logged")
+			}
+			assert.Contains(t, buf.String(), "level=WARN")
+		})
+	}
 }
 
 func TestFallback_AttemptsAccountForARefusalThatWasBilled(t *testing.T) {
@@ -314,6 +419,22 @@ func TestFallback_AttemptsAccountForARefusalThatWasBilled(t *testing.T) {
 	wantA, _ := wrapperPrices().Cost("model-a", refusedUsage)
 	wantB, _ := wrapperPrices().Cost("model-b", answeredUsage)
 	assert.Equal(t, wantA+wantB, cost)
+}
+
+func TestFallback_TheLastRefusalCarriesEveryRefusedAttempt(t *testing.T) {
+	// Every model refuses: the last refusal is the reply, and all the attempts
+	// that were billed on the way are in it.
+	u1, u2, u3 := llm.Usage{InputTokens: 11}, llm.Usage{InputTokens: 22}, llm.Usage{InputTokens: 33}
+	f := newFallback(t, llm.FallbackOptions{OnRefusal: true},
+		newFakeModel(fakeRefusal("one", u1)), newFakeModel(fakeRefusal("two", u2)), newFakeModel(fakeRefusal("three", u3)))
+
+	resp, err := f.Generate(context.Background(), fakeRequest(""))
+
+	require.NoError(t, err)
+	assert.Equal(t, "three", resp.Model)
+	assert.Equal(t, llm.StopRefusal, resp.Stop)
+	assert.Equal(t, u3, resp.Usage, "Usage is still the last model's")
+	assert.Equal(t, []llm.Attempt{{Model: "one", Usage: u1}, {Model: "two", Usage: u2}, {Model: "three", Usage: u3}}, resp.Attempts)
 }
 
 func TestFallback_AttemptsKeepTheAnsweringModelsOwn(t *testing.T) {
@@ -401,6 +522,16 @@ func TestFallback_Stream(t *testing.T) {
 			wantDeltas: nil,
 		},
 		{
+			name: "a provider's own timeout before the first delta moves on",
+			first: fakeStep{err: &llm.Error{
+				Provider: "fake", Err: fmt.Errorf("client timeout: %w", context.DeadlineExceeded), Retryable: true,
+			}},
+			second:          answerWith("two"),
+			wantSecondCalls: 1,
+			wantDeltas:      fakeDeltas(),
+			wantModel:       "two",
+		},
+		{
 			name:            "a refusal before any delta moves on with OnRefusal",
 			opts:            llm.FallbackOptions{OnRefusal: true},
 			first:           fakeRefusal("one", usage),
@@ -408,6 +539,23 @@ func TestFallback_Stream(t *testing.T) {
 			wantSecondCalls: 1,
 			wantDeltas:      fakeDeltas(),
 			wantModel:       "two",
+		},
+		{
+			name:            "a refusal and then a failure before any delta: the refusal is the reply",
+			opts:            llm.FallbackOptions{OnRefusal: true},
+			first:           fakeRefusal("one", usage),
+			second:          fakeStep{err: fakeTransient(0)},
+			wantSecondCalls: 1,
+			wantModel:       "one",
+		},
+		{
+			name:            "a refusal and then a stream that fails after a delta: still the refusal is the reply",
+			opts:            llm.FallbackOptions{OnRefusal: true},
+			first:           fakeRefusal("one", usage),
+			second:          fakeStep{deltas: fakeDeltas()[:1], err: fakeTransient(0)},
+			wantSecondCalls: 1,
+			wantDeltas:      fakeDeltas()[:1],
+			wantModel:       "one",
 		},
 		{
 			name: "a refusal after a delta is returned, since the caller has already seen it",
@@ -447,7 +595,7 @@ func TestFallback_Stream(t *testing.T) {
 			resp, err := f.Stream(context.Background(), fakeRequest("asked"), fn)
 
 			assert.Equal(t, 1, first.Calls())
-			assert.Equal(t, tt.wantSecondCalls, second.Calls())
+			require.Equal(t, tt.wantSecondCalls, second.Calls())
 			assert.Equal(t, tt.wantDeltas, got, "the callback sees one model's deltas, never a mix")
 			if tt.wantSecondCalls > 0 {
 				assert.Empty(t, second.Requests()[0].Model)
@@ -462,10 +610,86 @@ func TestFallback_Stream(t *testing.T) {
 				if tt.wantErrIs != nil {
 					assert.ErrorIs(t, err, tt.wantErrIs)
 				}
+				if tt.stopAfter > 0 {
+					assert.Same(t, errStop, err, "the callback's own error, as it returned it")
+				}
 				return
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantModel, resp.Model)
+		})
+	}
+}
+
+// The callback's error is the caller's own signal to stop, not a failure of a
+// model: it comes back as the caller returned it, not joined with anything,
+// not wrapped by the provider, and not moved past.
+func TestFallback_TheCallbacksErrorComesBackUntouched(t *testing.T) {
+	errStop := errors.New("caller stopped")
+	looksRetryable := fakeTransient(0)
+	tests := []struct {
+		name    string
+		cbErr   error
+		wrapped bool
+		// refusedFirst puts a refusal that was moved past ahead of the stream.
+		refusedFirst bool
+	}{
+		{name: "a plain error", cbErr: errStop},
+		{name: "an error that looks like a failure to move on from", cbErr: looksRetryable},
+		{name: "an error the provider wrapped on the way out", cbErr: errStop, wrapped: true},
+		{name: "after a refusal that was moved past", cbErr: errStop, refusedFirst: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			step := fakeAnswer("one", llm.Usage{})
+			step.deltas = fakeDeltas()
+			step.wrapCallbackError = tt.wrapped
+			models := []llm.Model{newFakeModel(step)}
+			next := newFakeModel(fakeAnswer("two", llm.Usage{}))
+			if tt.refusedFirst {
+				models = []llm.Model{newFakeModel(fakeRefusal("zero", llm.Usage{})), models[0]}
+			}
+			models = append(models, next)
+			f := newFallback(t, llm.FallbackOptions{OnRefusal: true}, models...)
+
+			resp, err := f.Stream(context.Background(), fakeRequest(""), func(llm.Delta) error { return tt.cbErr })
+
+			assert.Nil(t, resp)
+			assert.Same(t, tt.cbErr, err)
+			assert.Zero(t, next.Calls(), "no later model takes over")
+		})
+	}
+}
+
+func TestFallback_ANilReplyIsAFailureOfThatModel(t *testing.T) {
+	// A model that returns neither a reply nor an error is broken. With
+	// OnRefusal the chain would read its Stop, so it must be caught first.
+	for _, onRefusal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("OnRefusal %v", onRefusal), func(t *testing.T) {
+			opts := llm.FallbackOptions{OnRefusal: onRefusal}
+
+			t.Run("the chain moves on", func(t *testing.T) {
+				two := newFakeModel(fakeAnswer("two", llm.Usage{}))
+				f := newFallback(t, opts, newFakeModel(fakeStep{}), two)
+
+				resp, err := f.Generate(context.Background(), fakeRequest(""))
+				require.NoError(t, err)
+				assert.Equal(t, "two", resp.Model)
+
+				resp, err = newFallback(t, opts, newFakeModel(fakeStep{}), newFakeModel(fakeAnswer("two", llm.Usage{}))).
+					Stream(context.Background(), fakeRequest(""), func(llm.Delta) error { return nil })
+				require.NoError(t, err)
+				assert.Equal(t, "two", resp.Model)
+			})
+
+			t.Run("and when every model does it the call is an error", func(t *testing.T) {
+				f := newFallback(t, opts, newFakeModel(fakeStep{}), newFakeModel(fakeStep{}))
+
+				resp, err := f.Generate(context.Background(), fakeRequest(""))
+
+				assert.Nil(t, resp)
+				assert.ErrorContains(t, err, noReplyMessage)
+			})
 		})
 	}
 }
@@ -503,17 +727,18 @@ func TestFallback_LogsEachMoveOn(t *testing.T) {
 	assert.Empty(t, buf.String(), "a first answer logs nothing")
 }
 
-func TestFallback_LogsToTheDefaultLoggerWithNoOption(t *testing.T) {
-	var buf bytes.Buffer
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	t.Cleanup(func() { slog.SetDefault(previous) })
+func TestFallback_WithNoLoggerOptionItStillMovesOn(t *testing.T) {
+	// With no Logger the chain logs through slog's default. Raising that
+	// logger's level for the length of the test keeps it quiet, and the level
+	// is put back exactly; the default logger itself is never replaced.
+	previous := slog.SetLogLoggerLevel(slog.LevelError + 1)
+	t.Cleanup(func() { slog.SetLogLoggerLevel(previous) })
 	f, err := llm.NewFallback(llm.FallbackOptions{},
 		newFakeModel(fakeStep{err: fakeTransient(0)}), newFakeModel(fakeAnswer("two", llm.Usage{})))
 	require.NoError(t, err)
 
-	_, err = f.Generate(context.Background(), fakeRequest(""))
+	resp, err := f.Generate(context.Background(), fakeRequest(""))
 
 	require.NoError(t, err)
-	assert.Contains(t, buf.String(), "llm: fallback")
+	assert.Equal(t, "two", resp.Model)
 }

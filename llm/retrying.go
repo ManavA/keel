@@ -3,7 +3,6 @@ package llm
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -65,7 +64,7 @@ func NewRetrying(m Model, opts RetryOptions) *Retrying {
 func (r *Retrying) Generate(ctx context.Context, req Request) (*Response, error) {
 	var resp *Response
 	err := r.do(ctx, Retryable, func() (err error) {
-		resp, err = r.model.Generate(ctx, req)
+		resp, err = requireReply(r.model.Generate(ctx, req))
 		return err
 	})
 	if err != nil {
@@ -76,19 +75,21 @@ func (r *Retrying) Generate(ctx context.Context, req Request) (*Response, error)
 
 // Stream implements Model. It retries only while fn has not been called: a
 // stream that has delivered a delta is never replayed into the same callback,
-// so its failure is returned as it is.
+// so a failure after one is not retried. An error returned by fn itself is
+// the caller's own signal to stop, not a failure of the model, and comes back
+// as fn returned it, not as a *retry.Error.
 func (r *Retrying) Stream(ctx context.Context, req Request, fn func(Delta) error) (*Response, error) {
-	var delivered atomic.Bool
-	retryable := func(err error) bool { return !delivered.Load() && Retryable(err) }
+	g := &streamGuard{fn: fn}
+	retryable := func(err error) bool { return !g.delivered.Load() && Retryable(err) }
 	var resp *Response
 	err := r.do(ctx, retryable, func() (err error) {
-		resp, err = r.model.Stream(ctx, req, func(d Delta) error {
-			delivered.Store(true)
-			return fn(d)
-		})
+		resp, err = requireReply(r.model.Stream(ctx, req, g.deliver))
 		return err
 	})
 	if err != nil {
+		if cbErr := g.callbackErr(); cbErr != nil {
+			return nil, cbErr
+		}
 		return nil, err
 	}
 	return resp, nil
@@ -113,10 +114,54 @@ func (r *Retrying) do(ctx context.Context, retryable func(error) bool, call func
 			return err
 		}
 		if werr := sleep(ctx, min(le.RetryAfter, r.opts.MaxRetryAfter)); werr != nil {
-			return fmt.Errorf("llm: waiting out retry-after: %w (after %w)", werr, err)
+			return werr
 		}
 		return err
 	}, opts)
+}
+
+// errNoReply is what each wrapper reports of a model that returns neither a
+// reply nor an error. It is a bug in the model, not a transient failure, so
+// nothing retries it.
+var errNoReply = errors.New("llm: model returned neither a reply nor an error")
+
+// requireReply turns a model's nil reply with a nil error into errNoReply, so
+// that no wrapper has to guess what a nil reply means.
+func requireReply(resp *Response, err error) (*Response, error) {
+	if err == nil && resp == nil {
+		return nil, errNoReply
+	}
+	return resp, err
+}
+
+// streamGuard stands between a wrapper and the caller's stream callback. It
+// notes that a delta has been delivered, after which the stream can be neither
+// started again nor handed to another model, and it keeps the error fn
+// returned, which a wrapper gives back as it came: that error is the caller's
+// own signal to stop, and nothing that wraps or retries it may make it read as
+// a failure of the model.
+type streamGuard struct {
+	fn        func(Delta) error
+	delivered atomic.Bool
+	stopped   atomic.Pointer[error]
+}
+
+// deliver is the callback to hand the model in place of fn.
+func (g *streamGuard) deliver(d Delta) error {
+	g.delivered.Store(true)
+	err := g.fn(d)
+	if err != nil {
+		g.stopped.CompareAndSwap(nil, &err)
+	}
+	return err
+}
+
+// callbackErr is the first error fn returned, or nil if it returned none.
+func (g *streamGuard) callbackErr() error {
+	if p := g.stopped.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // sleep waits for d, or returns the context's error if that ends first.

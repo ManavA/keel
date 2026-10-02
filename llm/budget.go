@@ -34,8 +34,11 @@ type Spend struct {
 }
 
 // hold is what a call in flight has set aside: its worst case, tokens and
-// cost.
-type hold struct{ tokens, cost int64 }
+// cost, and the model that was priced for it.
+type hold struct {
+	tokens, cost int64
+	model        string
+}
 
 // Budgeted refuses a call that could take a Model past a budget.
 //
@@ -76,10 +79,19 @@ func (b *Budgeted) Generate(ctx context.Context, req Request) (*Response, error)
 // Stream implements Model. The worst case is held for the whole stream, and a
 // stream that fails, even after deltas, adds nothing.
 func (b *Budgeted) Stream(ctx context.Context, req Request, fn func(Delta) error) (*Response, error) {
-	return b.call(req, func() (*Response, error) { return b.model.Stream(ctx, req, fn) })
+	g := &streamGuard{fn: fn}
+	resp, err := b.call(req, func() (*Response, error) { return b.model.Stream(ctx, req, g.deliver) })
+	if err != nil {
+		if cbErr := g.callbackErr(); cbErr != nil {
+			return nil, cbErr
+		}
+	}
+	return resp, err
 }
 
-// Spent reports what has been used so far.
+// Spent reports what has been used so far. Calls counts the calls that
+// answered: a call that failed adds nothing, itself included, which is not
+// what Metered.Totals counts.
 func (b *Budgeted) Spent() Spend {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -95,7 +107,7 @@ func (b *Budgeted) call(req Request, run func() (*Response, error)) (*Response, 
 	}
 	var answered *Response
 	defer func() { b.settle(h, answered) }()
-	resp, err := run()
+	resp, err := requireReply(run())
 	if err == nil {
 		answered = resp
 	}
@@ -114,11 +126,11 @@ func (b *Budgeted) admit(req Request) (hold, error) {
 		maxOut = b.opts.DefaultMaxTokens
 	}
 	worst := Usage{InputTokens: EstimateInputTokens(req), OutputTokens: int64(maxOut)}
-	h := hold{tokens: worst.Total()}
+	h := hold{tokens: worst.Total(), model: model}
 	if b.opts.MaxCostMicros != 0 {
 		cost, err := b.opts.Prices.Cost(model, worst)
 		if err != nil {
-			return hold{}, fmt.Errorf("llm: budget: %w", err)
+			return hold{}, fmt.Errorf("pricing the worst case: %w", err)
 		}
 		h.cost = cost
 	}
@@ -142,19 +154,17 @@ func (b *Budgeted) admit(req Request) (hold, error) {
 // call that did not answer adds nothing: whether the provider billed it
 // cannot be known.
 //
-// A reply that the price table cannot price, such as one from a model the
-// request did not name, is charged the cost that was held for it. That is
-// the most it was admitted at, so the budget errs toward refusing the next
-// call rather than toward forgetting this one.
+// The real usage is priced by priceReply. Only a reply it cannot price is
+// charged the cost that was held for it, which is the most the call was
+// admitted at, so the budget errs toward refusing the next call rather than
+// toward forgetting this one.
 func (b *Budgeted) settle(h hold, resp *Response) {
 	var tokens, cost int64
 	if resp != nil {
 		tokens = billed(resp).Total()
 		cost = h.cost
-		if len(b.opts.Prices) > 0 {
-			if c, err := b.opts.Prices.CostOf(resp); err == nil {
-				cost = c
-			}
+		if c, ok := priceReply(b.opts.Prices, resp, h.model); ok {
+			cost = c
 		}
 	}
 	b.mu.Lock()
@@ -166,6 +176,25 @@ func (b *Budgeted) settle(h hold, resp *Response) {
 		b.spent.Tokens += tokens
 		b.spent.CostMicros += cost
 	}
+}
+
+// priceReply is what resp cost. Each attempt behind it is priced at the model
+// it names, or, when the table does not list that one, at asked, the model
+// the request asked for: a provider commonly answers an alias with a dated id
+// the table does not carry. ok is false when some attempt can be priced at
+// neither, and with no table.
+func priceReply(prices Prices, resp *Response, asked string) (cost int64, ok bool) {
+	for _, a := range attemptsOf(resp) {
+		c, err := prices.Cost(a.Model, a.Usage)
+		if err != nil {
+			c, err = prices.Cost(asked, a.Usage)
+		}
+		if err != nil {
+			return 0, false
+		}
+		cost += c
+	}
+	return cost, true
 }
 
 // billed is the usage of every attempt behind resp.

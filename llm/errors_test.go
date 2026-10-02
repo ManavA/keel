@@ -4,15 +4,33 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/ManavA/keel/llm"
 )
 
+// A real client timeout, as the standard library builds it, is what a
+// provider's transport error is made of, so the table uses one rather than a
+// guess at its shape.
+func TestHTTPClientTimeout_IsTheShapeThatFooledTheContextCheck(t *testing.T) {
+	err := httpClientTimeout(t)
+
+	var netErr net.Error
+	require.ErrorAs(t, err, &netErr)
+	assert.True(t, netErr.Timeout(), "a timeout")
+	assert.ErrorIs(t, err, context.DeadlineExceeded, "which reads as the caller's deadline to a check of the chain")
+	assert.NotErrorIs(t, err, context.Canceled)
+	var provider *llm.Error
+	assert.NotErrorAs(t, err, &provider)
+}
+
 func TestRetryable(t *testing.T) {
+	clientTimeout := httpClientTimeout(t)
 	retryable := &llm.Error{Provider: "anthropic", Status: 529, Type: "overloaded_error", Retryable: true}
 	permanent := &llm.Error{Provider: "anthropic", Status: 400, Type: "invalid_request_error"}
 
@@ -28,16 +46,48 @@ func TestRetryable(t *testing.T) {
 		{name: "context.Canceled", err: context.Canceled, want: false},
 		{name: "context.DeadlineExceeded", err: context.DeadlineExceeded, want: false},
 		{
-			// A transport failure is marked retryable by its provider, but
-			// not when the transport failed because the caller gave up.
-			name: "a retryable provider error whose transport error is a cancelled context",
+			// The provider's own flag decides, whatever its transport error
+			// wraps. A client's own timeout wraps the deadline error while the
+			// caller's context is live, and is worth another try. A caller who
+			// gave up is told by the provider with the context's own error and
+			// no *Error, and that is not retryable (the rows above).
+			name: "a retryable provider error whose transport error wraps a deadline",
+			err:  &llm.Error{Provider: "openai", Retryable: true, Err: context.DeadlineExceeded},
+			want: true,
+		},
+		{
+			name: "a retryable provider error whose transport error wraps a cancel",
 			err:  &llm.Error{Provider: "openai", Retryable: true, Err: context.Canceled},
+			want: true,
+		},
+		{
+			name: "a provider error that is not retryable, whose transport error wraps a deadline",
+			err:  &llm.Error{Provider: "openai", Retryable: false, Err: context.DeadlineExceeded},
 			want: false,
 		},
 		{
-			name: "a retryable provider error whose transport error is an expired deadline",
-			err:  &llm.Error{Provider: "openai", Retryable: true, Err: context.DeadlineExceeded},
+			name: "the timeout an http.Client raises, marked retryable by its provider",
+			err:  &llm.Error{Provider: "openai", Retryable: true, Err: clientTimeout},
+			want: true,
+		},
+		{
+			name: "the same timeout wrapped again on the way up",
+			err:  fmt.Errorf("generate: %w", &llm.Error{Provider: "openai", Retryable: true, Err: clientTimeout}),
+			want: true,
+		},
+		{
+			name: "the same timeout marked not retryable",
+			err:  &llm.Error{Provider: "openai", Retryable: false, Err: clientTimeout},
 			want: false,
+		},
+		{name: "the timeout an http.Client raises, with no provider error around it", err: clientTimeout, want: false},
+		{name: "a deadline error wrapped", err: fmt.Errorf("slow: %w", context.DeadlineExceeded), want: false},
+		{name: "a cancel wrapped", err: fmt.Errorf("stopped: %w", context.Canceled), want: false},
+		{
+			// An *Error in the chain decides even beside a context error.
+			name: "a retryable provider error joined with a context error",
+			err:  fmt.Errorf("%w; last error: %w", context.Canceled, retryable),
+			want: true,
 		},
 		{name: "ErrBudgetExceeded", err: llm.ErrBudgetExceeded, want: false},
 		{name: "ErrBudgetExceeded wrapped", err: fmt.Errorf("%w: 12 of 10 tokens", llm.ErrBudgetExceeded), want: false},

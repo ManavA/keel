@@ -417,12 +417,14 @@ func (e *Error) Error() string {
 func (e *Error) Unwrap() error { return e.Err }
 
 // Retryable reports whether err is a provider failure worth trying again.
-// Context cancellation, ErrBudgetExceeded and any error that is not an *Error
-// are not.
+//
+// If err holds an *Error, its Retryable field decides, whatever the error it
+// wraps says. A client's own timeout wraps context.DeadlineExceeded while the
+// caller's context is still live, and is worth another try; a provider whose
+// caller's context is done returns that context's error and no *Error. Any
+// other error is not retryable: a bare context cancellation or deadline,
+// ErrBudgetExceeded, and anything that is not from a provider.
 func Retryable(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
 	var e *Error
 	return errors.As(err, &e) && e.Retryable
 }
@@ -1098,18 +1100,32 @@ provider consumes an `*http.Client`. Nothing else.
 Every type here is safe for concurrent use. `Scripted`, `Budgeted` and
 `Metered` guard their state with a mutex; the providers hold no state beyond
 their options. No call is retried unless it is wrapped in `Retrying`: a
-provider makes one HTTP request per call. A cancelled context ends a call at
-once and is never retried and never moves a `Fallback` on.
+provider makes one HTTP request per call.
+
+The caller's own context ending, cancelled or past its deadline, ends a call
+at once: it is never retried and never moves a `Fallback` on. That is read
+from the context, not from an error that merely wraps a deadline. An HTTP
+client's own timeout wraps `context.DeadlineExceeded` while the caller's
+context is live; it is a failure of the provider, which marks it retryable,
+and both `Retryable` and `Fallback` treat it as one. A provider whose caller's
+context is done returns the context's error and no `*Error`.
 
 A provider reads at most 32 MiB of response body, and the event reader at
 most 16 MiB per event; past either it returns an error instead of
 allocating without limit.
 
-The order to compose the wrappers, outermost first, is `Metered`,
-`Budgeted`, `Fallback`, then one `Retrying` per provider: each provider
-retries its own transient failures before the chain moves on, the budget
-sees one call however many attempts it took, and the meter sees what the
-budget let through.
+The order to compose the wrappers, outermost first, is `Budgeted`, `Metered`,
+`Fallback`, then one `Retrying` per provider: each provider retries its own
+transient failures before the chain moves on, the budget refuses a call
+before anything else sees it, and the budget and the meter each see one call
+however many attempts it took. The meter records only what the budget let
+through.
+
+Two things hold for every wrapper. A stream callback's own error is the
+caller's signal to stop, not a failure of the model, so each wrapper returns it
+as the callback returned it, never wrapped, joined or retried. And a model that
+returns neither a reply nor an error is a bug in the model: each wrapper
+reports it as an error with one message, and none counts it as a reply.
 
 ### 4.8 In-process default
 
@@ -4078,3 +4094,41 @@ chose them.
     bound. Rejected: checking the assembled event, which allocates first
     and checks after. The error is not exported, since no caller has a
     decision to make about it.
+
+The review of the wrappers task settled the points below. They refine 4.3 and
+4.7, which they take precedence over. They carry no numbers, so that
+decisions added by tasks running at the same time do not collide.
+
+**The budget is outermost and the meter sits inside it.** `Budgeted`, then
+`Metered`, then `Fallback`. Rejected: the meter outermost, which records a
+call the budget refused as a failed call with no usage, and so counts as a
+call something that never reached a provider.
+
+**Only the caller's context ends a `Fallback` chain, and `Retryable` trusts
+the provider's mark.** Rejected: reading `context.DeadlineExceeded` or
+`context.Canceled` in the error chain as the caller's. An `http.Client`'s own
+timeout satisfies `errors.Is(err, context.DeadlineExceeded)` while the
+caller's context is live, so a provider that hangs, which is the case a
+fallback exists for, would end the chain and would not be retried. The
+default test for moving on is now `ErrBudgetExceeded` alone; `Retryable`
+decides by the `*Error` it finds, and a provider returns the context's own
+error and no `*Error` once the caller's context is done.
+
+**A refusal that was moved past is billed, and is the reply if no later model
+answers.** With `OnRefusal`, the last refusal comes back with a nil error and
+every refused attempt in `Attempts`, and the failures that followed are
+logged. Rejected: an error, which leaves what was paid for out of the budget
+and the meter, and bills another refusal each time the caller tries the step
+again.
+
+**A reply is priced at the model it names, then at the model the request asked
+for, then at the cost that was held for it.** One function does it, for the
+budget and the meter. Rejected: pricing only at the model the reply names. A
+provider commonly answers an alias with a dated id, so a table keyed by alias
+would fail on every call and the budget would refuse far too early.
+
+**A stream callback's own error comes back untouched, and a model's nil reply
+with a nil error is an error.** See 4.7. Rejected: letting the retry wrapper
+and the chain wrap the callback's error, which makes the caller's own signal
+to stop read as a model failure; and handling a nil reply differently in each
+wrapper.

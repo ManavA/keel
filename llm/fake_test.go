@@ -3,9 +3,14 @@ package llm_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/ManavA/keel/llm"
 )
@@ -23,6 +28,10 @@ type fakeStep struct {
 	onCall func()
 	// panicWith, when set, is panicked with instead of returning.
 	panicWith any
+	// wrapCallbackError makes a Stream return its callback's error wrapped, as
+	// a provider that adds its own context would, so a test can see a wrapper
+	// give the caller's own error back.
+	wrapCallbackError bool
 }
 
 // errFakeRanOut is what a fakeModel returns for a call beyond its steps. It is
@@ -93,12 +102,17 @@ func (f *fakeModel) run(ctx context.Context, req llm.Request, fn func(llm.Delta)
 		select {
 		case <-timer.C:
 		case <-ctx.Done():
-			return nil, &llm.Error{Provider: "fake", Err: ctx.Err(), Retryable: true}
+			// The caller's own context error and no *llm.Error, which is what a
+			// provider returns once the caller's context is done.
+			return nil, ctx.Err()
 		}
 	}
 	if fn != nil {
 		for _, d := range step.deltas {
 			if err := fn(d); err != nil {
+				if step.wrapCallbackError {
+					err = fmt.Errorf("fake: stream stopped: %w", err)
+				}
 				return nil, err
 			}
 		}
@@ -126,6 +140,30 @@ func (f *fakeModel) Peak() int {
 	defer f.mu.Unlock()
 	return f.peak
 }
+
+// httpClientTimeout is the error net/http returns when an http.Client's own
+// Timeout fires on a request whose context is still live. It is made by a real
+// client against a local server that never answers, not described by hand.
+func httpClientTimeout(t *testing.T) error {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	defer srv.Close()
+	defer close(release)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+
+	resp, err := (&http.Client{Timeout: 20 * time.Millisecond}).Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("the server answered, so there is no timeout to keep")
+	}
+	return err
+}
+
+// noReplyMessage is what every wrapper says of a model that returns neither a
+// reply nor an error.
+const noReplyMessage = "model returned neither a reply nor an error"
 
 // fakeRequest is a small valid request naming model, which may be empty.
 func fakeRequest(model string) llm.Request {
