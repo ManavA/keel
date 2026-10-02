@@ -3752,6 +3752,12 @@ type Options struct {
 	// Heartbeat is how often an idle event stream sends a comment line, to
 	// keep proxies from closing it. Default 15 seconds.
 	Heartbeat time.Duration
+	// CrossOrigin guards the three routes that change something against a
+	// request a browser makes for a page on another origin: 403, before
+	// Actor is asked. Nil means a protection with no trusted origins; a
+	// service whose front end is on another origin supplies one that trusts
+	// it. Reading and the stream are not guarded.
+	CrossOrigin *http.CrossOriginProtection
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
 }
@@ -3771,7 +3777,7 @@ var _ Runs = (*agent.Engine)(nil)
 
 | Route | Answers |
 |---|---|
-| `GET /runs` | `{"runs": […], "next": "<cursor>"}`, newest first. Query: `status`, `agent`, `parent`, `limit` (1 to 200, default 50), `cursor`. An unknown status or a limit out of range is 400, as `pg.ParsePage` refuses rather than clamps |
+| `GET /runs` | `{"runs": […], "next": "<cursor>"}`, newest first. Query: `status`, `agent`, `parent`, `limit` (1 to 200, default 50), `cursor`. An unknown status or a limit out of range is 400, as `pg.ParsePage` refuses rather than clamps; so is a cursor that does not decode, whose time does not parse, or whose id is not a UUID in the canonical lower-case hyphenated form |
 | `GET /runs/{id}` | The run, or 404 |
 | `GET /runs/{id}/timeline` | `{"run": …, "steps": […], "approvals": […]}`: `Changes` since 0 |
 | `GET /runs/{id}/events` | A server-sent event stream, below |
@@ -3782,14 +3788,49 @@ var _ Runs = (*agent.Engine)(nil)
 
 Responses go through `httpx.JSON`, and failures through `httpx.NotFound`,
 `httpx.BadRequest` and `httpx.Error`, so error bodies are the generic ones
-and the reason is in the log. `Message.Opaque` is removed from every step
-before it is served: it is the provider's private data, large, and of no
-use to a reader.
+and the reason is in the log. What the engine answered (`ErrNotFound`, the
+two conflicts) is told whatever became of the request. After that, a request
+whose context was cancelled is 503, logged at debug level and not as a
+fault: a cancelled context does not say the client has gone (a server
+shutting down, a client that half-closes after sending and a mount's
+middleware cancel it with the client still reading), so it is answered, which
+costs nothing if the client is gone. One whose time ran out is 503 too. No
+failure leaves the status a handler starts with, which would read as success;
+a body that cannot be read to the end is treated as a cancelled call, and one
+that is too long is 400. Everything but the stream is sent with
+`Cache-Control: no-store`: it is journal content. `Message.Opaque` is removed
+from every step before it is served: it is the provider's private data,
+large, and of no use to a reader.
 
 The three routes that change something need `Options.Actor` to return a
-name, and answer 403 without one. The zero `Options` therefore serves a
-read-only surface. A request body is read through `http.MaxBytesReader` at
-4 KiB and decoded with unknown fields disallowed.
+name, and answer 403 without one. A name is recorded for good, so it is
+what is left after the white space round it, and it is no name when it is
+empty, is not valid UTF-8, is over 256 bytes, holds a control character (a
+newline, a NUL, a tab, a line or paragraph separator), or has nothing to see
+in it (no letter, mark, number, punctuation or symbol, so a name of only
+zero-width characters is nobody). The zero `Options` therefore serves a
+read-only surface. `Actor` is a name for the
+record and not an authorisation: the package does not authenticate and does
+not decide who may decide which approval, so anyone `Actor` names can
+approve, decline or cancel anything the API can see, and authorisation is
+the mount's. A request body is read through `http.MaxBytesReader` at 4 KiB
+and decoded with unknown fields disallowed; a reason that is not valid UTF-8
+or has a NUL in it is 400, since a database could not keep it.
+
+Those three routes are also behind `http.CrossOriginProtection`
+(`Options.CrossOrigin`), checked before `Actor` is asked. A request that
+`Sec-Fetch-Site` marks as anything but same-origin or none, or that has no
+such header and an `Origin` other than its host, is refused with 403 unless
+the protection trusts that origin; a request with neither header, which is a
+server-side client and not a browser acting for a page, passes. It closes the
+cross-site form post against a cookie session, and nothing more: it is not
+authentication, `Actor` only names who is acting, for the record, and it does not guard
+the reads or the stream, which change nothing.
+
+A cursor comes from the client, so it is input and is decoded strictly, in
+the package and before the engine is asked: a token that is not what the
+package made, a time that does not parse, or an id that `uuid.Parse` does not
+read back to the same string is 400.
 
 The package has no route that starts a run. What a run's input is, and who
 may start one, belong to the service; the example has its own.
@@ -3797,15 +3838,42 @@ may start one, belong to the service; the example has its own.
 The stream. `GET /runs/{id}/events` answers 404 for an unknown run before
 any stream starts. Then, through `httpx.NewEventStream`:
 
-1. `since` is `Last-Event-ID` as an integer, or 0.
-2. Read `Changes(id, since)`. Send one `step` event per step and one
-   `approval` event per approval, in `Rev` order, with no id. Then send one
-   `run` event whose id is `Run.Rev`, and set `since` to it. Sending the id
-   last means a client that reconnects mid-batch is sent the whole batch
-   again, which is harmless: each event is the current state of one thing.
-3. If the run has ended, send an `end` event and return.
+1. `since` is `Last-Event-ID` as a non-negative integer, or 0. A value that
+   is not a number, is negative, or overflows is 0, and a value ahead of
+   the run's own `Rev` is read again from 0: the stream carries state, so
+   sending it all again is always safe, where refusing the header would
+   strand an `EventSource`, which cannot change what it sends, and waiting
+   for a run to reach a revision it never had would skip every change in
+   between.
+2. Read `Changes(id, since)`. This first read is the lookup, made before
+   the stream opens, so that an unknown run is a 404 and a failing store a
+   500. Send one `step` event per step and one `approval` event per
+   approval, in `Rev` order (a step before an approval of the same
+   revision), with no id. Then send one `run` event whose id is `Run.Rev`,
+   and set `since` to it. Sending the id last means a client that
+   reconnects mid-batch is sent the whole batch again, which is harmless:
+   each event is the current state of one thing. When the read holds
+   nothing and `Run.Rev` has not passed `since`, nothing is sent, not even
+   the `run` event.
+3. If the run has ended, send an `end` event, whose data is `{}` and which
+   has no id, and return. A client closes its event source on `end`: a
+   reconnect to a finished run is sent `end` again, so one that did not
+   would loop at the browser's retry interval.
 4. Wait `PollInterval`, sending a comment line every `Heartbeat` while
-   nothing changes, and go to 2. Return when the request's context ends.
+   nothing is sent (any send restarts the wait), and go to 2. Return when
+   the request's context ends, when a send fails (the client has gone and
+   the stream is unusable), when a read fails, or when an event cannot be
+   encoded (a step whose stored arguments are not JSON). In the last two the
+   stream ends with no `end` event, which is how a client knows to reconnect
+   from the id it has, and the cause is logged: a read that failed because
+   the request is over quietly, and an event that cannot be encoded as a
+   fault, since the client will meet it again at every reconnect.
+
+A `HEAD` request on the route is answered with the headers a stream has
+and no stream, after a `GetRun` for the 404 (a GET's lookup is its first
+`Changes`), and the package keeps the two in step with a test; a stream started for a `HEAD` would only wait for the client to
+leave. A writer that cannot flush is answered with an ordinary 500, before
+anything is written.
 
 The stream carries state, not history: a step that started and completed
 between two polls appears once, completed. The journal is the history.
@@ -4953,3 +5021,27 @@ them. These are written from the OpenAI provider's side.
     empty table as no table. And the caller's context decides before a budget
     refusal, an `ErrNoPrice` and an unpriceable reply as it does before a
     provider error.
+
+60. **The routes that change something refuse a cross-origin browser request, and
+    a cursor is input.** Approve, decline and cancel are how people govern a
+    run, and each accepts a POST with no body of any content type, which a form
+    on another site can make a browser send with the user's cookie. They are
+    therefore guarded in the package, with the standard library's
+    `http.CrossOriginProtection` (Go 1.25), and `Options.CrossOrigin` lets a
+    service trust the origin of its own front end. The guard refuses by
+    `Sec-Fetch-Site` or by `Origin`, answers the generic 403 and runs before
+    `Actor`. Rejected: leaving it to the mount, which `Routes` documents as
+    guarding operator traffic and which cannot know that these three routes
+    accept a request that carries nothing to tell a form from a client;
+    requiring a content type, which a form can send as `text/plain` and which
+    would refuse a client that sends none; and `CrossOriginProtection.Handler`,
+    whose refusal is plain text. The package calls `Check` and answers with its
+    own generic 403, so a deny handler set on a supplied protection is not
+    used. The guard is not authentication, and does not cover the reads or
+    the stream. A cursor is the client's to send, so it is decoded strictly
+    before the engine is asked: a token that does not decode, a time that does
+    not parse, or an id that is not a UUID in the canonical form (`uuid.Parse`
+    reads upper case, braces, a URN and no hyphens, and a store would be given
+    a name it does not know) is 400. Rejected: handing the id to the store to
+    judge as the ids in a path are, which for a cursor has no 404 to answer
+    with and, against a `uuid` column, a 500.
