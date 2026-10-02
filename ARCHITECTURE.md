@@ -43,6 +43,16 @@ perf/            response caching, ETag, gzip, and singleflight middleware
 auth/            authentication sources, sessions, tokens
   pg/              the Postgres-backed user, session and token stores
 textpolicy/      one normalize-then-match guard for generated and forwarded text
+policy/          rules that allow, ask or block an action, and a record of each decision
+  pg/              the Postgres decision log
+llm/             one call to a language model, wrappers for retries, fallback,
+                 budgets and metering, and embeddings
+  anthropic/       the Anthropic provider
+  openai/          the OpenAI-compatible provider
+agent/           durable agent runs: journal, lease, budgets, approvals
+  pg/              the Postgres Store, its migration, and Once
+  httpapi/         runs, approvals and an event stream over HTTP
+  agenttest/       clock, scripted model, fault store and Store contract suite
 admin/           administrative session auth and a CORS-scoped router
   pg/              the Postgres-backed admin store
   cmd/seed/        a runnable command that seeds the first admin account
@@ -52,7 +62,8 @@ idempotency/     HTTP middleware that replays a response for a repeated request
 outbox/          write an event with a transaction, relay it to events
   pg/              the outbox table's migration
 app/             the optional lifecycle: logger, pool, migrations, router,
-                 auth and admin mounts, jobs, graceful shutdown
+                 auth and admin mounts, jobs, graceful shutdown, and the
+                 adapters that put llm and policy behind agent
 cmd/keel/        scaffolding: `keel new` copies a template profile into a project
                  (minimal from examples/minimal by default, standard from
                  examples/fullstack)
@@ -60,7 +71,10 @@ scripts/         developer and CI scripts
 deploy/          deployment templates and checks
 examples/
   minimal/       a runnable service over Postgres and nothing else
+  agentdemo/     a durable agent over Postgres: a run that survives a kill,
+                 waits for approval and is held to rules
 docs/
+  agents.md
   backup.md
   deploy.md
   testing.md
@@ -72,10 +86,17 @@ Nothing enforces this at build time, so it is written down. A package may import
 anything strictly below it.
 
 1. **`config`, `log`, `httpx/buildinfo`** — no keel imports at all.
-2. **`httpx`, `pg`, `events`, `textpolicy`, `retry`** — may use level 1.
+2. **`httpx`, `pg`, `events`, `textpolicy`, `policy`, `retry`** — may use level 1.
+   `policy` imports no keel package; it sits beside `textpolicy`, and the two
+   meet through an attribute. `policy/pg` imports `policy` and sits with it, as
+   `auth/pg` does with `auth`.
 3. **`pg/migrate`, `pg/testdb`, `search`, `mail`, `jobs`, `media`, `geocode`,
-   `perf`, `idempotency`, `outbox`** — may use levels 1 and 2. Each owns a dependency on something
-   outside the process.
+   `perf`, `idempotency`, `outbox`, `llm`, `agent`** — may use levels 1 and 2. Each owns a dependency on something
+   outside the process. `llm` imports `retry`; `agent` imports no keel package.
+   `llm/anthropic` and `llm/openai` import `llm`; `agent/pg` imports `agent` and
+   `pg`; `agent/httpapi` imports `agent` and `httpx`; `agent/agenttest` imports
+   `agent`. `llm` and `agent` are siblings and import neither each other nor
+   `policy`.
 4. **`auth`, `admin`** — may use levels 1 through 3, including each other's
    level-3 dependencies (`pg`, `httpx`), but not each other: they sit at the
    same level on purpose, so an admin endpoint can never reach through `auth`
@@ -84,8 +105,10 @@ anything strictly below it.
    same level as the package that owns them.
 5. **`app`** — may use levels 1 through 4. It wires the other packages into a
    running service and is the only package allowed to depend on all of them.
+   That includes `llm`, `policy` and `agent`, which meet only in the adapters
+   in `app/agents.go`.
 
-`examples/minimal` and `cmd/keel` sit outside the layers. The example imports
+`examples/minimal`, `examples/agentdemo` and `cmd/keel` sit outside the layers. The example imports
 whatever it needs; the scaffolder imports no keel package, only the standard
 library.
 

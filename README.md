@@ -4,7 +4,9 @@
 
 Reusable Go packages for building a web backend: configuration, structured
 logging, HTTP serving, Postgres access and migrations, search, background jobs,
-events and transactional email. Each package is usable on its own, and every
+events and transactional email, and durable, governed AI agents: runs that
+survive a crash, wait for a person's approval and are held to written rules,
+on Postgres alone. Each package is usable on its own, and every
 package that talks to an external service ships an in-process default, so a
 project running only Postgres gets a complete backend.
 
@@ -85,7 +87,7 @@ Postgres. Run it with `make run-local`, or start your own from it with
 |---|---|
 | `config` | Environment loading over envconfig, optional dotenv, validation, secret trimming and redaction |
 | `log` | A JSON `slog` handler carrying request ids, with credential-shaped keys redacted |
-| `httpx` | HTTP server with graceful shutdown, chi router, middleware, JSON responses, health endpoints |
+| `httpx` | HTTP server with graceful shutdown, chi router, middleware, JSON responses, health endpoints, server-sent event streams |
 | `httpx/middleware` | Real client address, request id, request log, panic recovery, CORS, rate limiting |
 | `httpx/buildinfo` | The revision the running binary was built from |
 | `pg` | pgx v5 pool, transaction helper, offset and keyset paging |
@@ -108,8 +110,17 @@ Postgres. Run it with `make run-local`, or start your own from it with
 | `metrics` | Counters and histograms for HTTP, pool, jobs, outbox, events and geocode, with a no-op default and OTel via `metrics/otel` |
 | `webhooks` | Signed HTTP delivery of events to external URLs, over the outbox relay |
 | `notifyprefs` | Per-user notification opt-outs with send-path enforcement (`notifyprefs/pg` for Postgres) |
-| `app` | The service lifecycle: logger, pool, migrations, router, auth and admin mounts, jobs, shutdown |
-| `cmd/keel` | Scaffolds a project from a template profile (`keel new <name> [-profile minimal\|standard\|api\|worker\|webhook]`; minimal copies `examples/minimal`, standard copies `examples/fullstack`, api copies `examples/apionly`, worker copies `examples/worker`, webhook copies `examples/webhook`) |
+| `llm` | One call to a language model: text, tool calls, structured replies, streaming, embeddings; wrappers for retries, fallback, budgets and metering; no provider and no price table |
+| `llm/anthropic` | The Anthropic Messages API over `net/http`, no vendor SDK |
+| `llm/openai` | The OpenAI chat completions and embeddings API, and compatible servers, over `net/http` |
+| `policy` | Rules that allow, ask a person about, or block an action, with every decision recorded under the rule that made it |
+| `policy/pg` | The Postgres recorder for `policy`: an append-only decision log |
+| `agent` | A run as a journal: model and tool calls written down around each step, a lease any process can take over, budgets, approvals and child runs |
+| `agent/pg` | The Postgres `agent.Store`, its migration, and `Once` for tools that write to the same database |
+| `agent/httpapi` | Runs, timelines, approvals and an event stream over HTTP; it names the caller but does not authenticate or authorise |
+| `agent/agenttest` | A hand-moved clock, a scripted model, a fault-injecting store and the Store contract suite |
+| `app` | The service lifecycle: logger, pool, migrations, router, auth and admin mounts, jobs, shutdown; and the adapters that put `llm` and `policy` behind `agent` |
+| `cmd/keel` | Scaffolds a project from a template profile (`keel new <name> [-profile minimal\|standard\|api\|worker\|webhook\|agent]`; minimal copies `examples/minimal`, standard copies `examples/fullstack`, api copies `examples/apionly`, worker copies `examples/worker`, webhook copies `examples/webhook`, agent copies `examples/agentdemo`) |
 
 ## Configuration
 
@@ -149,6 +160,13 @@ configuration and falls back to an in-process default:
 | `idempotency` | in-memory (`MemoryStore`) | Postgres (`idempotency/pg`) |
 | `flags` | in-memory (`MemoryStore`) | Postgres (`flags/pg`) |
 | `metrics` | no-op recorder, in-process capture (`InMemory`) | OpenTelemetry (`metrics/otel`) |
+| `llm` | `Scripted` model and `HashEmbedder`, answering with no network | Anthropic (`llm/anthropic`), OpenAI and compatible servers (`llm/openai`) |
+| `policy` | in-memory recorder (`MemoryRecorder`) | Postgres (`policy/pg`) |
+| `agent` | in-memory store (`MemoryStore`), whose runs last as long as the process | Postgres (`agent/pg`) |
+
+Nothing in `llm/anthropic` or `llm/openai` has been run against a real provider
+yet. Each has a live test behind the `live` build tag that needs an API key.
+See `docs/agents.md` for the agent packages.
 
 ## Deployment
 
