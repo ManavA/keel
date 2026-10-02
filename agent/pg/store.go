@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/ManavA/keel/agent"
 	keelpg "github.com/ManavA/keel/pg"
@@ -111,7 +112,8 @@ select $1::uuid, $2::text, $3::text, $4::text, $5::text, $6::text, $7::text,
     $14::bigint, $15::bigint, $16::bigint, $17::integer, $18::bigint, 1,
     $19::text, $20::bigint, $21::timestamptz, $22::integer, $23::timestamptz,
     $24::boolean, $25::text, $26::text, $27::timestamptz, $28::timestamptz, $29::timestamptz
-where $8::uuid is null or exists (select 1 from ` + RunsTable + ` where id = $8::uuid)
+where ($8::uuid is null and $10::integer = 0)
+   or exists (select 1 from ` + RunsTable + ` where id = $8::uuid and depth = $10::integer - 1)
 on conflict do nothing
 returning ` + runColumns
 
@@ -119,15 +121,17 @@ const (
 	runSQL       = `select ` + runColumns + ` from ` + RunsTable + ` where id = $1`
 	runByKeySQL  = `select ` + runColumns + ` from ` + RunsTable + ` where agent = $1 and start_key = $2`
 	runExistsSQL = `select exists (select 1 from ` + RunsTable + ` where id = $1)`
+	runDepthSQL  = `select depth from ` + RunsTable + ` where id = $1`
 )
 
 // CreateRun implements agent.Store.
 //
 // The insert passes over a run it conflicts with, on its key or on its id,
-// and a child whose parent is not there. Which of the three it was is read
-// afterwards, key first: so a create that finds its key answers for the run
-// that has it whatever else the request gets wrong, and two creates of one
-// key at once make one run, the second waiting on the first's row.
+// and a run that is not one level below a parent that exists, or not at
+// depth zero with none. Which of those it was is read afterwards, key first:
+// so a create that finds its key answers for the run that has it whatever
+// else the store would refuse, and two creates of one key at once make one
+// run, the second waiting on the first's row.
 func (s *Store) CreateRun(ctx context.Context, run agent.Run) (agent.Run, bool, error) {
 	const op = "create run"
 	if !isUUID(run.ID) {
@@ -138,6 +142,10 @@ func (s *Store) CreateRun(ctx context.Context, run agent.Run) (agent.Run, bool, 
 	}
 	if run.Status != agent.StatusRunnable {
 		return agent.Run{}, false, refused(op, "status is %q, not %q", run.Status, agent.StatusRunnable)
+	}
+	if !storable(run.Agent) || !storable(run.Key) || !storable(run.LeaseOwner) {
+		return agent.Run{}, false, refused(op, "the agent %q, the key %q or the owner %q holds a character no column keeps",
+			run.Agent, run.Key, run.LeaseOwner)
 	}
 	if !fitsColumn(run.ParentSeq) || !fitsColumn(run.Depth) || !fitsColumn(run.ModelCalls) || !fitsColumn(run.Failures) {
 		return agent.Run{}, false, refused(op, "a count does not fit its column: parent seq %d, depth %d, model calls %d, failures %d",
@@ -158,11 +166,11 @@ func (s *Store) CreateRun(ctx context.Context, run agent.Run) (agent.Run, bool, 
 	)
 	err = s.inTx(ctx, op, readCommitted, func(tx pgx.Tx) error {
 		inserted, err := scanRun(tx.QueryRow(ctx, insertRunSQL,
-			run.ID, run.Agent, string(run.Status), run.Reason, run.Input, run.Output, run.Error,
+			run.ID, run.Agent, string(run.Status), kept(run.Reason), kept(run.Input), kept(run.Output), kept(run.Error),
 			nullable(run.ParentID), run.ParentSeq, run.Depth, nullable(run.Key), definition, metadata,
 			run.Usage.InputTokens, run.Usage.OutputTokens, run.Usage.CostMicros, run.ModelCalls, run.ActiveMillis,
 			run.LeaseOwner, run.LeaseEpoch, run.LeaseExpiresAt, run.Failures, run.NextAttemptAt,
-			run.CancelRequested, run.CancelBy, run.CancelReason, run.CreatedAt, run.UpdatedAt, run.FinishedAt))
+			run.CancelRequested, kept(run.CancelBy), kept(run.CancelReason), run.CreatedAt, run.UpdatedAt, run.FinishedAt))
 		if err == nil {
 			stored, created = inserted, true
 			return nil
@@ -188,8 +196,24 @@ func (s *Store) CreateRun(ctx context.Context, run agent.Run) (agent.Run, bool, 
 		if taken {
 			return fmt.Errorf("id %q is already in use", run.ID)
 		}
+		// A child is one level below its parent, and a run nobody started
+		// is at none: the order rows are locked in, children before
+		// parents, is taken from the depth.
+		if run.ParentID == "" && run.Depth != 0 {
+			return fmt.Errorf("depth is %d for a run no other started", run.Depth)
+		}
 		if run.ParentID != "" {
-			return fmt.Errorf("parent %s does not exist", run.ParentID)
+			var depth int
+			err := tx.QueryRow(ctx, runDepthSQL, run.ParentID).Scan(&depth)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("parent %s does not exist", run.ParentID)
+			}
+			if err != nil {
+				return err
+			}
+			if run.Depth != depth+1 {
+				return fmt.Errorf("depth is %d under a parent at depth %d", run.Depth, depth)
+			}
 		}
 		// Purge removed it between the insert and the look.
 		return errors.New("the run this one conflicted with has since been removed")
@@ -259,19 +283,34 @@ func listLimit(limit int) int {
 	return limit
 }
 
+// listCursor is the position a listing starts after, or nil for the start.
+// A cursor is an argument, and may have come from a client: its id must be a
+// UUID in the one form, though it need not be one a run has. The zero Cursor
+// is no position, and lists from the start.
+func listCursor(c *agent.Cursor) (*agent.Cursor, error) {
+	if c == nil || c.ID == "" && c.CreatedAt.IsZero() {
+		return nil, nil
+	}
+	if !isUUID(c.ID) {
+		return nil, fmt.Errorf("cursor id %q is not a UUID", c.ID)
+	}
+	return c, nil
+}
+
 // ListRuns implements agent.Store.
 //
-// A cursor is an argument, and may have come from a client: one whose id is
-// not a UUID in the one form is refused before anything is asked of the
-// database. It need not name a run that exists. It is a position, and a run
-// is older than it when its (CreatedAt, ID) sorts below the cursor's.
+// A cursor that is refused is refused before anything is asked of the
+// database. One that is taken is a position: a run is older than it when its
+// (CreatedAt, ID) sorts below the cursor's.
 func (s *Store) ListRuns(ctx context.Context, f agent.RunFilter) ([]agent.Run, error) {
 	const op = "list runs"
-	if f.Before != nil && !isUUID(f.Before.ID) {
-		return nil, refused(op, "cursor id %q is not a UUID", f.Before.ID)
+	before, err := listCursor(f.Before)
+	if err != nil {
+		return nil, refused(op, "%w", err)
 	}
-	// A filter is not a lookup: an id nothing could have lists nothing.
-	if f.ParentID != "" && !isUUID(f.ParentID) {
+	// A filter is not a lookup: a parent's id, an agent's name or a status
+	// that no run could have lists nothing, and is not sent.
+	if f.ParentID != "" && !isUUID(f.ParentID) || !storable(f.Agent) || !storable(string(f.Status)) {
 		return []agent.Run{}, nil
 	}
 
@@ -285,14 +324,14 @@ func (s *Store) ListRuns(ctx context.Context, f agent.RunFilter) ([]agent.Run, e
 	if f.ParentID != "" {
 		c.and("parent_id = " + c.arg(f.ParentID))
 	}
-	if f.Before != nil {
-		c.and("(created_at, id) < (" + c.arg(f.Before.CreatedAt) + ", " + c.arg(f.Before.ID) + "::uuid)")
+	if before != nil {
+		c.and("(created_at, id) < (" + c.arg(before.CreatedAt) + ", " + c.arg(before.ID) + "::uuid)")
 	}
 	query := `select ` + runColumns + ` from ` + RunsTable + c.where() +
 		` order by created_at desc, ` + runIDColumn + ` desc limit ` + c.arg(listLimit(f.Limit))
 
 	runs := []agent.Run{}
-	err := s.inTx(ctx, op, readCommitted, func(tx pgx.Tx) error {
+	err = s.inTx(ctx, op, readCommitted, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, query, c.args...)
 		found, err := collect(rows, err, scanRun)
 		if err != nil {
@@ -360,16 +399,22 @@ func (s *Store) Claim(ctx context.Context, req agent.ClaimRequest) (*agent.Run, 
 	if req.Owner == "" {
 		return nil, refused(op, "owner is empty")
 	}
+	if !storable(req.Owner) {
+		return nil, refused(op, "owner %q holds a character no column keeps", req.Owner)
+	}
 	if req.TTL <= 0 {
 		return nil, refused(op, "ttl is %s, not more than zero", req.TTL)
 	}
 	if req.RunID != "" && !isUUID(req.RunID) {
 		return nil, notFound(op)
 	}
-	// Never null: a null list makes the condition null, not false.
-	agents := req.Agents
-	if agents == nil {
-		agents = []string{}
+	// Never null: a null list makes the condition null, not false. A name
+	// no column keeps is no run's agent, and is not sent.
+	agents := []string{}
+	for _, name := range req.Agents {
+		if storable(name) {
+			agents = append(agents, name)
+		}
 	}
 	expires := req.Now.Add(req.TTL)
 
@@ -510,7 +555,7 @@ where id = $1`
 // Yield implements agent.Store.
 func (s *Store) Yield(ctx context.Context, lease agent.Lease, req agent.YieldRequest) error {
 	return s.fenced(ctx, "yield", lease, func(tx pgx.Tx, _ heldRun) error {
-		_, err := tx.Exec(ctx, yieldSQL, lease.RunID, req.NextAttemptAt, req.Failed, req.Error, req.Now)
+		_, err := tx.Exec(ctx, yieldSQL, lease.RunID, req.NextAttemptAt, req.Failed, kept(req.Error), req.Now)
 		return err
 	})
 }
@@ -559,7 +604,7 @@ func park(ctx context.Context, tx pgx.Tx, runID string, run heldRun, req agent.P
 	if !waits {
 		return false, nil
 	}
-	if _, err := tx.Exec(ctx, parkSQL, runID, req.Reason, req.Now); err != nil {
+	if _, err := tx.Exec(ctx, parkSQL, runID, kept(req.Reason), req.Now); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -598,7 +643,7 @@ func (s *Store) Finish(ctx context.Context, lease agent.Lease, req agent.FinishR
 	return s.fenced(ctx, op, lease, func(tx pgx.Tx, run heldRun) error {
 		var rev int64
 		err := tx.QueryRow(ctx, finishSQL,
-			lease.RunID, string(req.Status), req.Reason, req.Output, req.Error, req.Now).Scan(&rev)
+			lease.RunID, string(req.Status), kept(req.Reason), kept(req.Output), kept(req.Error), req.Now).Scan(&rev)
 		if err != nil {
 			return err
 		}
@@ -659,7 +704,7 @@ func (s *Store) RequestCancel(ctx context.Context, req agent.CancelRequest) erro
 		if marked {
 			return nil
 		}
-		_, err = tx.Exec(ctx, cancelSQL, req.RunID, req.By, req.Reason, req.Now)
+		_, err = tx.Exec(ctx, cancelSQL, req.RunID, kept(req.By), kept(req.Reason), req.Now)
 		return err
 	})
 }
@@ -713,9 +758,34 @@ func (s *Store) Changes(ctx context.Context, runID string, since int64) (agent.C
 	return changes, nil
 }
 
-const purgeSQL = `
-delete from ` + RunsTable + `
-where parent_id is null and status in ` + ended + ` and finished_at < $1`
+const (
+	// lockDoomedSQL locks every run a purge will remove: the runs nobody
+	// started that ended before the cut, and every run under them. It takes
+	// the rows in the order every other writer does, children before
+	// parents, so that a child that is ending as its parent is purged waits
+	// for nothing the purge holds.
+	lockDoomedSQL = `
+with recursive doomed as (
+    select id from ` + RunsTable + `
+    where parent_id is null and status in ` + ended + ` and finished_at < $1
+  union all
+    select child.id from ` + RunsTable + ` child join doomed on child.parent_id = doomed.id
+)
+select id::text, parent_id is null from ` + RunsTable + `
+where id in (select id from doomed)
+order by depth desc, ` + runIDColumn + `
+for update`
+
+	// A tool effect's key is its step's: the run's id, a colon, the seq.
+	purgeEffectsSQL = `delete from ` + EffectsTable + ` where left(key, 37) = any($1::text[])`
+
+	// Steps, approvals and child runs go with the run they belong to.
+	purgeRunsSQL = `delete from ` + RunsTable + ` where id = any($1::text[]::uuid[])`
+)
+
+// deadlockDetected is the SQLSTATE Postgres ends a transaction with when it
+// and another each hold a lock the other waits for.
+const deadlockDetected = "40P01"
 
 // Purge deletes runs that ended before olderThan and were not started by
 // another run, with their steps, approvals and child runs, and reports how
@@ -723,19 +793,62 @@ where parent_id is null and status in ` + ended + ` and finished_at < $1`
 //
 // The count is of the runs nobody started. A child run goes with the run
 // that started it, ended or not, and is not counted; one whose parent
-// remains is left. The keys Once recorded are not removed.
+// remains is left. The keys Once recorded for a removed run's steps go with
+// it: those that begin with the run's id and a colon, as Invocation.Key
+// does.
+//
+// A purge locks the runs it will remove in the order every writer takes
+// rows, so it does not deadlock with a run that is ending. Should Postgres
+// report a deadlock all the same, the purge is tried once more before the
+// error is returned: nothing of the first try was kept, and what held the
+// other lock has gone on.
 func (s *Store) Purge(ctx context.Context, olderThan time.Time) (int64, error) {
+	removed, err := s.purge(ctx, olderThan)
+	var failure *pgconn.PgError
+	if errors.As(err, &failure) && failure.Code == deadlockDetected {
+		removed, err = s.purge(ctx, olderThan)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
+func (s *Store) purge(ctx context.Context, olderThan time.Time) (int64, error) {
 	var removed int64
 	err := s.inTx(ctx, "purge", readCommitted, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, purgeSQL, olderThan)
+		rows, err := tx.Query(ctx, lockDoomedSQL, olderThan)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		var roots, keys []string
+		for rows.Next() {
+			var (
+				id   string
+				root bool
+			)
+			if err := rows.Scan(&id, &root); err != nil {
+				return err
+			}
+			keys = append(keys, id+":")
+			if root {
+				roots = append(roots, id)
+			}
+		}
+		if err := rows.Err(); err != nil || len(roots) == 0 {
+			return err
+		}
+
+		if _, err := tx.Exec(ctx, purgeEffectsSQL, keys); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, purgeRunsSQL, roots)
 		if err != nil {
 			return err
 		}
 		removed = tag.RowsAffected()
 		return nil
 	})
-	if err != nil {
-		return 0, err
-	}
-	return removed, nil
+	return removed, err
 }

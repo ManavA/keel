@@ -92,12 +92,12 @@ func (s *Store) RequestApproval(ctx context.Context, lease agent.Lease, req agen
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, waitStepSQL, lease.RunID, req.Seq, req.Decision != "", string(req.Decision), req.Rule, rev)
+		_, err = tx.Exec(ctx, waitStepSQL, lease.RunID, req.Seq, req.Decision != "", kept(string(req.Decision)), kept(req.Rule), rev)
 		if err != nil {
 			return err
 		}
 		approval, err = scanApproval(tx.QueryRow(ctx, insertApprovalSQL,
-			req.ID, lease.RunID, req.Seq, st.attempts, string(req.Cause), st.name, input, action, req.Rule,
+			req.ID, lease.RunID, req.Seq, st.attempts, string(req.Cause), st.name, input, action, kept(req.Rule),
 			rev, req.Now, req.ExpiresAt))
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Another run's approval has the id. Returning the error undoes
@@ -151,8 +151,9 @@ func (s *Store) GetApproval(ctx context.Context, id string) (agent.Approval, err
 
 // ListApprovals implements agent.Store.
 func (s *Store) ListApprovals(ctx context.Context, f agent.ApprovalFilter) ([]agent.Approval, error) {
-	// A filter is not a lookup: an id nothing could have lists nothing.
-	if f.RunID != "" && !isUUID(f.RunID) {
+	// A filter is not a lookup: a run's id or a status that no approval
+	// could have lists nothing, and is not sent.
+	if f.RunID != "" && !isUUID(f.RunID) || !storable(string(f.Status)) {
 		return nil, nil
 	}
 
@@ -246,7 +247,7 @@ func (s *Store) DecideApproval(ctx context.Context, req agent.DecideRequest) (ag
 		if req.Approved {
 			status = agent.ApprovalApproved
 		}
-		approval, err = scanApproval(tx.QueryRow(ctx, decideSQL, req.ID, string(status), req.By, req.Reason, req.Now, rev))
+		approval, err = scanApproval(tx.QueryRow(ctx, decideSQL, req.ID, string(status), kept(req.By), kept(req.Reason), req.Now, rev))
 		return err
 	})
 	if err != nil {

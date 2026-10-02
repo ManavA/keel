@@ -225,6 +225,9 @@ func encodeMetadata(metadata map[string]string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if text, err = keptJSON(text); err != nil {
+		return "", err
+	}
 	return string(text), nil
 }
 
@@ -233,6 +236,9 @@ func encodeMetadata(metadata map[string]string) (string, error) {
 func encodeAction(a agent.Action) (string, error) {
 	text, err := json.Marshal(a)
 	if err != nil {
+		return "", fmt.Errorf("action attributes: %w", err)
+	}
+	if text, err = keptJSON(text); err != nil {
 		return "", fmt.Errorf("action attributes: %w", err)
 	}
 	return string(text), nil

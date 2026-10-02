@@ -178,7 +178,7 @@ func (s *Store) CompleteModel(ctx context.Context, lease agent.Lease, req agent.
 	for i, call := range req.Message.Calls {
 		// It was encoded once already, inside the message.
 		calls[i], _ = encodeCall(call)
-		names[i] = call.Name
+		names[i] = kept(call.Name)
 	}
 
 	return s.fenced(ctx, op, lease, func(tx pgx.Tx, _ heldRun) error {
@@ -208,7 +208,7 @@ func (s *Store) CompleteModel(ctx context.Context, lease agent.Lease, req agent.
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, completeModelStepSQL, lease.RunID, req.Seq, req.Model, message, string(req.Stop),
+		_, err = tx.Exec(ctx, completeModelStepSQL, lease.RunID, req.Seq, kept(req.Model), message, kept(string(req.Stop)),
 			req.Usage.InputTokens, req.Usage.OutputTokens, req.Usage.CostMicros, req.Now, rev)
 		if err != nil || len(calls) == 0 {
 			return err
@@ -300,8 +300,8 @@ func (s *Store) UpdateStep(ctx context.Context, lease agent.Lease, req agent.Ste
 			result = *req.Result
 		}
 		_, err = tx.Exec(ctx, moveStepSQL, lease.RunID, req.Seq, string(req.To),
-			req.Decision != "", string(req.Decision), req.Rule,
-			req.Result != nil, result, req.IsError,
+			req.Decision != "", kept(string(req.Decision)), kept(req.Rule),
+			req.Result != nil, kept(result), req.IsError,
 			nullable(req.ChildRunID),
 			req.Usage.InputTokens, req.Usage.OutputTokens, req.Usage.CostMicros,
 			starts, final, req.Now, rev)

@@ -19,6 +19,9 @@ const onceSQL = `insert into ` + EffectsTable + ` (key) values ($1) on conflict 
 // index: the second waits for the first to commit, and is then told false,
 // or for it to be rolled back, and is then the first.
 func Once(ctx context.Context, tx pgx.Tx, key string) (first bool, err error) {
+	if !storable(key) {
+		return false, fmt.Errorf("agent/pg: once: key %q holds a character no column keeps", key)
+	}
 	tag, err := tx.Exec(ctx, onceSQL, key)
 	if err != nil {
 		return false, fmt.Errorf("agent/pg: once: record %q: %w", key, err)

@@ -46,7 +46,10 @@ func RunStoreSuite(t *testing.T, newStore func(t *testing.T) agent.Store) {
 		{"RequestCancel", requestCancelCases()},
 		{"Changes", changesCases()},
 		{"ListRuns", listRunsCases()},
+		{"Cursor", cursorCases()},
 		{"ListApprovals", listApprovalsCases()},
+		{"Strings", stringsCases()},
+		{"RawJSON", rawJSONCases()},
 		{"NotFound", notFoundCases()},
 		{"Order", orderCases()},
 	}

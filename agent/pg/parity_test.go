@@ -1,13 +1,10 @@
 package pg_test
 
 import (
-	"cmp"
 	"context"
 	"errors"
-	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -55,50 +52,6 @@ func TestStore_AnswersAsTheMemoryStoreDoesWhereTheSuiteIsSilent(t *testing.T) {
 		assert.Equal(t, got[0], got[1], "which empty lists are nil")
 	})
 
-	t.Run("a cursor that names no run is a position all the same", func(t *testing.T) {
-		for _, s := range stores {
-			k := s.kit
-			instants := []time.Time{k.tick(), k.tick(), k.tick()}
-			var stored []agent.Run
-			created := map[string]time.Time{}
-			for _, at := range instants {
-				for range 3 {
-					run := k.newRun("paged")
-					run.CreatedAt, run.UpdatedAt = at, at
-					stored = append(stored, k.insert(run))
-					created[run.ID] = at
-				}
-			}
-			for _, id := range []string{
-				// Below every id a run has, above every one, and among them.
-				"00000000-0000-0000-0000-000000000000", "ffffffff-ffff-ffff-ffff-ffffffffffff", newID(),
-			} {
-				for _, at := range []time.Time{instants[1], instants[1].Add(time.Microsecond), instants[0].Add(-time.Hour)} {
-					// Newest first, then by id descending, and older than
-					// the position.
-					var want []string
-					for _, run := range stored {
-						if run.CreatedAt.Before(at) || run.CreatedAt.Equal(at) && run.ID < id {
-							want = append(want, run.ID)
-						}
-					}
-					slices.SortFunc(want, func(a, b string) int {
-						return cmp.Or(created[b].Compare(created[a]), cmp.Compare(b, a))
-					})
-
-					runs, err := k.store.ListRuns(k.ctx, agent.RunFilter{Agent: "paged", Before: &agent.Cursor{CreatedAt: at, ID: id}})
-
-					require.NoError(t, err, "%s: cursor %s at %s", s.name, id, at)
-					var got []string
-					for _, run := range runs {
-						got = append(got, run.ID)
-					}
-					assert.Equal(t, want, got, "%s: cursor %s at %s", s.name, id, at)
-				}
-			}
-		}
-	})
-
 	t.Run("a create whose key is taken, by a run that could not have been stored", func(t *testing.T) {
 		for _, s := range stores {
 			k := s.kit
@@ -137,15 +90,12 @@ func (n neverBegun) BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error) {
 	return nil, errors.New("not reached")
 }
 
-// A cursor is an argument and may have come from a client. One whose id is
-// not a UUID in the one form is refused for what it is, with nothing asked
-// of the database, so that what comes back is never the database's
-// complaint about the id's form.
-//
-// The memory store has no such check: it compares a cursor's id as the
-// string it is, and lists what sorts below it. The suite pins neither, so
-// this is a place where the two stores differ.
-func TestListRuns_ACursorWhoseIDIsNotAUUIDIsRefused(t *testing.T) {
+// A cursor is an argument and may have come from a client. One the store
+// refuses, it refuses with nothing asked of the database, so that what comes
+// back is never the database's complaint about the id's form. The suite
+// holds both stores to which cursors are refused; that no transaction is
+// opened for one is this store's to show.
+func TestListRuns_ACursorIsRefusedWithoutATransaction(t *testing.T) {
 	store := agentpg.New(neverBegun{t})
 	at := testStart
 	canonical := newID()
@@ -159,30 +109,19 @@ func TestListRuns_ACursorWhoseIDIsNotAUUIDIsRefused(t *testing.T) {
 		var fromDatabase *pgconn.PgError
 		assert.NotErrorAs(t, err, &fromDatabase)
 
-		// The cursor is judged before the parent filter, which would
-		// otherwise answer with nothing listed.
+		// The cursor is judged before the filters, which would otherwise
+		// answer with nothing listed.
 		_, err = store.ListRuns(t.Context(), agent.RunFilter{ParentID: "no-such-id", Before: &agent.Cursor{CreatedAt: at, ID: id}})
 		require.Error(t, err, "cursor id %q, with a parent that is no UUID", id)
 	}
 
-	// What the memory store does with the same cursors: it compares the id
-	// as the string it is. No id sorts below the empty one, so that cursor
-	// lists only what is older than its time; every id sorts below one that
-	// begins with a letter past f, so that cursor lists the runs of its own
-	// instant as well.
-	k := kitOver(t, agent.NewMemoryStore())
-	older := k.create()
-	later := k.clock.Now().Add(time.Hour)
-	run := k.newRun(agentAlpha)
-	run.CreatedAt, run.UpdatedAt = later, later
-	k.insert(run)
-	for id, want := range map[string][]string{"": {older.ID}, "no-such-id": {run.ID, older.ID}} {
-		runs, err := k.store.ListRuns(k.ctx, agent.RunFilter{Before: &agent.Cursor{CreatedAt: later, ID: id}})
+	// Nor is one opened for a filter that names what no run could have.
+	for _, f := range []agent.RunFilter{{ParentID: "no-such-id"}, {Agent: "a\x00b"}, {Status: "caf\xff"}} {
+		runs, err := store.ListRuns(t.Context(), f)
 		require.NoError(t, err)
-		var got []string
-		for _, r := range runs {
-			got = append(got, r.ID)
-		}
-		assert.Equal(t, want, got, "the memory store, given cursor id %q", id)
+		assert.Empty(t, runs)
 	}
+	approvals, err := store.ListApprovals(t.Context(), agent.ApprovalFilter{Status: "a\x00b"})
+	require.NoError(t, err)
+	assert.Empty(t, approvals)
 }

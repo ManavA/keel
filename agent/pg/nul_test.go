@@ -1,7 +1,6 @@
 package pg_test
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -14,23 +13,16 @@ import (
 )
 
 // What each column does with a NUL character, which a model, a tool or a
-// person can put in any string they write.
+// person can put in any string they write, and with a byte that is not
+// UTF-8.
 //
-// The JSON columns keep one: inside a string it is the escape \u0000, which
-// JSON text may hold. The TEXT columns and the two JSONB columns cannot hold
-// one at all, and Postgres refuses the statement. So does a byte that is not
-// UTF-8 in a TEXT column. This file records which is which, column by
-// column, so that the answer is on the page and a change to a column's type
-// shows here.
-
-// The SQLSTATEs Postgres refuses a string with.
-const (
-	// refusedText is character_not_in_repertoire: a TEXT value holds a NUL
-	// or a byte sequence that is not UTF-8.
-	refusedText = "22021"
-	// refusedJSONB is untranslatable_character: a JSONB string holds \u0000.
-	refusedJSONB = "22P05"
-)
+// The JSON columns keep a NUL: inside a string it is the escape \u0000, which
+// JSON text may hold. A TEXT column holds neither character, and a JSONB
+// column no NUL, and Postgres would refuse the statement. The store never
+// lets it: what it only records, it keeps with each such character as the
+// replacement character, and what it compares, a name or a key, it refuses
+// before it opens a transaction. This file records which is which, column by
+// column.
 
 const nul = "a\x00b"
 
@@ -126,188 +118,204 @@ func TestNUL_ColumnsThatKeepOne(t *testing.T) {
 	}
 }
 
-func TestNUL_ColumnsThatRefuseOne(t *testing.T) {
+// lost is what a NUL and a byte that is not UTF-8 are each kept as.
+const lost = "a�b�"
+
+func TestNUL_ColumnsThatKeepWhatTheyCannotHoldAsTheReplacementCharacter(t *testing.T) {
+	const bad = nul + "\xff"
 	tests := []struct {
 		column string
-		code   string
-		// write makes a store call that would put value in the column, and
-		// is otherwise one the store accepts.
-		write func(w nulWorld, value string) error
+		// write makes a store call that puts bad in the column, and
+		// returns what the column then reads back as.
+		write func(t *testing.T, w nulWorld) string
 	}{
-		{"agent_runs.agent", refusedText, func(w nulWorld, v string) error {
-			_, _, err := w.k.store.CreateRun(w.k.ctx, w.k.newRun(agentAlpha+v))
-			return err
-		}},
-		{"agent_runs.input", refusedText, func(w nulWorld, v string) error {
+		{"agent_runs.input", func(t *testing.T, w nulWorld) string {
 			run := w.k.newRun(agentAlpha)
-			run.Input = "input" + v
-			_, _, err := w.k.store.CreateRun(w.k.ctx, run)
-			return err
+			run.Input = bad
+			return w.k.insert(run).Input
 		}},
-		{"agent_runs.start_key", refusedText, func(w nulWorld, v string) error {
+		{"agent_runs.metadata, in a key and in a value", func(t *testing.T, w nulWorld) string {
 			run := w.k.newRun(agentAlpha)
-			run.Key = "start-1" + v
-			_, _, err := w.k.store.CreateRun(w.k.ctx, run)
-			return err
+			run.Metadata = map[string]string{bad: bad, "plain": "kept"}
+			w.k.insert(run)
+			metadata := w.k.run(run.ID).Metadata
+			require.Equal(t, map[string]string{lost: lost, "plain": "kept"}, metadata)
+			return metadata[lost]
 		}},
-		{"agent_runs.metadata", refusedJSONB, func(w nulWorld, v string) error {
-			run := w.k.newRun(agentAlpha)
-			run.Metadata = map[string]string{"note": "n" + v}
-			_, _, err := w.k.store.CreateRun(w.k.ctx, run)
-			return err
+		{"agent_runs.error, from Yield", func(t *testing.T, w nulWorld) string {
+			require.NoError(t, w.k.store.Yield(w.k.ctx, w.lease, agent.YieldRequest{Failed: true, Error: bad, Now: w.k.tick()}))
+			return w.k.run(w.run.ID).Error
 		}},
-		{"agent_runs.lease_owner", refusedText, func(w nulWorld, v string) error {
-			_, err := w.k.store.Claim(w.k.ctx, agent.ClaimRequest{
-				Owner: workerB + v, Agents: testAgents, RunID: w.k.create().ID, Now: w.k.tick(), TTL: testTTL,
-			})
-			return err
-		}},
-		{"agent_runs.error, from Yield", refusedText, func(w nulWorld, v string) error {
-			return w.k.store.Yield(w.k.ctx, w.lease, agent.YieldRequest{Failed: true, Error: "boom" + v, Now: w.k.tick()})
-		}},
-		{"agent_runs.reason, from Park", refusedText, func(w nulWorld, v string) error {
+		{"agent_runs.reason, from Park", func(t *testing.T, w nulWorld) string {
 			w.k.ask(w.lease, 2, nil)
-			_, err := w.k.store.Park(w.k.ctx, w.lease, agent.ParkRequest{Reason: agent.ReasonApproval + v, Now: w.k.tick()})
-			return err
+			parked, err := w.k.store.Park(w.k.ctx, w.lease, agent.ParkRequest{Reason: bad, Now: w.k.tick()})
+			require.NoError(t, err)
+			require.True(t, parked)
+			return w.k.run(w.run.ID).Reason
 		}},
-		{"agent_runs.reason, from Finish", refusedText, func(w nulWorld, v string) error {
-			return w.k.store.Finish(w.k.ctx, w.lease, agent.FinishRequest{
-				Status: agent.StatusFailed, Reason: agent.ReasonError + v, Now: w.k.tick(),
-			})
+		{"agent_runs.reason, output and error, from Finish", func(t *testing.T, w nulWorld) string {
+			require.NoError(t, w.k.store.Finish(w.k.ctx, w.lease, agent.FinishRequest{
+				Status: agent.StatusFailed, Reason: bad, Output: bad, Error: bad, Now: w.k.tick(),
+			}))
+			run := w.k.run(w.run.ID)
+			require.Equal(t, lost, run.Reason)
+			require.Equal(t, lost, run.Error)
+			return run.Output
 		}},
-		{"agent_runs.output", refusedText, func(w nulWorld, v string) error {
-			return w.k.store.Finish(w.k.ctx, w.lease, agent.FinishRequest{
-				Status: agent.StatusCompleted, Output: "the answer" + v, Now: w.k.tick(),
-			})
+		{"agent_runs.cancel_by and cancel_reason", func(t *testing.T, w nulWorld) string {
+			require.NoError(t, w.k.store.RequestCancel(w.k.ctx, agent.CancelRequest{RunID: w.run.ID, By: bad, Reason: bad, Now: w.k.tick()}))
+			run := w.k.run(w.run.ID)
+			require.Equal(t, lost, run.CancelBy)
+			return run.CancelReason
 		}},
-		{"agent_runs.error, from Finish", refusedText, func(w nulWorld, v string) error {
-			return w.k.store.Finish(w.k.ctx, w.lease, agent.FinishRequest{
-				Status: agent.StatusFailed, Error: "gave up" + v, Now: w.k.tick(),
-			})
+		{"agent_steps.name and stop, of a model step", func(t *testing.T, w nulWorld) string {
+			require.NoError(t, w.k.store.BeginModel(w.k.ctx, w.lease, 3, w.k.tick()))
+			require.NoError(t, w.k.store.CompleteModel(w.k.ctx, w.lease, agent.CompleteModelRequest{
+				Seq: 3, Message: agenttest.Say("done").Message, Stop: agent.Stop(bad), Model: bad, Now: w.k.tick(),
+			}))
+			step := w.k.steps(w.run.ID)[2]
+			require.Equal(t, agent.Stop(lost), step.Stop)
+			return step.Name
 		}},
-		{"agent_runs.cancel_by", refusedText, func(w nulWorld, v string) error {
-			return w.k.store.RequestCancel(w.k.ctx, agent.CancelRequest{RunID: w.run.ID, By: person + v, Now: w.k.tick()})
-		}},
-		{"agent_runs.cancel_reason", refusedText, func(w nulWorld, v string) error {
-			return w.k.store.RequestCancel(w.k.ctx, agent.CancelRequest{
-				RunID: w.run.ID, By: person, Reason: "wrong batch" + v, Now: w.k.tick(),
-			})
-		}},
-		{"agent_steps.name, of a model step", refusedText, func(w nulWorld, v string) error {
-			if err := w.k.store.BeginModel(w.k.ctx, w.lease, 3, w.k.tick()); err != nil {
-				return err
-			}
-			return w.k.store.CompleteModel(w.k.ctx, w.lease, agent.CompleteModelRequest{
-				Seq: 3, Message: agenttest.Say("done").Message, Stop: agent.StopEnd, Model: "model-a" + v, Now: w.k.tick(),
-			})
-		}},
-		{"agent_steps.stop", refusedText, func(w nulWorld, v string) error {
-			if err := w.k.store.BeginModel(w.k.ctx, w.lease, 3, w.k.tick()); err != nil {
-				return err
-			}
-			return w.k.store.CompleteModel(w.k.ctx, w.lease, agent.CompleteModelRequest{
-				Seq: 3, Message: agenttest.Say("done").Message, Stop: agent.StopEnd + agent.Stop(v), Now: w.k.tick(),
-			})
-		}},
-		{"agent_steps.name, of a tool step: the name the model called", refusedText, func(w nulWorld, v string) error {
-			if err := w.k.store.BeginModel(w.k.ctx, w.lease, 3, w.k.tick()); err != nil {
-				return err
-			}
-			return w.k.store.CompleteModel(w.k.ctx, w.lease, agent.CompleteModelRequest{
+		{"agent_steps.name, of a tool step: the name the model called, and agent_approvals.tool", func(t *testing.T, w nulWorld) string {
+			require.NoError(t, w.k.store.BeginModel(w.k.ctx, w.lease, 3, w.k.tick()))
+			require.NoError(t, w.k.store.CompleteModel(w.k.ctx, w.lease, agent.CompleteModelRequest{
 				Seq:     3,
-				Message: agenttest.Use(agenttest.Call("call-2", toolSend+v, sendInput)).Message,
+				Message: agent.Message{Role: agent.RoleAssistant, Calls: []agent.Call{{ID: "call-2", Name: bad, Input: raw(sendInput)}}},
 				Stop:    agent.StopToolUse, Now: w.k.tick(),
-			})
+			}))
+			step := w.k.steps(w.run.ID)[3]
+			require.Equal(t, nul+"�", step.Call.Name, "the call keeps its NUL: it is in a json column")
+			require.Equal(t, lost, w.k.ask(w.lease, 4, nil).Tool)
+			return step.Name
 		}},
-		{"agent_steps.decision", refusedText, func(w nulWorld, v string) error {
-			return w.k.store.UpdateStep(w.k.ctx, w.lease, agent.StepUpdate{
-				Seq: 2, From: agent.StepProposed, To: agent.StepStarted, Decision: agent.Allow + agent.Effect(v), Now: w.k.tick(),
-			})
+		{"agent_steps.decision, rule and result: what a tool returned", func(t *testing.T, w nulWorld) string {
+			text := bad
+			require.NoError(t, w.k.store.UpdateStep(w.k.ctx, w.lease, agent.StepUpdate{
+				Seq: 2, From: agent.StepProposed, To: agent.StepCompleted,
+				Decision: agent.Effect(bad), Rule: bad, Result: &text, Now: w.k.tick(),
+			}))
+			step := w.k.steps(w.run.ID)[1]
+			require.Equal(t, agent.Effect(lost), step.Decision)
+			require.Equal(t, lost, step.Rule)
+			return step.Result
 		}},
-		{"agent_steps.rule", refusedText, func(w nulWorld, v string) error {
-			return w.k.store.UpdateStep(w.k.ctx, w.lease, agent.StepUpdate{
-				Seq: 2, From: agent.StepProposed, To: agent.StepStarted, Decision: agent.Allow, Rule: "a rule" + v, Now: w.k.tick(),
-			})
-		}},
-		{"agent_steps.result: what a tool returned", refusedText, func(w nulWorld, v string) error {
-			text := "sent" + v
-			return w.k.store.UpdateStep(w.k.ctx, w.lease, agent.StepUpdate{
-				Seq: 2, From: agent.StepProposed, To: agent.StepCompleted, Result: &text, Now: w.k.tick(),
-			})
-		}},
-		{"agent_approvals.action, in an attribute", refusedJSONB, func(w nulWorld, v string) error {
+		{"agent_approvals.action, in its kind, its target, and the keys and values of its attributes", func(t *testing.T, w nulWorld) string {
 			req := w.k.askRequest(2)
-			req.Action.Attrs = map[string]any{"to": "a" + v}
+			req.Action = agent.Action{Kind: bad, Target: bad, Attrs: map[string]any{
+				bad:      bad,
+				"nested": map[string]any{bad: []any{bad, 7, nil}},
+				// The six characters of the escape, which are not a NUL.
+				"written": `\u0000`,
+				"exact":   uint64(12345678901234567890),
+			}}
 			_, err := w.k.store.RequestApproval(w.k.ctx, w.lease, req)
-			return err
+			require.NoError(t, err)
+			action := w.k.approval(req.ID).Action
+			require.Equal(t, lost, action.Kind)
+			require.Equal(t, map[string]any{
+				lost:      lost,
+				"nested":  map[string]any{lost: []any{lost, float64(7), nil}},
+				"written": `\u0000`,
+				"exact":   float64(12345678901234567890),
+			}, action.Attrs)
+			return action.Target
 		}},
-		{"agent_approvals.action, in the target", refusedJSONB, func(w nulWorld, v string) error {
+		{"agent_approvals.rule, and the step's decision and rule", func(t *testing.T, w nulWorld) string {
 			req := w.k.askRequest(2)
-			req.Action.Target = toolSend + v
-			_, err := w.k.store.RequestApproval(w.k.ctx, w.lease, req)
-			return err
+			req.Decision, req.Rule = agent.Effect(bad), bad
+			approval, err := w.k.store.RequestApproval(w.k.ctx, w.lease, req)
+			require.NoError(t, err)
+			step := w.k.steps(w.run.ID)[1]
+			require.Equal(t, agent.Effect(lost), step.Decision)
+			require.Equal(t, lost, step.Rule)
+			return approval.Rule
 		}},
-		{"agent_approvals.rule", refusedText, func(w nulWorld, v string) error {
-			req := w.k.askRequest(2)
-			req.Rule += v
-			_, err := w.k.store.RequestApproval(w.k.ctx, w.lease, req)
-			return err
-		}},
-		{"agent_approvals.decided_by", refusedText, func(w nulWorld, v string) error {
-			_, err := w.k.store.DecideApproval(w.k.ctx, agent.DecideRequest{ID: w.asked.ID, Approved: true, By: person + v, Now: w.k.tick()})
-			return err
-		}},
-		{"agent_approvals.reason", refusedText, func(w nulWorld, v string) error {
-			_, err := w.k.store.DecideApproval(w.k.ctx, agent.DecideRequest{
-				ID: w.asked.ID, Approved: true, By: person, Reason: "checked" + v, Now: w.k.tick(),
-			})
-			return err
+		{"agent_approvals.decided_by and reason", func(t *testing.T, w nulWorld) string {
+			approval, err := w.k.store.DecideApproval(w.k.ctx, agent.DecideRequest{ID: w.asked.ID, Approved: true, By: bad, Reason: bad, Now: w.k.tick()})
+			require.NoError(t, err)
+			require.Equal(t, lost, approval.DecidedBy)
+			return w.k.approval(w.asked.ID).Reason
 		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.column, func(t *testing.T) {
-			w := newNULWorld(t)
-
-			err := tt.write(w, nul)
-
-			var refusal *pgconn.PgError
-			require.ErrorAs(t, err, &refusal, "the store kept a NUL in %s", tt.column)
-			assert.Equal(t, tt.code, refusal.Code)
-			for _, sentinel := range []error{agent.ErrNotFound, agent.ErrLeaseLost, agent.ErrConflict, agent.ErrAlreadyDecided} {
-				assert.NotErrorIs(t, err, sentinel)
-			}
-
-			// The statement that was refused took its transaction with it,
-			// so nothing was left half-written: the same call without the
-			// NUL goes through, in the same store and under the same lease.
-			require.NoError(t, tt.write(w, ""))
+			assert.Equal(t, lost, tt.write(t, newNULWorld(t)))
 		})
 	}
 }
 
-// A TEXT column refuses a byte that is not UTF-8 as it refuses a NUL. The
-// result of a tool call is the one that matters: a tool that read a file in
-// another encoding hands such a string back.
-func TestNUL_ATextColumnRefusesAByteThatIsNotUTF8(t *testing.T) {
-	w := newNULWorld(t)
-	text := "caf\xff"
+// A name is compared, so it cannot be kept as something else: one that
+// holds a NUL or a byte that is not UTF-8 is refused, for what it is and
+// before a transaction is opened.
+func TestNUL_NamesThatCannotBeKeptAreRefused(t *testing.T) {
+	store := agentpg.New(neverBegun{t})
+	ctx := t.Context()
+	run := func(edit func(*agent.Run)) agent.Run {
+		r := agent.Run{ID: newID(), Agent: agentAlpha, Status: agent.StatusRunnable, CreatedAt: testStart, UpdatedAt: testStart}
+		edit(&r)
+		return r
+	}
 
-	err := w.k.store.UpdateStep(w.k.ctx, w.lease, agent.StepUpdate{
-		Seq: 2, From: agent.StepProposed, To: agent.StepCompleted, Result: &text, Now: w.k.tick(),
-	})
-
-	var refusal *pgconn.PgError
-	require.ErrorAs(t, err, &refusal)
-	assert.Equal(t, refusedText, refusal.Code)
-	assert.Equal(t, agent.StepProposed, w.k.steps(w.run.ID)[1].Status)
+	for _, bad := range []string{nul, "caf\xff"} {
+		refusals := map[string]func() error{
+			"agent_runs.agent": func() error {
+				_, _, err := store.CreateRun(ctx, run(func(r *agent.Run) { r.Agent = bad }))
+				return err
+			},
+			"agent_runs.start_key": func() error {
+				_, _, err := store.CreateRun(ctx, run(func(r *agent.Run) { r.Key = bad }))
+				return err
+			},
+			"agent_runs.lease_owner, on a run stored with one": func() error {
+				_, _, err := store.CreateRun(ctx, run(func(r *agent.Run) { r.LeaseOwner = bad }))
+				return err
+			},
+			"agent_runs.lease_owner, from Claim": func() error {
+				_, err := store.Claim(ctx, agent.ClaimRequest{Owner: bad, Agents: testAgents, Now: testStart, TTL: testTTL})
+				return err
+			},
+		}
+		for column, refuse := range refusals {
+			err := refuse()
+			require.Error(t, err, "%s, given %q", column, bad)
+			var fromDatabase *pgconn.PgError
+			assert.NotErrorAs(t, err, &fromDatabase, column)
+		}
+	}
 }
 
-func TestNUL_OnceRefusesOneInAKey(t *testing.T) {
+// An agent's name that no column keeps is no run's agent. A claim that
+// lists one claims for the others.
+func TestNUL_AClaimPassesOverAnAgentNoRunCouldHave(t *testing.T) {
+	k, _ := newKit(t)
+	run := k.create()
+
+	got, err := k.store.Claim(k.ctx, agent.ClaimRequest{Owner: workerA, Agents: []string{nul, "caf\xff"}, Now: k.tick(), TTL: testTTL})
+	require.NoError(t, err)
+	assert.Nil(t, got)
+
+	_, err = k.store.Claim(k.ctx, agent.ClaimRequest{Owner: workerA, Agents: []string{nul}, RunID: run.ID, Now: k.tick(), TTL: testTTL})
+	require.ErrorIs(t, err, agent.ErrNotClaimable)
+
+	got, err = k.store.Claim(k.ctx, agent.ClaimRequest{Owner: workerA, Agents: []string{nul, agentAlpha}, Now: k.tick(), TTL: testTTL})
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, run.ID, got.ID)
+}
+
+func TestNUL_OnceRefusesAKeyThatCannotBeKept(t *testing.T) {
 	tx := begin(t, newDatabase(t).pool(t))
 
-	_, err := agentpg.Once(t.Context(), tx, "run-1:2"+nul)
+	for _, key := range []string{"run-1:2" + nul, "run-1:2\xff"} {
+		_, err := agentpg.Once(t.Context(), tx, key)
+		require.Error(t, err)
+		var fromDatabase *pgconn.PgError
+		assert.NotErrorAs(t, err, &fromDatabase, "the key never reached the database")
+	}
 
-	var refusal *pgconn.PgError
-	require.True(t, errors.As(err, &refusal))
-	assert.Equal(t, refusedText, refusal.Code)
+	// The transaction is still good: Postgres was not asked.
+	first, err := agentpg.Once(t.Context(), tx, "run-1:2")
+	require.NoError(t, err)
+	assert.True(t, first)
 }

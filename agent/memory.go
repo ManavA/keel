@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -33,8 +35,21 @@ const (
 // Like every Store it never reads a clock. What it refuses and how values
 // read back are as agent/pg has them, so that a test passing on one passes
 // on the other: an id must be a UUID in its canonical form, a child's parent
-// must exist, and metadata and an action's attributes come back as a JSON
-// round trip gives them.
+// must exist and be one level above it, and metadata and an action's
+// attributes come back as a JSON round trip gives them.
+//
+// That holds for the strings a database cannot keep too: one with a NUL
+// character in it, or a byte that is not UTF-8. A string the store only
+// records is kept with each such character as the replacement character,
+// U+FFFD: a tool's result, a run's input, output and error, a reason, a
+// rule, the name of a tool or a model, who decided or cancelled and why, and
+// the strings inside metadata and an action. So nothing a model or a tool
+// wrote can make a journal write fail. Inside a message and a definition,
+// which are kept as JSON, a NUL is kept and only the byte that is not UTF-8
+// is replaced. A string the store compares names something and is refused
+// before the store is looked at: an agent's name, a start key and an owner,
+// as an id is. Raw JSON that is not JSON, or not UTF-8, is refused the same
+// way.
 //
 // Every method makes its checks in one order. First what the request alone
 // shows to be wrong, before the store is looked at; then whether the run
@@ -43,8 +58,7 @@ const (
 type MemoryStore struct {
 	mu   sync.Mutex
 	runs map[string]*memoryRun
-	// order holds the runs as they arrived. Claim breaks a tie between runs
-	// created at the same instant by it.
+	// order holds the runs as they arrived.
 	order []*memoryRun
 	// keys maps an agent and a start key to the run that has them.
 	keys      map[startKey]*memoryRun
@@ -89,6 +103,14 @@ func (s *MemoryStore) CreateRun(_ context.Context, run Run) (Run, bool, error) {
 	if run.Status != StatusRunnable {
 		return Run{}, false, fmt.Errorf("agent: create run: status is %q, not %q", run.Status, StatusRunnable)
 	}
+	if !storable(run.Agent) || !storable(run.Key) || !storable(run.LeaseOwner) {
+		return Run{}, false, fmt.Errorf("agent: create run: the agent %q, the key %q or the owner %q holds a character no store keeps",
+			run.Agent, run.Key, run.LeaseOwner)
+	}
+	definition, err := storedSnapshot(run.Definition)
+	if err != nil {
+		return Run{}, false, fmt.Errorf("agent: create run: definition: %w", err)
+	}
 	metadata, err := storedMetadata(run.Metadata)
 	if err != nil {
 		return Run{}, false, fmt.Errorf("agent: create run: %w", err)
@@ -115,10 +137,22 @@ func (s *MemoryStore) CreateRun(_ context.Context, run Run) (Run, bool, error) {
 		}
 		parent = named
 	}
+	// A child is one level below its parent, and a run nobody started is at
+	// none. The order rows are locked in, children before parents, is taken
+	// from this.
+	if parent == nil && run.Depth != 0 {
+		return Run{}, false, fmt.Errorf("agent: create run: depth is %d for a run no other started", run.Depth)
+	}
+	if parent != nil && run.Depth != parent.run.Depth+1 {
+		return Run{}, false, fmt.Errorf("agent: create run: depth is %d under a parent at depth %d", run.Depth, parent.run.Depth)
+	}
 
 	r := &memoryRun{run: cloneRun(run)}
 	r.run.Rev = 1
+	r.run.Definition = definition
 	r.run.Metadata = metadata
+	r.run.Reason, r.run.Input, r.run.Output, r.run.Error = kept(run.Reason), kept(run.Input), kept(run.Output), kept(run.Error)
+	r.run.CancelBy, r.run.CancelReason = kept(run.CancelBy), kept(run.CancelReason)
 	s.runs[run.ID] = r
 	s.order = append(s.order, r)
 	if run.Key != "" {
@@ -138,6 +172,44 @@ func isUUID(id string) bool {
 	return err == nil && parsed.String() == id
 }
 
+// replacement is what a character no database column holds is kept as.
+const replacement = "\uFFFD"
+
+// storable reports whether a text column holds s as it is: with no NUL
+// character in it, and in UTF-8.
+func storable(s string) bool {
+	return strings.IndexByte(s, 0) < 0 && utf8.ValidString(s)
+}
+
+// kept is s as a store keeps a string it only records: with each NUL and
+// each byte that is not UTF-8 as the replacement character.
+func kept(s string) string {
+	if storable(s) {
+		return s
+	}
+	return strings.ToValidUTF8(strings.ReplaceAll(s, "\x00", replacement), replacement)
+}
+
+// keptInJSON is s as a store keeps a string inside a JSON value, where a NUL
+// has an escape and is kept: only a byte that is not UTF-8 is replaced.
+func keptInJSON(s string) string {
+	return strings.ToValidUTF8(s, replacement)
+}
+
+// validRaw reports why a store could not keep value, which is JSON somebody
+// else wrote. None is kept as none.
+func validRaw(value json.RawMessage) error {
+	switch {
+	case len(value) == 0:
+		return nil
+	case !json.Valid(value):
+		return errors.New("not valid JSON")
+	case !utf8.Valid(value):
+		return errors.New("not UTF-8")
+	}
+	return nil
+}
+
 // GetRun implements Store.
 func (s *MemoryStore) GetRun(_ context.Context, id string) (Run, error) {
 	s.mu.Lock()
@@ -152,6 +224,11 @@ func (s *MemoryStore) GetRun(_ context.Context, id string) (Run, error) {
 
 // ListRuns implements Store.
 func (s *MemoryStore) ListRuns(_ context.Context, f RunFilter) ([]Run, error) {
+	before, err := listCursor(f.Before)
+	if err != nil {
+		return nil, fmt.Errorf("agent: list runs: %w", err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -161,7 +238,7 @@ func (s *MemoryStore) ListRuns(_ context.Context, f RunFilter) ([]Run, error) {
 		case f.Status != "" && r.run.Status != f.Status:
 		case f.Agent != "" && r.run.Agent != f.Agent:
 		case f.ParentID != "" && r.run.ParentID != f.ParentID:
-		case f.Before != nil && !olderThan(r.run, *f.Before):
+		case before != nil && !olderThan(r.run, *before):
 		default:
 			found = append(found, r)
 		}
@@ -176,6 +253,20 @@ func (s *MemoryStore) ListRuns(_ context.Context, f RunFilter) ([]Run, error) {
 		out[i] = cloneRun(r.run)
 	}
 	return out, nil
+}
+
+// listCursor is the position a listing starts after, or nil for the start.
+// A cursor is an argument, and may have come from a client: its id must be a
+// UUID in the one form, though it need not be one a run has. The zero Cursor
+// is no position, and lists from the start.
+func listCursor(c *Cursor) (*Cursor, error) {
+	if c == nil || c.ID == "" && c.CreatedAt.IsZero() {
+		return nil, nil
+	}
+	if !isUUID(c.ID) {
+		return nil, fmt.Errorf("cursor id %q is not a UUID", c.ID)
+	}
+	return c, nil
 }
 
 // olderThan reports whether run comes after the position c in a listing,
@@ -209,6 +300,9 @@ func (s *MemoryStore) Claim(_ context.Context, req ClaimRequest) (*Run, error) {
 	if req.TTL <= 0 {
 		return nil, fmt.Errorf("agent: claim: ttl is %s, not more than zero", req.TTL)
 	}
+	if !storable(req.Owner) {
+		return nil, fmt.Errorf("agent: claim: owner %q holds a character no store keeps", req.Owner)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -224,8 +318,10 @@ func (s *MemoryStore) Claim(_ context.Context, req ClaimRequest) (*Run, error) {
 		}
 		r = named
 	} else {
+		// The oldest, and of runs created at one instant the one whose id
+		// sorts first: a table keeps no order of arrival to break the tie by.
 		for _, candidate := range s.order {
-			if claimable(candidate.run, req) && (r == nil || candidate.run.CreatedAt.Before(r.run.CreatedAt)) {
+			if claimable(candidate.run, req) && (r == nil || claimedBefore(candidate.run, r.run)) {
 				r = candidate
 			}
 		}
@@ -247,6 +343,14 @@ func (s *MemoryStore) Claim(_ context.Context, req ClaimRequest) (*Run, error) {
 
 	out := cloneRun(r.run)
 	return &out, nil
+}
+
+// claimedBefore reports whether a claim takes a ahead of b.
+func claimedBefore(a, b Run) bool {
+	if order := a.CreatedAt.Compare(b.CreatedAt); order != 0 {
+		return order < 0
+	}
+	return a.ID < b.ID
 }
 
 func claimable(run Run, req ClaimRequest) bool {
@@ -324,7 +428,7 @@ func (s *MemoryStore) Yield(_ context.Context, lease Lease, req YieldRequest) er
 	r.run.NextAttemptAt = cloneTime(req.NextAttemptAt)
 	if req.Failed {
 		r.run.Failures++
-		r.run.Error = req.Error
+		r.run.Error = kept(req.Error)
 	}
 	touch(r, req.Now)
 	return nil
@@ -343,7 +447,7 @@ func (s *MemoryStore) Park(_ context.Context, lease Lease, req ParkRequest) (boo
 		return false, nil
 	}
 	r.run.Status = StatusWaiting
-	r.run.Reason = req.Reason
+	r.run.Reason = kept(req.Reason)
 	release(r)
 	touch(r, req.Now)
 	return true, nil
@@ -375,9 +479,9 @@ func (s *MemoryStore) Finish(_ context.Context, lease Lease, req FinishRequest) 
 
 	finished := req.Now
 	r.run.Status = req.Status
-	r.run.Reason = req.Reason
-	r.run.Output = req.Output
-	r.run.Error = req.Error
+	r.run.Reason = kept(req.Reason)
+	r.run.Output = kept(req.Output)
+	r.run.Error = kept(req.Error)
 	r.run.FinishedAt = &finished
 	release(r)
 	rev := touch(r, req.Now)
@@ -456,6 +560,11 @@ func (s *MemoryStore) BeginModel(_ context.Context, lease Lease, seq int, now ti
 
 // CompleteModel implements Store.
 func (s *MemoryStore) CompleteModel(_ context.Context, lease Lease, req CompleteModelRequest) error {
+	message, err := storedMessage(req.Message)
+	if err != nil {
+		return fmt.Errorf("agent: complete model: message: %w", err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -474,12 +583,11 @@ func (s *MemoryStore) CompleteModel(_ context.Context, lease Lease, req Complete
 	}
 
 	rev := touch(r, req.Now)
-	message := cloneMessage(req.Message)
 	finished := req.Now
 	st.Status = StepCompleted
-	st.Name = req.Model
+	st.Name = kept(req.Model)
 	st.Message = &message
-	st.Stop = req.Stop
+	st.Stop = Stop(kept(string(req.Stop)))
 	st.Usage = req.Usage
 	st.FinishedAt = &finished
 	st.Rev = rev
@@ -489,7 +597,10 @@ func (s *MemoryStore) CompleteModel(_ context.Context, lease Lease, req Complete
 	r.run.ActiveMillis += activeMillis(st.StartedAt, req.Now)
 	r.run.Failures = 0
 
-	for i, call := range req.Message.Calls {
+	// Each call is the message's own, copied, so the step shares nothing
+	// with the reply. The step's name is a column of its own, where the
+	// call's is inside JSON.
+	for i, call := range message.Calls {
 		seq := req.Seq + 1 + i
 		call.Input = slices.Clone(call.Input)
 		r.steps = append(r.steps, &Step{
@@ -497,7 +608,7 @@ func (s *MemoryStore) CompleteModel(_ context.Context, lease Lease, req Complete
 			Seq:       seq,
 			Kind:      StepTool,
 			Status:    StepProposed,
-			Name:      call.Name,
+			Name:      kept(req.Message.Calls[i].Name),
 			Turn:      req.Seq,
 			Call:      &call,
 			Key:       StepKey(r.run.ID, seq),
@@ -541,11 +652,11 @@ func (s *MemoryStore) UpdateStep(_ context.Context, lease Lease, req StepUpdate)
 	st.Rev = touch(r, req.Now)
 	st.Status = req.To
 	if req.Decision != "" {
-		st.Decision = req.Decision
-		st.Rule = req.Rule
+		st.Decision = Effect(kept(string(req.Decision)))
+		st.Rule = kept(req.Rule)
 	}
 	if req.Result != nil {
-		st.Result = *req.Result
+		st.Result = kept(*req.Result)
 		st.IsError = req.IsError
 	}
 	if req.ChildRunID != "" {
@@ -582,6 +693,9 @@ func (s *MemoryStore) RequestApproval(_ context.Context, lease Lease, req Approv
 	if !isUUID(req.ID) {
 		return Approval{}, fmt.Errorf("agent: request approval: id %q is not a UUID", req.ID)
 	}
+	if !isCause(req.Cause) {
+		return Approval{}, fmt.Errorf("agent: request approval: %q is not a cause", req.Cause)
+	}
 	action, err := storedAction(req.Action)
 	if err != nil {
 		return Approval{}, fmt.Errorf("agent: request approval: %w", err)
@@ -613,8 +727,8 @@ func (s *MemoryStore) RequestApproval(_ context.Context, lease Lease, req Approv
 	rev := touch(r, req.Now)
 	st.Status = StepWaiting
 	if req.Decision != "" {
-		st.Decision = req.Decision
-		st.Rule = req.Rule
+		st.Decision = Effect(kept(string(req.Decision)))
+		st.Rule = kept(req.Rule)
 	}
 	st.Rev = rev
 
@@ -626,7 +740,7 @@ func (s *MemoryStore) RequestApproval(_ context.Context, lease Lease, req Approv
 		Cause:       req.Cause,
 		Tool:        st.Name,
 		Action:      action,
-		Rule:        req.Rule,
+		Rule:        kept(req.Rule),
 		Status:      ApprovalPending,
 		Rev:         rev,
 		RequestedAt: req.Now,
@@ -638,6 +752,14 @@ func (s *MemoryStore) RequestApproval(_ context.Context, lease Lease, req Approv
 	r.approvals = append(r.approvals, a)
 	s.approvals[req.ID] = a
 	return cloneApproval(a.approval), nil
+}
+
+func isCause(cause ApprovalCause) bool {
+	switch cause {
+	case CauseGuard, CauseTool, CauseInterrupted:
+		return true
+	}
+	return false
 }
 
 // GetApproval implements Store.
@@ -698,8 +820,8 @@ func (s *MemoryStore) DecideApproval(_ context.Context, req DecideRequest) (Appr
 	if req.Approved {
 		a.approval.Status = ApprovalApproved
 	}
-	a.approval.DecidedBy = req.By
-	a.approval.Reason = req.Reason
+	a.approval.DecidedBy = kept(req.By)
+	a.approval.Reason = kept(req.Reason)
 	a.approval.DecidedAt = &decided
 	a.approval.Rev = touch(a.run, req.Now)
 	wake(a.run)
@@ -750,8 +872,8 @@ func (s *MemoryStore) RequestCancel(_ context.Context, req CancelRequest) error 
 		return nil
 	}
 	r.run.CancelRequested = true
-	r.run.CancelBy = req.By
-	r.run.CancelReason = req.Reason
+	r.run.CancelBy = kept(req.By)
+	r.run.CancelReason = kept(req.Reason)
 	wake(r)
 	touch(r, req.Now)
 	return nil
@@ -853,20 +975,73 @@ func cloneApproval(a Approval) Approval {
 
 // storedMetadata is metadata as it reads back from a store: through JSON,
 // so a byte that is no UTF-8 is the replacement character, and none is an
-// empty map.
+// empty map. A NUL is the replacement character too, in a key or a value.
 func storedMetadata(metadata map[string]string) (map[string]string, error) {
 	text, err := json.Marshal(metadata)
 	if err != nil {
 		return nil, fmt.Errorf("metadata: %w", err)
 	}
-	var stored map[string]string
-	if err := json.Unmarshal(text, &stored); err != nil {
+	var read map[string]string
+	if err := json.Unmarshal(text, &read); err != nil {
 		return nil, fmt.Errorf("metadata: %w", err)
 	}
-	if stored == nil {
-		stored = map[string]string{}
+	stored := make(map[string]string, len(read))
+	for k, v := range read {
+		stored[kept(k)] = kept(v)
 	}
 	return stored, nil
+}
+
+// storedSnapshot is a definition as it reads back from a store, which keeps
+// it as JSON: each schema as the bytes it came as, and each string with a
+// byte that is not UTF-8 as the replacement character. It fails for a schema
+// that is not JSON.
+func storedSnapshot(def Snapshot) (Snapshot, error) {
+	if err := validRaw(def.Output); err != nil {
+		return Snapshot{}, fmt.Errorf("output: %w", err)
+	}
+	def.System, def.Model = keptInJSON(def.System), keptInJSON(def.Model)
+	def.Output = slices.Clone(def.Output)
+	if def.Tools != nil {
+		tools := make([]ToolSpec, len(def.Tools))
+		for i, tool := range def.Tools {
+			if err := validRaw(tool.Schema); err != nil {
+				return Snapshot{}, fmt.Errorf("tool %q: schema: %w", tool.Name, err)
+			}
+			tool.Name, tool.Description = keptInJSON(tool.Name), keptInJSON(tool.Description)
+			tool.Schema = slices.Clone(tool.Schema)
+			tools[i] = tool
+		}
+		def.Tools = tools
+	}
+	return def, nil
+}
+
+// storedMessage is a reply as it reads back from a store, which keeps it as
+// JSON: the arguments of each call and the provider's form as the bytes they
+// came as, and each string with a byte that is not UTF-8 as the replacement
+// character. It fails for arguments or a provider's form that are not JSON.
+func storedMessage(m Message) (Message, error) {
+	m = cloneMessage(m)
+	m.Role, m.Text = Role(keptInJSON(string(m.Role))), keptInJSON(m.Text)
+	for i := range m.Calls {
+		call := &m.Calls[i]
+		if err := validRaw(call.Input); err != nil {
+			return Message{}, fmt.Errorf("call %d: input: %w", i+1, err)
+		}
+		call.ID, call.Name = keptInJSON(call.ID), keptInJSON(call.Name)
+	}
+	for i := range m.Results {
+		result := &m.Results[i]
+		result.CallID, result.Content = keptInJSON(result.CallID), keptInJSON(result.Content)
+	}
+	if m.Opaque != nil {
+		if err := validRaw(m.Opaque.Data); err != nil {
+			return Message{}, fmt.Errorf("opaque: data: %w", err)
+		}
+		m.Opaque.Provider = keptInJSON(m.Opaque.Provider)
+	}
+	return m, nil
 }
 
 // storedAction is a as it reads back from a store: its attributes through
@@ -882,11 +1057,36 @@ func storedAction(a Action) (Action, error) {
 	if err := json.Unmarshal(text, &attrs); err != nil {
 		return Action{}, fmt.Errorf("action attributes: %w", err)
 	}
-	if attrs == nil {
-		attrs = map[string]any{}
+	// A NUL has no place in a value a database keeps, in a key or in a
+	// string at any depth.
+	a.Attrs, _ = withoutNUL(attrs).(map[string]any)
+	if a.Attrs == nil {
+		a.Attrs = map[string]any{}
 	}
-	a.Attrs = attrs
+	a.Kind, a.Target = kept(a.Kind), kept(a.Target)
 	return a, nil
+}
+
+// withoutNUL is a value that has been through JSON with each NUL in its
+// strings and keys as the replacement character.
+func withoutNUL(value any) any {
+	switch v := value.(type) {
+	case string:
+		return strings.ReplaceAll(v, "\x00", replacement)
+	case []any:
+		out := make([]any, len(v))
+		for i, e := range v {
+			out[i] = withoutNUL(e)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, e := range v {
+			out[strings.ReplaceAll(key, "\x00", replacement)] = withoutNUL(e)
+		}
+		return out
+	}
+	return value
 }
 
 func cloneAction(a Action) Action {

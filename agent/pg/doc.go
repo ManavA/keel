@@ -37,10 +37,10 @@
 // so two workers looking for work never wait on each other.
 //
 // Rows are always taken child before parent. A child's Finish takes its own
-// and then its parent's; ExpireApprovals takes every run it will change
-// before it changes any, deepest first and by id within a depth. The order
-// uses the Depth a run was created with, which the engine sets to one more
-// than its parent's.
+// and then its parent's; ExpireApprovals and Purge take every run they will
+// change before they change any, deepest first and by id within a depth. The
+// order uses the Depth a run was created with, which CreateRun holds to one
+// more than its parent's.
 //
 // The store asks for read committed by name in each of these transactions.
 // The look after the lock sees what was committed during the wait only at
@@ -68,18 +68,26 @@
 // action are jsonb columns and read back equal in value: a number as a
 // float64, no attributes as an empty map.
 //
-// A NUL character can be kept where JSON can hold one, as the escape \u0000:
-// in a message's text, a call's arguments, the provider's form, and the
-// definition. It cannot be kept in a TEXT column or in the two jsonb columns,
-// and neither can a byte that is not UTF-8 in a TEXT column: Postgres refuses
-// the statement and the store returns its error, with nothing written. A
-// tool's result, a run's input, output and error, and an action's attributes
-// are among those.
+// A TEXT column holds neither a NUL character nor a byte that is not UTF-8,
+// and a jsonb column no NUL. A model, a tool or a person can put either in
+// anything they write, and the store never sends Postgres a string it would
+// refuse. A string the store only records is kept with each such character
+// as the replacement character U+FFFD: a tool's result, a run's input,
+// output and error, a reason, a rule, the name of a tool or a model, who
+// decided or cancelled and why, and the strings inside metadata and an
+// action. So no journal write fails, and no run is wedged, for what a model
+// or a tool wrote. A string the store compares is refused before a
+// transaction is opened, since it could only be kept as another name: an
+// agent's name, a start key, an owner and a tool effect's key. Inside the
+// json columns a NUL is kept, as the escape \u0000, and only a byte that is
+// not UTF-8 is replaced. agent.MemoryStore does the same, and the suite
+// holds both to it.
 //
 // # Once
 //
 // A completed step is never executed again, but a tool call that was
 // interrupted is, with the same Invocation.Key. A tool whose effect is a
 // write to this database makes it exactly once by calling Once with that key
-// in the transaction that makes the write.
+// in the transaction that makes the write. Purge removes a run's keys with
+// the run.
 package pg

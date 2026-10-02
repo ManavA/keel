@@ -144,6 +144,33 @@ func requestApprovalCases() []storeCase {
 			_, err = k.store.GetApproval(k.ctx, req.ID)
 			assert.ErrorIs(k.t, err, agent.ErrNotFound)
 		}},
+		{"a cause that is none of the three is refused", func(k *kit) {
+			run, lease := k.proposed(agentAlpha)
+			before := k.snapshot(run.ID)
+
+			for _, cause := range []agent.ApprovalCause{"", "policy", "Guard"} {
+				req := k.askRequest(2)
+				req.Cause = cause
+
+				_, err := k.store.RequestApproval(k.ctx, lease, req)
+
+				require.Error(k.t, err, "cause %q", cause)
+				assert.NotErrorIs(k.t, err, agent.ErrConflict, "cause %q: the step was there to ask about", cause)
+				k.unchanged(before)
+				_, err = k.store.GetApproval(k.ctx, req.ID)
+				assert.ErrorIs(k.t, err, agent.ErrNotFound, "cause %q", cause)
+			}
+
+			// Each of the three is recorded.
+			for i, cause := range []agent.ApprovalCause{agent.CauseGuard, agent.CauseTool, agent.CauseInterrupted} {
+				_, held := k.proposed(agentAlpha)
+				req := k.askRequest(2)
+				req.Cause = cause
+				got, err := k.store.RequestApproval(k.ctx, held, req)
+				require.NoError(k.t, err, "cause %d", i)
+				assert.Equal(k.t, cause, got.Cause)
+			}
+		}},
 		{"another spelling of a UUID is refused as an approval's id", func(k *kit) {
 			run, lease := k.proposed(agentAlpha)
 			before := k.snapshot(run.ID)

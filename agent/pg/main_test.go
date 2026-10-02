@@ -315,6 +315,9 @@ func newID() string { return uuid.NewString() }
 type stepped struct {
 	keelpg.Beginner
 	before func(st statement)
+	// failing, when set, is asked before each statement whether the
+	// statement is to fail, and with what: the statement is then not made.
+	failing func(st statement) error
 }
 
 // statement is one statement a store made.
@@ -329,41 +332,64 @@ func (s stepped) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error
 	if err != nil {
 		return nil, err
 	}
-	return &steppedTx{Tx: tx, before: s.before}, nil
+	return &steppedTx{Tx: tx, before: s.before, failing: s.failing}, nil
 }
 
 type steppedTx struct {
 	pgx.Tx
-	n      int
-	before func(st statement)
+	n       int
+	before  func(st statement)
+	failing func(st statement) error
 }
 
-func (t *steppedTx) step(sql string, args []any) {
+// step tells the hooks of a statement, and returns the error it is to fail
+// with, if any.
+func (t *steppedTx) step(sql string, args []any) error {
 	t.n++
-	t.before(statement{n: t.n, sql: sql, args: args})
+	st := statement{n: t.n, sql: sql, args: args}
+	if t.before != nil {
+		t.before(st)
+	}
+	if t.failing != nil {
+		return t.failing(st)
+	}
+	return nil
 }
 
 // Commit counts as a statement whose text is "commit", so that a transaction
 // can be stopped with all its work done and none of it visible.
 func (t *steppedTx) Commit(ctx context.Context) error {
-	t.step(commitStep, nil)
+	if err := t.step(commitStep, nil); err != nil {
+		return err
+	}
 	return t.Tx.Commit(ctx)
 }
 
 func (t *steppedTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	t.step(sql, args)
+	if err := t.step(sql, args); err != nil {
+		return pgconn.CommandTag{}, err
+	}
 	return t.Tx.Exec(ctx, sql, args...)
 }
 
 func (t *steppedTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-	t.step(sql, args)
+	if err := t.step(sql, args); err != nil {
+		return nil, err
+	}
 	return t.Tx.Query(ctx, sql, args...)
 }
 
 func (t *steppedTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
-	t.step(sql, args)
+	if err := t.step(sql, args); err != nil {
+		return failedRow{err}
+	}
 	return t.Tx.QueryRow(ctx, sql, args...)
 }
+
+// failedRow is the row of a statement that was made to fail.
+type failedRow struct{ err error }
+
+func (r failedRow) Scan(...any) error { return r.err }
 
 // commitStep is the text a stepped transaction's hook is given for its
 // commit.
