@@ -114,11 +114,34 @@
 // another in other ways, such as two eq on one attribute with different
 // values, are not detected.
 //
+// # A policy that no record could hold
+//
+// A decision record holds the name of the rule that decided and of each that
+// matched, the policy's version, and the names of the attributes a condition
+// could not tell. A name and the version go to text columns, and a name is
+// indexed, so [Policy.Validate] refuses what would load and then fail to record
+// every decision made under it, or record something other than what decided: a
+// rule name or an attribute name or the version that holds a NUL character or
+// is not valid UTF-8, and a rule name or a version of more than 256 bytes. A
+// kind and a target pattern are never in a record, but are refused for a NUL,
+// since one that holds it can only match an action that could never be
+// recorded. Each message names the rule, so that [Parse] and [NewDecider] stop
+// at load and not at the first decision.
+//
 // # A decision that cannot be recorded is not an allow
 //
 // [Decider.Decide] returns an error and a zero [Decision] when the record
 // cannot be written. The zero Decision's empty effect is not Allow, and a
 // caller must treat an effect that is not one of the three as Block.
+//
+// An error for a record that can never be stored, however often it is tried
+// again, wraps [ErrUnrecordable]: the error of a [Recorder] that says so, and
+// the Decider's own refusal of an action with too many values to copy. An error
+// that does not wrap it is the recorder's or the moment's, such as a database
+// that is down, and a later call may not meet it. A caller that retries what
+// fails (an agent step, say) retries on those and stops on this one, since a
+// retry of a record that can never be stored never ends. The Decider returns
+// no decision either way.
 //
 // # Immutable, and in-process by default
 //
@@ -128,10 +151,15 @@
 // record too. A copy is bounded in work as well as depth: a policy whose
 // conditions, or an action whose attributes, hold more than 10000 values is
 // refused, by NewDecider and by Decide, which returns an error and no decision.
-// [MemoryRecorder] is the Recorder a Decider uses when it is given none, and
-// its zero value is ready to use. It keeps the most recent decisions, 1000
-// unless Options.MemoryRecords says otherwise, and no more. policy/pg is the
-// Postgres recorder.
+// The error for an action wraps [ErrUnrecordable], since no retry will make the
+// action smaller; the error for a policy does not, since a policy is not a
+// record and is not retried. [MemoryRecorder] is the Recorder a Decider uses
+// when it is given none, and its zero value is ready to use. It keeps the most
+// recent decisions, 1000 unless Options.MemoryRecords says otherwise, and no
+// more, and it numbers none of them: [Record.ID] is the number a store that
+// keeps one gives a record it lists, which with the time is the record's place
+// in the log, and is zero in what the Decider hands a recorder and in what
+// MemoryRecorder returns. policy/pg is the Postgres recorder.
 //
 // # Beside textpolicy
 //

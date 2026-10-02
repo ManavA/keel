@@ -65,7 +65,9 @@ func NewDecider(p Policy, opts Options) (*Decider, error) {
 // caller may read as Allow. The Recorder is handed a copy of the action and the
 // decision, so neither it nor the caller can change what the other holds; an
 // action whose attributes hold more than 10000 values cannot be copied, which
-// is a record that cannot be written, and gets an error and no decision.
+// is a record that cannot be written, and gets an error and no decision; the
+// error wraps ErrUnrecordable, as does any a Recorder returns for a record it
+// can never store, so a caller can tell either from a Recorder that is down.
 //
 // A Recorder that panics takes Decide with it: no Decision is returned.
 func (d *Decider) Decide(ctx context.Context, a Action) (Decision, error) {
@@ -75,7 +77,7 @@ func (d *Decider) Decide(ctx context.Context, a Action) (Decision, error) {
 		// As below, the action's own facts are left out.
 		d.log.ErrorContext(ctx, "copy action for the policy record",
 			"kind", a.Kind, "rule", dec.Rule, "effect", dec.Effect, "error", err)
-		return Decision{}, fmt.Errorf("policy: record decision: the action's attributes hold %w", err)
+		return Decision{}, fmt.Errorf("policy: record decision: the action's attributes hold %w", unrecordable(err))
 	}
 	rec := Record{At: d.now(), Action: action, Decision: dec.clone(), Version: d.policy.Version}
 	if err := d.rec.Record(ctx, rec); err != nil {

@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // UnmarshalText reads an effect. It also reads "approve" as Ask, which is
@@ -200,10 +201,22 @@ func (p Policy) check() error {
 	if p.Default != "" && !p.Default.Valid() {
 		return fmt.Errorf("default %q is not allow, ask or block", p.Default)
 	}
+	if fault := recordedFault(p.Version); fault != "" {
+		return fmt.Errorf("the version %s", fault)
+	}
+	if len(p.Version) > maxRecordedText {
+		return fmt.Errorf("the version is %d bytes, and a decision record holds at most %d", len(p.Version), maxRecordedText)
+	}
 	seen := make(map[string]int, len(p.Rules))
 	for i, r := range p.Rules {
 		if r.Name == "" {
 			return fmt.Errorf("rule %d has no name", i)
+		}
+		if fault := recordedFault(r.Name); fault != "" {
+			return fmt.Errorf("rule %d (%q): the name %s", i, r.Name, fault)
+		}
+		if len(r.Name) > maxRecordedText {
+			return fmt.Errorf("rule %d: the name is %d bytes, and a decision record holds at most %d", i, len(r.Name), maxRecordedText)
 		}
 		if r.Name == RuleDefault {
 			return fmt.Errorf("rule %d is named %q, which is what a decision records when no rule matched", i, r.Name)
@@ -222,17 +235,57 @@ func (p Policy) check() error {
 	return nil
 }
 
-// check reports what is wrong with m: a kind that names nothing, a target
-// pattern that does not compile or is a bare star, a condition that can never
-// hold or holds whatever the action is, or conditions that cannot all hold. The
-// design says an empty Kinds, an empty Target and an empty Attrs each mean
-// "any", so those are accepted; anything else that would leave a part of a rule
-// silently unmatched is refused, since on a block rule that fails open.
+// What a record can hold as it is. A decision record holds the name of the rule
+// that decided and of every rule that matched, the policy's version, and the
+// names of the attributes a condition could not tell; a name and the version
+// go to text columns, and a name is also indexed. So a name or a version with a
+// NUL or bytes that are not UTF-8, or one too long, would load and then fail to
+// record every decision made under it, or record something other than what
+// decided; each is refused when the policy is loaded. A kind and a target
+// pattern are never in a record. They are refused for a NUL because a kind or a
+// pattern that holds one can only match an action that could never be recorded.
+const (
+	// maxRecordedText is the most bytes a rule's name or the version may have.
+	maxRecordedText = 256
+
+	// nulRefusal ends the message for a NUL in a text a record holds, and
+	// nulMatchRefusal the one for a NUL in a kind or a pattern.
+	nulRefusal      = "holds a NUL character, which a decision record cannot store"
+	nulMatchRefusal = "holds a NUL character, which only an action that could never be recorded can carry"
+)
+
+// recordedFault is why a decision record could not hold s as it is, or empty.
+func recordedFault(s string) string {
+	switch {
+	case strings.IndexByte(s, 0) >= 0:
+		return nulRefusal
+	case !utf8.ValidString(s):
+		return "is not valid UTF-8, so a decision record could not hold it as it is"
+	}
+	return ""
+}
+
+// hasNUL reports whether s holds a NUL character.
+func hasNUL(s string) bool { return strings.IndexByte(s, 0) >= 0 }
+
+// check reports what is wrong with m: a kind that names nothing or holds a NUL,
+// a target pattern that holds one, does not compile or is a bare star, a
+// condition that can never hold or holds whatever the action is, or conditions
+// that cannot all hold. The design says an empty Kinds, an empty Target and an
+// empty Attrs each mean "any", so those are accepted; anything else that would
+// leave a part of a rule silently unmatched is refused, since on a block rule
+// that fails open.
 func (m Match) check() error {
 	for i, k := range m.Kinds {
 		if k == "" {
 			return fmt.Errorf("kind %d is empty, which names no action", i)
 		}
+		if hasNUL(k) {
+			return fmt.Errorf("kind %d (%q) %s", i, k, nulMatchRefusal)
+		}
+	}
+	if hasNUL(m.Target) {
+		return fmt.Errorf("target pattern %q %s", m.Target, nulMatchRefusal)
 	}
 	// Matching against the empty string still reads the whole pattern, so a
 	// malformed one is reported whatever the target.
@@ -245,6 +298,9 @@ func (m Match) check() error {
 	for i, c := range m.Attrs {
 		if c.Attr == "" {
 			return fmt.Errorf("condition %d has no attribute", i)
+		}
+		if fault := recordedFault(c.Attr); fault != "" {
+			return fmt.Errorf("condition %d: the attribute name %q %s", i, c.Attr, fault)
 		}
 		if err := c.check(); err != nil {
 			return fmt.Errorf("condition %d on %q: %w", i, c.Attr, err)

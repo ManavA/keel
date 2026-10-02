@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -561,6 +562,7 @@ func TestDecider_RefusesWhatIsTooLargeToCopy(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "policy:")
 		assert.Contains(t, err.Error(), "10000")
+		assert.ErrorIs(t, err, policy.ErrUnrecordable, "no retry will make the action smaller")
 		assert.Equal(t, policy.Decision{}, got)
 		assert.False(t, got.Effect.Valid())
 		assert.Empty(t, rec.recs, "nothing was recorded")
@@ -585,6 +587,7 @@ func TestDecider_RefusesWhatIsTooLargeToCopy(t *testing.T) {
 		require.NoError(t, err)
 		got, err := d.Decide(t.Context(), policy.Action{Kind: "read", Attrs: map[string]any{"list": flat(20000)}})
 		require.Error(t, err)
+		assert.ErrorIs(t, err, policy.ErrUnrecordable)
 		assert.Equal(t, policy.Decision{}, got)
 	})
 
@@ -594,6 +597,7 @@ func TestDecider_RefusesWhatIsTooLargeToCopy(t *testing.T) {
 		assert.Nil(t, d)
 		assert.Contains(t, err.Error(), "policy: new decider")
 		assert.Contains(t, err.Error(), "10000")
+		assert.NotErrorIs(t, err, policy.ErrUnrecordable, "a policy is not a record")
 	})
 
 	t.Run("the bound is on the whole policy, not on each condition", func(t *testing.T) {
@@ -666,3 +670,44 @@ func TestDecider_IsSafeForConcurrentUse(t *testing.T) {
 	wg.Wait()
 	assert.Len(t, rec.Records(), goroutines*each)
 }
+
+// errStore is what a store that keeps nothing says of a record it can never
+// hold, with the sentinel the Recorder documents.
+var errStore = fmt.Errorf("store: that value cannot be written: %w", policy.ErrUnrecordable)
+
+// A record that can never be stored, whatever is retried, is told from one that
+// failed for a reason a later call may not meet, so that whoever retries a
+// failed decision does not retry for ever. The Decider gives no decision either
+// way.
+func TestDecider_ToldApartARecordThatCanNeverBeStoredFromOneThatFailed(t *testing.T) {
+	tests := []struct {
+		name             string
+		recorderErr      error
+		wantUnrecordable bool
+	}{
+		{"a database that is down", errDisk, false},
+		{"a record the store can never hold", errStore, true},
+		{"the same, wrapped again by the store", fmt.Errorf("pg: record: %w", errStore), true},
+		{"a failure joined to the sentinel", errors.Join(errDisk, policy.ErrUnrecordable), true},
+		{"a cancelled context", context.Canceled, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d, err := policy.NewDecider(deciderPolicy(), policy.Options{Recorder: errRecorder{tt.recorderErr}, Logger: slog.New(slog.DiscardHandler)})
+			require.NoError(t, err)
+			require.Equal(t, policy.Allow, deciderPolicy().Decide(policy.Action{Kind: "read"}).Effect, "the fixture")
+
+			got, err := d.Decide(t.Context(), policy.Action{Kind: "read"})
+
+			require.ErrorIs(t, err, tt.recorderErr, "the recorder's own error stays in the chain")
+			assert.Equal(t, tt.wantUnrecordable, errors.Is(err, policy.ErrUnrecordable))
+			assert.Equal(t, policy.Decision{}, got)
+			assert.NotEqual(t, policy.Allow, got.Effect)
+		})
+	}
+}
+
+// errRecorder fails every record with one error.
+type errRecorder struct{ err error }
+
+func (e errRecorder) Record(context.Context, policy.Record) error { return e.err }
