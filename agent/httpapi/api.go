@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
@@ -60,9 +61,12 @@ type Runs interface {
 type Options struct {
 	Runs Runs
 	// Actor names who is making a request, for the record of an approval or
-	// a cancellation. Nil, or a name with nothing in it but white space,
-	// refuses those requests with 403, so the zero value serves a read-only
-	// API. It is a name for the record and not a check: whoever it names may
+	// a cancellation. Nil, or a name that cannot be recorded, refuses those
+	// requests with 403, so the zero value serves a read-only API. A name is
+	// recorded for good, so one that is not text, is over 256 bytes after the
+	// white space round it is dropped, has a control character in it, or has no
+	// character to see in it (a name of only zero-width ones is nobody) is no
+	// name. It is a name for the record and not a check: whoever it names may
 	// decide anything the API can see.
 	Actor func(r *http.Request) string
 	// PollInterval is how often an event stream reads the journal. Default
@@ -143,7 +147,8 @@ func New(opts Options) (*API, error) {
 // A request to change something carries {"reason": "..."} or nothing, needs an
 // actor, and is refused with 403 when a browser makes it for another origin. An
 // id the engine does not know is 404, a request that cannot be acted on is 400,
-// and anything else the engine says is 500.
+// a request that was cut off or timed out is 503, and anything else the engine
+// says is 500.
 func (a *API) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Use(a.prepare)
@@ -166,8 +171,8 @@ func (a *API) Routes() chi.Router {
 }
 
 // refuseCrossOrigin answers 403 to a request that a browser makes for a page
-// on another origin. It is not authentication: it says nothing of who is
-// asking, which is Options.Actor's to say.
+// on another origin. It is not authentication, and says nothing of who is
+// asking: Options.Actor only names the caller, for the record.
 func (a *API) refuseCrossOrigin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := a.crossOrigin.Check(r); err != nil {
@@ -199,29 +204,46 @@ func (a *API) prepare(next http.Handler) http.Handler {
 	})
 }
 
-// fail answers a failure of the engine. A client that has gone is told nothing
-// and nothing is raised: whatever the engine was doing when it found out, the
-// fault is not the service's. Otherwise a name the engine does not know is 404,
-// whatever its form: the engine judges it. What has been settled already is
-// 409. A request whose time ran out with the client still there is 503, and
-// anything else is the service's fault and says nothing of itself. The cause is
-// in the log.
+// fail answers a failure of the engine, and always with a status: a handler
+// that wrote nothing would answer 200, and a client that reads only the status
+// would take a decision that was not made for one that was.
+//
+// What the engine answered comes first, and is true whatever became of the
+// request: a name it does not know is 404, whatever its form, and what has been
+// settled already is 409. After those, a request whose context is done is 503.
+// A cancelled context does not say the client has gone (a server shutting down,
+// a client that half-closes after sending, and a mount's middleware all cancel
+// it with the client still reading), so it is answered, with a line at debug
+// level and not an alarm: it costs nothing if the client is gone and is true if
+// not. A context past its deadline is the router's timeout, with the client
+// still there, and is 503 too. Anything else is the service's fault and says
+// nothing of itself. The cause is in the log.
 func fail(w http.ResponseWriter, r *http.Request, what string, err error) {
 	err = fmt.Errorf("agent/httpapi: %s: %w", what, err)
 	ctx := r.Context()
 	switch {
-	case errors.Is(ctx.Err(), context.Canceled):
-		httpx.Logger(ctx).LogAttrs(ctx, slog.LevelDebug, "request abandoned",
-			slog.String("method", r.Method), slog.String("path", r.URL.Path), slog.Any("error", err))
 	case errors.Is(err, agent.ErrNotFound):
 		httpx.NotFound(w, r)
 	case errors.Is(err, agent.ErrAlreadyDecided), errors.Is(err, agent.ErrFinished):
 		httpx.Error(w, r, http.StatusConflict, err)
+	case errors.Is(ctx.Err(), context.Canceled):
+		unavailable(w, r, err)
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		httpx.Error(w, r, http.StatusServiceUnavailable, err)
 	default:
 		httpx.InternalError(w, r, err)
 	}
+}
+
+// unavailable answers 503 for a request that was cut off, and logs it at debug
+// level. httpx.Error would log it as a failure, so the generic body is made
+// with a logger that discards.
+func unavailable(w http.ResponseWriter, r *http.Request, err error) {
+	ctx := r.Context()
+	httpx.Logger(ctx).LogAttrs(ctx, slog.LevelDebug, "request cut off",
+		slog.String("method", r.Method), slog.String("path", r.URL.Path), slog.Any("error", err))
+	quiet := httpx.WithLogger(ctx, slog.New(slog.DiscardHandler))
+	httpx.Error(w, r.WithContext(quiet), http.StatusServiceUnavailable, err)
 }
 
 func (a *API) getRun(w http.ResponseWriter, r *http.Request) {
@@ -483,14 +505,14 @@ func (a *API) decide(call func(ctx context.Context, approvalID, by, reason strin
 
 // actorAndReason is what the three routes that change something start with. It
 // names the actor and reads the reason, and answers the request itself,
-// returning false, when no one is named or the body is not acceptable. A name
-// is what is left after the white space round it, and nothing left is no one:
-// a decision recorded under no name is a decision by nobody. The actor is asked
-// first: a request with no one to record is not read a body. Whether the actor
-// may do this is not asked here at all, and is the mount's to decide.
+// returning false, when no one is named, or the body cannot be read, or is not
+// acceptable. A name that cannot be recorded is no one: a decision recorded
+// under it would be a decision by nobody. The actor is asked first: a request
+// with no one to record is not read a body. Whether the actor may do this is
+// not asked here at all, and is the mount's to decide.
 func (a *API) actorAndReason(w http.ResponseWriter, r *http.Request) (by, reason string, ok bool) {
 	if a.actor != nil {
-		by = strings.TrimSpace(a.actor(r))
+		by = recordable(a.actor(r))
 	}
 	if by == "" {
 		httpx.Error(w, r, http.StatusForbidden, errors.New("agent/httpapi: the request names no actor"))
@@ -498,11 +520,56 @@ func (a *API) actorAndReason(w http.ResponseWriter, r *http.Request) (by, reason
 	}
 	reason, err := readReason(w, r)
 	if err != nil {
-		httpx.BadRequest(w, r, fmt.Errorf("agent/httpapi: %w", err))
+		err = fmt.Errorf("agent/httpapi: %w", err)
+		var failed *readFailure
+		if errors.As(err, &failed) {
+			unavailable(w, r, err)
+		} else {
+			httpx.BadRequest(w, r, err)
+		}
 		return "", "", false
 	}
 	return by, reason, true
 }
+
+// maxActorBytes bounds an actor's name, which is recorded for good.
+const maxActorBytes = 256
+
+// recordable is the name an actor gave, as it is recorded, or "" when it is
+// nobody. The name comes from the mount, which is trusted to say who is acting
+// and not to say it in a form that can be kept. The white space round it is
+// dropped. What is left must be text (valid UTF-8), no longer than 256 bytes,
+// hold no control character (a newline, a NUL, a tab, a line or paragraph
+// separator), and have something to see in it: a letter, a mark, a number,
+// punctuation or a symbol, so a name of only zero-width or other format
+// characters, which show as nothing, is nobody.
+func recordable(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > maxActorBytes || !utf8.ValidString(name) {
+		return ""
+	}
+	visible := false
+	for _, c := range name {
+		switch {
+		case unicode.IsControl(c), unicode.Is(unicode.Zl, c), unicode.Is(unicode.Zp, c):
+			return ""
+		case unicode.IsLetter(c), unicode.IsMark(c), unicode.IsNumber(c), unicode.IsPunct(c), unicode.IsSymbol(c):
+			visible = true
+		}
+	}
+	if !visible {
+		return ""
+	}
+	return name
+}
+
+// readFailure is a body that could not be read, as against one that was read and
+// is not acceptable: the client left, or the connection broke, and nothing was
+// wrong with what it sent.
+type readFailure struct{ err error }
+
+func (e *readFailure) Error() string { return "read body: " + e.err.Error() }
+func (e *readFailure) Unwrap() error { return e.err }
 
 // readReason reads the one thing a body may say. No body, an empty one and an
 // empty object all say nothing; anything else that is not an object with only
@@ -516,7 +583,11 @@ func readReason(w http.ResponseWriter, r *http.Request) (string, error) {
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
-		return "", fmt.Errorf("read body: %w", err)
+		var tooLong *http.MaxBytesError
+		if errors.As(err, &tooLong) {
+			return "", fmt.Errorf("read body: %w", err)
+		}
+		return "", &readFailure{err}
 	}
 	if !utf8.Valid(body) {
 		return "", errors.New("read body: not valid UTF-8")

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -955,23 +956,43 @@ func TestFailures_WhenTheRequestIsOver(t *testing.T) {
 				return doCtx(t, ctx, h, r.method, r.path, r.body, "X-Actor", "sam"), &sink
 			}
 
-			t.Run("a client that went away is told nothing and raises no alarm", func(t *testing.T) {
+			// A cancelled context does not say the client has gone: a server
+			// shutting down, a client that half-closes after sending and a mount's
+			// middleware all cancel it with the client still reading. The answer is
+			// 503, which is true if the client is there and costs nothing if not,
+			// and it is not an alarm.
+			t.Run("a request that was cancelled, and failed, is 503 and no alarm", func(t *testing.T) {
 				for name, err := range map[string]error{
 					"a cancelled call":        fmt.Errorf("store: %w", context.Canceled),
 					"any error at all":        errStoreDown,
 					"a deadline of its own":   fmt.Errorf("store: %w", context.DeadlineExceeded),
 					"the store's own failure": errors.New("connection reset"),
-					"an answer that stands":   agent.ErrNotFound,
 				} {
 					rec, sink := serve(t, gone(), err)
-					assert.Zero(t, rec.Body.Len(), name)
-					assert.Equal(t, http.StatusOK, rec.Code, "%s: no status was written", name)
-					assert.Empty(t, rec.Header().Get("Content-Type"), name)
+					requireError(t, rec, http.StatusServiceUnavailable)
 					assert.Empty(t, sink.atLeast(slog.LevelInfo), name)
 					logged := sink.all()
 					require.Len(t, logged, 1, name)
 					assert.Equal(t, slog.LevelDebug, logged[0].Level, name)
 					assert.Contains(t, logged[0].Attrs["error"], err.Error(), name)
+				}
+			})
+
+			// What the engine answered is true whatever became of the request.
+			t.Run("an answer the engine gave stands, in any state of the request", func(t *testing.T) {
+				for _, ctx := range []context.Context{context.Background(), gone(), timedOut()} {
+					for _, answer := range []struct {
+						err  error
+						want int
+					}{
+						{agent.ErrNotFound, http.StatusNotFound},
+						{agent.ErrAlreadyDecided, http.StatusConflict},
+						{agent.ErrFinished, http.StatusConflict},
+						{fmt.Errorf("wrapped: %w", agent.ErrNotFound), http.StatusNotFound},
+					} {
+						rec, _ := serve(t, ctx, answer.err)
+						requireError(t, rec, answer.want)
+					}
 				}
 			})
 
@@ -993,11 +1014,196 @@ func TestFailures_WhenTheRequestIsOver(t *testing.T) {
 		})
 	}
 
-	t.Run("an answer the store gave stands while the client is still there", func(t *testing.T) {
-		f := newFake().fail("GetRun", agent.ErrNotFound)
-		rec := doCtx(t, timedOut(), newAPI(t, f), http.MethodGet, "/runs/"+uid(1), "")
-		requireError(t, rec, http.StatusNotFound)
+}
+
+// No route leaves the status it starts with after a failure. A handler that
+// writes nothing answers 200, and a client that reads only the status takes a
+// decision that was not made for one that was. Every route, with the request
+// live, cancelled and past its deadline, and every kind of failure, answers
+// with an error status and a body.
+func TestFailures_NeverEndInASuccessStatus(t *testing.T) {
+	type route struct{ pattern, path, call string }
+	routes := []route{
+		{"GET /runs", "/runs", "ListRuns"},
+		{"GET /runs/{id}", "/runs/" + uid(1), "GetRun"},
+		{"GET /runs/{id}/timeline", "/runs/" + uid(1) + "/timeline", "Changes"},
+		{"GET /runs/{id}/events", "/runs/" + uid(1) + "/events", "Changes"},
+		{"HEAD /runs/{id}/events", "/runs/" + uid(1) + "/events", "GetRun"},
+		{"POST /runs/{id}/cancel", "/runs/" + uid(1) + "/cancel", "Cancel"},
+		{"GET /approvals", "/approvals", "ListApprovals"},
+		{"POST /approvals/{id}/approve", "/approvals/" + uid(50) + "/approve", "Approve"},
+		{"POST /approvals/{id}/decline", "/approvals/" + uid(50) + "/decline", "Decline"},
+	}
+
+	t.Run("the table has every route", func(t *testing.T) {
+		var served, tabled []string
+		require.NoError(t, chi.Walk(newAPI(t, newFake()), func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+			served = append(served, method+" "+route)
+			return nil
+		}))
+		for _, r := range routes {
+			tabled = append(tabled, r.pattern)
+		}
+		slices.Sort(served)
+		slices.Sort(tabled)
+		assert.Equal(t, served, tabled, "a route added to the API is added to this table")
 	})
+
+	contexts := map[string]func(t *testing.T) context.Context{
+		"live": func(*testing.T) context.Context { return context.Background() },
+		"cancelled": func(*testing.T) context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx
+		},
+		"past its deadline": func(t *testing.T) context.Context {
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			t.Cleanup(cancel)
+			return ctx
+		},
+	}
+	failures := map[string]error{
+		"a store error":      errStoreDown,
+		"a cancelled call":   fmt.Errorf("store: %w", context.Canceled),
+		"a call out of time": fmt.Errorf("store: %w", context.DeadlineExceeded),
+		"not found":          agent.ErrNotFound,
+		"already decided":    agent.ErrAlreadyDecided,
+		"finished":           agent.ErrFinished,
+		"another sentinel":   agent.ErrConflict,
+	}
+	for _, r := range routes {
+		for ctxName, newCtx := range contexts {
+			for failure, err := range failures {
+				t.Run(r.pattern+"/"+ctxName+"/"+failure, func(t *testing.T) {
+					f := mutationFake().fail(r.call, err)
+					method, _, _ := strings.Cut(r.pattern, " ")
+					rec := doCtx(t, newCtx(t), newAPI(t, f), method, r.path, "", "X-Actor", "sam")
+					assert.GreaterOrEqual(t, rec.Code, 400, "a failed call is never a success: %s", rec.Body.String())
+					assert.NotEmpty(t, rec.Body.String(), "and says so")
+					assert.NotEmpty(t, f.calls, "the call was made")
+				})
+			}
+		}
+	}
+}
+
+// failingBody is a request body that gives some bytes and then fails.
+type failingBody struct {
+	data string
+	err  error
+	read bool
+}
+
+func (b *failingBody) Read(p []byte) (int, error) {
+	if b.read {
+		return 0, b.err
+	}
+	b.read = true
+	return copy(p, b.data), nil
+}
+
+// A body that cannot be read to the end is a client that left, or a connection
+// that broke: not a body that was wrong, and not a 400 with a warning.
+func TestMutations_ABodyThatFailsToReadIsNotABadRequest(t *testing.T) {
+	for _, m := range mutations() {
+		t.Run(m.name, func(t *testing.T) {
+			path := fmt.Sprintf(m.path, m.pending)
+			for name, err := range map[string]error{
+				"a reset":              errors.New("read tcp: connection reset by peer"),
+				"cut short":            io.ErrUnexpectedEOF,
+				"the context's own":    context.Canceled,
+				"a deadline in a read": context.DeadlineExceeded,
+			} {
+				for ctxName, cancelled := range map[string]bool{"cancelled": true, "live": false} {
+					t.Run(name+"/"+ctxName, func(t *testing.T) {
+						var sink logSink
+						f := mutationFake()
+						ctx, cancel := context.WithCancel(context.Background())
+						defer cancel()
+						if cancelled {
+							cancel()
+						}
+						req := httptest.NewRequestWithContext(ctx, http.MethodPost, path, &failingBody{data: `{"reason":"par`, err: err})
+						req.Header.Set("X-Actor", "sam")
+						rec := httptest.NewRecorder()
+						newAPI(t, f, func(o *httpapi.Options) { o.Logger = sink.logger() }).ServeHTTP(rec, req)
+
+						requireError(t, rec, http.StatusServiceUnavailable)
+						assert.Empty(t, f.calls, "nothing was decided")
+						assert.Empty(t, sink.atLeast(slog.LevelInfo), "a client leaving is not a fault")
+						logged := sink.all()
+						require.Len(t, logged, 1)
+						assert.Equal(t, slog.LevelDebug, logged[0].Level)
+					})
+				}
+			}
+			t.Run("a body that is too long is still the client's mistake", func(t *testing.T) {
+				f := mutationFake()
+				rec := do(t, newAPI(t, f), http.MethodPost, path, `{"reason":"`+strings.Repeat("a", 5000)+`"}`, "X-Actor", "sam")
+				requireError(t, rec, http.StatusBadRequest)
+			})
+		})
+	}
+}
+
+// The name an actor gives is recorded for good, and comes from the mount, which
+// is trusted to say who is acting and not to say it in a form that can be
+// recorded. A name that is not text, or holds a control character, or is
+// without a character anyone can see, or is long, is no name.
+func TestMutations_RefuseAnActorNameThatCannotBeRecorded(t *testing.T) {
+	longest := strings.Repeat("a", 256)
+	refused := map[string]string{
+		"not UTF-8":                    "sam\xff",
+		"a lone continuation byte":     "\x80sam",
+		"a NUL":                        "sam\x00lee",
+		"a NUL at the end":             "sam\x00",
+		"a line feed inside":           "sam\nlee",
+		"a carriage return inside":     "sam\rlee",
+		"a tab inside":                 "sam\tlee",
+		"a bell":                       "sam\x07",
+		"a delete":                     "sam\x7flee",
+		"a next line inside":           "sam\u0085lee",
+		"a line separator inside":      "sam\u2028lee",
+		"a paragraph separator inside": "sam\u2029lee",
+		"257 bytes":                    longest + "a",
+		"257 bytes after trimming":     "  " + longest + "a  ",
+		"long in multi-byte letters":   strings.Repeat("\u00e9", 129),
+		"only a zero-width space":      "\u200b",
+		"only a byte order mark":       "\ufeff",
+		"only a soft hyphen":           "\u00ad",
+		"only a zero-width joiner":     "\u200d",
+		"only format characters":       "\u200b\u200d\u2060\ufeff\u00ad",
+		"format characters and spaces": " \u200b \u00a0\ufeff ",
+	}
+	accepted := []string{
+		"sam", "Sam Lee", "sam.lee@example.com", "o'brien", "\u674e\u96f7", "ops-team/3", "user 42", "+",
+		"!", "42", "\u2160", "e\u0301", longest, strings.Repeat("\u00e9", 128), "\u200bsam\u200b",
+	}
+	for _, m := range mutations() {
+		t.Run(m.name, func(t *testing.T) {
+			path := fmt.Sprintf(m.path, m.pending)
+			for name, who := range refused {
+				t.Run("refuses "+name, func(t *testing.T) {
+					f := mutationFake()
+					h := newAPI(t, f, func(o *httpapi.Options) { o.Actor = func(*http.Request) string { return who } })
+					rec := do(t, h, http.MethodPost, path, "")
+					requireError(t, rec, http.StatusForbidden)
+					assert.Empty(t, f.calls)
+				})
+			}
+			for _, who := range accepted {
+				t.Run("accepts "+strconv.Quote(who), func(t *testing.T) {
+					f := mutationFake()
+					h := newAPI(t, f, func(o *httpapi.Options) { o.Actor = func(*http.Request) string { return who } })
+					rec := do(t, h, http.MethodPost, path, "")
+					require.Equal(t, m.status, rec.Code, rec.Body.String())
+					call, ok := m.seen(f)
+					require.True(t, ok)
+					assert.Equal(t, who, call.By)
+				})
+			}
+		})
+	}
 }
 
 // A journal is private to whoever is allowed to see it: nothing is kept.

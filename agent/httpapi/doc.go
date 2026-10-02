@@ -19,9 +19,11 @@
 //
 // The three routes that change something (cancel, approve, decline) need Actor
 // to name the caller and answer 403 without a name, or with one that is
-// nothing but white space: the zero [Options] serves a read-only surface. A
-// reason that is not valid UTF-8 or has a NUL in it is refused with 400, since
-// a database could not keep it. Everything but the stream is sent with
+// nothing but white space, or with one that cannot be recorded (it is not text,
+// holds a control character, is over 256 bytes, or has nothing to see in it,
+// as a name of only zero-width characters has not): the zero [Options] serves a
+// read-only surface. A reason that is not valid UTF-8 or has a NUL in it is
+// refused with 400, since a database could not keep it. Everything but the stream is sent with
 // Cache-Control: no-store. A step's provider-private form,
 // Message.Opaque, which can hold the model's own reasoning, is removed from
 // every step before it is served, on the timeline and on the stream.
@@ -34,18 +36,21 @@
 // says so or, with no such header, when its Origin is not its host; one with
 // neither header is a server-side client or a tool such as curl, and passes.
 // This closes the hole of a cookie session being driven by a form on another
-// site. It is not authentication: it says nothing of who is asking, which is
-// Actor's to say, and it does not guard reading or the stream, which change
-// nothing.
+// site. It is not authentication, and says nothing of who is asking: Actor
+// only names the caller, for the record. It does not guard reading or the
+// stream, which change nothing.
 //
 // # Ids and errors
 //
 // An id in a path or a filter is given to the engine as written. Whether it
 // has the form of an id is the store's to say, and one that does not names
 // nothing: 404, not 400. A failure answers with httpx's generic body and the
-// cause goes to the log; but a request whose client has gone is logged at debug
-// level and given no status, and one whose time ran out with the client still
-// there is 503. A listing's limit and status, a cursor, and a body
+// cause goes to the log. What the engine answered is told whatever became of
+// the request. A request that was cut off (its context cancelled, which a
+// server shutting down, a client that half-closes after sending and a mount's
+// middleware all do with the client still reading) or whose time ran out is
+// 503, the first logged at debug level and not as a fault; no failure leaves
+// the status a handler starts with, since that would read as success. A listing's limit and status, a cursor, and a body
 // that is over 4 KiB or says more than a reason are refused with 400 rather
 // than clamped or ignored. A cursor is the client's input, and is read
 // strictly: one that does not decode, or whose time does not parse, or whose

@@ -3524,17 +3524,28 @@ var _ Runs = (*agent.Engine)(nil)
 
 Responses go through `httpx.JSON`, and failures through `httpx.NotFound`,
 `httpx.BadRequest` and `httpx.Error`, so error bodies are the generic ones
-and the reason is in the log. A request whose client has gone is logged at
-debug level and is given no status, and one whose time ran out with the
-client still there is 503. Everything but the stream is sent with
+and the reason is in the log. What the engine answered (`ErrNotFound`, the
+two conflicts) is told whatever became of the request. After that, a request
+whose context was cancelled is 503, logged at debug level and not as a
+fault: a cancelled context does not say the client has gone (a server
+shutting down, a client that half-closes after sending and a mount's
+middleware cancel it with the client still reading), so it is answered, which
+costs nothing if the client is gone. One whose time ran out is 503 too. No
+failure leaves the status a handler starts with, which would read as success;
+a body that cannot be read to the end is treated as a cancelled call, and one
+that is too long is 400. Everything but the stream is sent with
 `Cache-Control: no-store`: it is journal content. `Message.Opaque` is removed
 from every step before it is served: it is the provider's private data,
 large, and of no use to a reader.
 
 The three routes that change something need `Options.Actor` to return a
-name, and answer 403 without one; a name is what is left after the white
-space round it, so one of nothing but white space is no name. The zero
-`Options` therefore serves a read-only surface. `Actor` is a name for the
+name, and answer 403 without one. A name is recorded for good, so it is
+what is left after the white space round it, and it is no name when it is
+empty, is not valid UTF-8, is over 256 bytes, holds a control character (a
+newline, a NUL, a tab, a line or paragraph separator), or has nothing to see
+in it (no letter, mark, number, punctuation or symbol, so a name of only
+zero-width characters is nobody). The zero `Options` therefore serves a
+read-only surface. `Actor` is a name for the
 record and not an authorisation: the package does not authenticate and does
 not decide who may decide which approval, so anyone `Actor` names can
 approve, decline or cancel anything the API can see, and authorisation is
@@ -3549,7 +3560,7 @@ such header and an `Origin` other than its host, is refused with 403 unless
 the protection trusts that origin; a request with neither header, which is a
 server-side client and not a browser acting for a page, passes. It closes the
 cross-site form post against a cookie session, and nothing more: it is not
-authentication, `Actor` still decides who is acting, and it does not guard
+authentication, `Actor` only names who is acting, for the record, and it does not guard
 the reads or the stream, which change nothing.
 
 A cursor comes from the client, so it is input and is decoded strictly, in
@@ -3587,13 +3598,16 @@ any stream starts. Then, through `httpx.NewEventStream`:
 4. Wait `PollInterval`, sending a comment line every `Heartbeat` while
    nothing is sent (any send restarts the wait), and go to 2. Return when
    the request's context ends, when a send fails (the client has gone and
-   the stream is unusable), or when a read fails: the stream then ends with
-   no `end` event, which is how a client knows to reconnect from the id it
-   has, and the cause is logged.
+   the stream is unusable), when a read fails, or when an event cannot be
+   encoded (a step whose stored arguments are not JSON). In the last two the
+   stream ends with no `end` event, which is how a client knows to reconnect
+   from the id it has, and the cause is logged: a read that failed because
+   the request is over quietly, and an event that cannot be encoded as a
+   fault, since the client will meet it again at every reconnect.
 
 A `HEAD` request on the route is answered with the headers a stream has
-and no stream, after the same lookup, and the package keeps the two in step
-with a test; a stream started for a `HEAD` would only wait for the client to
+and no stream, after a `GetRun` for the 404 (a GET's lookup is its first
+`Changes`), and the package keeps the two in step with a test; a stream started for a `HEAD` would only wait for the client to
 leave. A writer that cannot flush is answered with an ordinary 500, before
 anything is written.
 

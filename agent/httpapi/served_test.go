@@ -21,6 +21,7 @@ var servedFields = []string{
 	"Approval.ExpiresAt", "Approval.ID", "Approval.Input", "Approval.Reason", "Approval.RequestedAt",
 	"Approval.Rev", "Approval.Rule", "Approval.RunID", "Approval.Seq", "Approval.Status", "Approval.Tool",
 	"Call.ID", "Call.Input", "Call.Malformed", "Call.Name",
+	"Changes.Approvals", "Changes.Run", "Changes.Steps",
 	"Limits.MaxCostMicros", "Limits.MaxDuration", "Limits.MaxModelCalls", "Limits.MaxTokens",
 	"Message.Calls", "Message.Results", "Message.Role", "Message.Text",
 	"Result.CallID", "Result.Content", "Result.IsError",
@@ -76,6 +77,7 @@ func TestServedTypes_HaveOnlyFieldsSomeoneDecidedOn(t *testing.T) {
 	seen := map[reflect.Type]bool{}
 	for _, root := range []reflect.Type{
 		reflect.TypeFor[agent.Run](), reflect.TypeFor[agent.Step](), reflect.TypeFor[agent.Approval](),
+		reflect.TypeFor[agent.Changes](), // the timeline, which is served whole
 	} {
 		reachable(root, seen, &found)
 	}
