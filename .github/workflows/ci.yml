@@ -36,7 +36,7 @@ jobs:
       - name: Database-backed tests
         env:
           KEEL_REQUIRE_DB: "1"
-        run: go test -count=1 ./pg/... ./examples/... ./auth/pg/... ./admin/pg/... ./app/...
+        run: go test -count=1 ./pg/... ./examples/... ./auth/pg/... ./admin/pg/... ./policy/pg/... ./agent/... ./app/...
 
       # Its own step, so a migration that does not replay is reported as that
       # rather than as one failure among a package's worth. ARCHITECTURE.md
