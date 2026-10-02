@@ -2,6 +2,7 @@ package pg_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -715,4 +716,69 @@ func TestExecutor_AnAnswerThatLandsAsARunWithTwoQuestionsParksIsActedOnAtOnce(t 
 	require.NoError(t, err)
 	assert.Equal(t, agent.StatusCompleted, got.Status)
 	assert.Equal(t, "both are sent", got.Output)
+}
+
+// A reply whose arguments or provider form are not JSON, or not UTF-8, is
+// one this store refuses, and would refuse on every retry. The executor
+// journals it as a store can keep it: the arguments as one JSON string on a
+// malformed call, which is answered and never run, and the provider form
+// dropped.
+func TestExecutor_AReplyNoColumnCanKeepIsJournaledAsOneItCan(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		held  string
+	}{
+		{"not JSON", `{"to":`, `{"to":`},
+		{"JSON, and not UTF-8", "{\"to\":\"\xff\"}", "{\"to\":\"�\"}"},
+		{"a NUL character", "{\x00}", "{\x00}"},
+	}
+	w := newBatchWorld(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w.t = t
+			w.empty()
+			log := &toolLog{}
+			model := agenttest.NewModel(agenttest.ByAgent(map[string]agenttest.Script{
+				"lead": func(_ agent.Request, turn int) (agent.Response, error) {
+					if turn > 0 {
+						return agenttest.Say("it could not be read"), nil
+					}
+					return agent.Response{
+						Message: agent.Message{
+							Role: agent.RoleAssistant,
+							Calls: []agent.Call{
+								{ID: "call-1", Name: "lookup", Input: []byte(tt.input)},
+								{ID: "call-2", Name: "lookup", Input: []byte(`{"order":7}`)},
+							},
+							Opaque: &agent.Opaque{Provider: "vendor", Data: []byte(tt.input)},
+						},
+						Stop: agent.StopToolUse,
+					}, nil
+				},
+			}))
+			p := w.process("worker-1", log, model, nil)
+			lead, err := p.engine.Start(t.Context(), agent.StartRequest{Agent: "lead", Input: "look it up"})
+			require.NoError(t, err)
+
+			got, err := p.engine.Execute(t.Context(), lead.ID)
+
+			require.NoError(t, err)
+			require.Equal(t, agent.StatusCompleted, got.Status, got.Error)
+			assert.Zero(t, got.Failures)
+			steps := w.changes(lead.ID).Steps
+			require.Equal(t, []string{"1 model completed", "2 lookup completed", "3 lookup completed", "4 model completed"},
+				journalLines(steps))
+			assert.Nil(t, steps[0].Message.Opaque)
+			require.NotNil(t, steps[1].Call)
+			assert.True(t, steps[1].Call.Malformed)
+			var held string
+			require.NoError(t, json.Unmarshal(steps[1].Call.Input, &held))
+			assert.Equal(t, tt.held, held)
+			assert.Equal(t, "arguments were not valid JSON", steps[1].Result)
+			assert.True(t, steps[1].IsError)
+			assert.Empty(t, log.byKey()[agent.StepKey(lead.ID, 2)], "a malformed call is never run")
+			assert.Len(t, log.byKey()[agent.StepKey(lead.ID, 3)], 1)
+		})
+	}
 }
