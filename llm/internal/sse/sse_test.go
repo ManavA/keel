@@ -79,14 +79,19 @@ func TestReader_Next(t *testing.T) {
 			want:   []event{{Data: "one", ID: "42"}, {Data: "two"}},
 		},
 		{
-			name:   "a stream that ends without the final blank line still gives its last event",
-			stream: "data: one\n\nevent: b\ndata: two\n",
-			want:   []event{{Data: "one"}, {Name: "b", Data: "two"}},
+			name:   "a stream that ends after an event with no data ended cleanly",
+			stream: "data: one\n\nevent: ping\n\n",
+			want:   []event{{Data: "one"}},
 		},
 		{
-			name:   "a stream that ends in the middle of a line still gives its last event",
-			stream: "data: one\n\ndata: two",
-			want:   []event{{Data: "one"}, {Data: "two"}},
+			name:   "a comment after the last event is not an event cut short",
+			stream: "data: one\n\n: bye\n",
+			want:   []event{{Data: "one"}},
+		},
+		{
+			name:   "nor is a comment the stream ends in the middle of",
+			stream: "data: one\n\n: by",
+			want:   []event{{Data: "one"}},
 		},
 		{
 			name:   "an event with no data is skipped, and its name does not reach the next",
@@ -191,7 +196,7 @@ func TestReader_ALineLongerThanTheReadBuffer(t *testing.T) {
 }
 
 func TestReader_EndOfStreamIsSticky(t *testing.T) {
-	r := sse.NewReader(strings.NewReader("data: one\n"))
+	r := sse.NewReader(strings.NewReader("data: one\n\n"))
 
 	ev, err := r.Next()
 	require.NoError(t, err)
@@ -199,8 +204,94 @@ func TestReader_EndOfStreamIsSticky(t *testing.T) {
 
 	for range 3 {
 		_, err = r.Next()
-		assert.ErrorIs(t, err, io.EOF)
+		assert.Equal(t, io.EOF, err, "a clean end is io.EOF itself, as io.Reader gives it")
 	}
+}
+
+// A stream that stops before the blank line that ends an event did not end:
+// the connection dropped. The event is not handed out as though it were
+// whole, and the error is one a provider can tell from a clean end.
+func TestReader_StreamCutInTheMiddleOfAnEvent(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream string
+		want   []event
+	}{
+		{
+			name:   "after a data line, with no blank line",
+			stream: "data: one\n\nevent: b\ndata: two\n",
+			want:   []event{{Data: "one"}},
+		},
+		{
+			name:   "in the middle of a data line",
+			stream: "data: one\n\ndata: {\"type\":\"content_block_de",
+			want:   []event{{Data: "one"}},
+		},
+		{
+			name:   "in the middle of a field name",
+			stream: "data: one\n\nda",
+			want:   []event{{Data: "one"}},
+		},
+		{
+			name:   "after an event field, before any data",
+			stream: "data: one\n\nevent: b\n",
+			want:   []event{{Data: "one"}},
+		},
+		{
+			name:   "in the first event",
+			stream: "data: one\n",
+			want:   nil,
+		},
+		{
+			name:   "after a comment inside the event",
+			stream: "data: one\n: keep-alive\n",
+			want:   nil,
+		},
+		{
+			name:   "with carriage returns, one line feed short",
+			stream: "data: one\r\n\r\ndata: two\r\n\r",
+			want:   []event{{Data: "one"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := sse.NewReader(strings.NewReader(tt.stream))
+
+			var got []event
+			var err error
+			for {
+				var ev sse.Event
+				if ev, err = r.Next(); err != nil {
+					break
+				}
+				got = append(got, event{Name: ev.Name, Data: string(ev.Data), ID: ev.ID})
+			}
+
+			assert.Equal(t, tt.want, got, "only the events that were complete are returned")
+			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			assert.NotErrorIs(t, err, io.EOF)
+			assert.Contains(t, err.Error(), "sse: ")
+
+			_, again := r.Next()
+			assert.Equal(t, err, again, "the failure is returned again, not replaced by io.EOF")
+		})
+	}
+}
+
+// A transport that reports the truncation itself is told apart the same way.
+func TestReader_TruncatedBodyIsUnexpectedEOF(t *testing.T) {
+	r := sse.NewReader(io.MultiReader(
+		strings.NewReader("data: one\n\n"),
+		iotest.ErrReader(io.ErrUnexpectedEOF),
+	))
+
+	_, err := r.Next()
+	require.NoError(t, err)
+
+	_, err = r.Next()
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.NotErrorIs(t, err, io.EOF)
 }
 
 func TestReader_EventDataIsNotReused(t *testing.T) {

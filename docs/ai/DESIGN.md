@@ -720,9 +720,26 @@ type Reader struct{ /* unexported fields */ }
 func NewReader(r io.Reader) *Reader
 
 // Next returns the next event. It skips comment lines and events with no
-// data, and returns io.EOF when the stream ends.
+// data, and returns io.EOF when the stream ends after a complete event. A
+// stream that ends in the middle of an event, with no blank line after it,
+// is a connection that dropped: the event is not returned, and the error
+// wraps io.ErrUnexpectedEOF.
 func (r *Reader) Next() (Event, error)
 ```
+
+How a stream ends matters to a provider, so the reader tells the two ways
+apart. A stream that ends between events, after the blank line that closes
+the last one, returns `io.EOF`. A stream that ends after any field line, or
+part of one, with no blank line to close the event, did not end: the
+connection dropped. `Next` then returns an error wrapping
+`io.ErrUnexpectedEOF` and never the partial event, which is what the standard
+says to do with it. A transport that notices the truncation itself gives the
+same error, so both providers test for one thing and report it as a
+transport failure, an `*llm.Error` with `Err` set, retryable unless the
+context ended. A failed read is returned wrapped, so `errors.Is` still finds
+its cause, and once `Next` has returned an error it returns that error
+again. Decisions 36 to 39 in section 12 record the rest of what the reader
+does and does not read.
 
 ### 4.3 What each piece does
 
@@ -740,10 +757,21 @@ each tool call as one delta, then returns what `Generate` would have. It is
 safe for concurrent use.
 
 **`EstimateInputTokens`.** One token per three bytes of the system prompt,
-message text, tool arguments, tool results, tool definitions and output
-schema, plus eight per message, rounded up. It is an upper estimate for
-English text and not a tokenizer; it exists so a budget can refuse a call
-before making it.
+the messages, the tool definitions and the output schema, rounded up once
+over their sum, plus eight per message. A message is counted in whichever of
+its two forms is larger: its text, tool arguments and tool results, or the
+bytes of its `Opaque.Data`. A provider is sent one form or the other, and its
+own form of a turn also carries what the fields do not show, such as
+thinking blocks and their signatures. A tool definition is its name,
+description and schema, and the output schema its name, description and
+JSON. It is an upper estimate for English text and not a tokenizer; it
+exists so a budget can refuse a call before making it.
+
+This rule changed while the contracts task was built. It first counted
+message text, tool arguments and tool results and left `Opaque` out, which
+made the estimate low for a conversation that replays thinking blocks, and
+so made `Budgeted`'s worst case low. Decisions 33 to 35 in section 12 record
+the change and what else the count includes.
 
 **`HashEmbedder`.** Each input is lowercased and split on anything that is
 not a letter or a digit; each token is hashed with FNV-1a to a dimension and
@@ -3994,3 +4022,59 @@ rejected and why. The first nine are the ones worth a second opinion.
     `httpapi` all compile against `agent.Store` and `agent.Step`; one
     commit of types, transcribed from this document, is what lets the rest
     proceed in separate worktrees.
+
+The contracts task met seven places where this document was silent. Two
+were ruled on by the project lead, 35 and 36; the others stand as the task
+chose them.
+
+33. **`EstimateInputTokens` sums the bytes and rounds once.** It counts the
+    system prompt, each message, each tool definition as its name,
+    description and schema, and the output schema as its name, description
+    and JSON; divides the total by three, rounding up; and adds eight per
+    message. Rejected: rounding each part, which adds up to a token for
+    every field and makes the figure depend on how a request is divided.
+
+34. **Ids and names inside a message are not counted.** Tool-call ids and
+    names and the call ids on results are short and fixed in number per
+    call. Rejected: counting them, for an estimate whose three bytes a
+    token and eight tokens a message already leave more room than they
+    take.
+
+35. **A message is estimated by the larger of its two forms.** Its text,
+    tool arguments and tool results, or the bytes of its `Opaque.Data`.
+    Rejected: leaving `Opaque` out, as 4.3 first read, which is low for a
+    turn replayed with its thinking blocks and signatures; and counting
+    both forms, since a provider is sent one or the other.
+
+36. **A stream that ends in the middle of an event is an error.**
+    `sse.Reader.Next` returns an error wrapping `io.ErrUnexpectedEOF` and
+    does not return the event. Rejected: returning the partial event, to
+    suit a server that closes straight after its last data line. A provider
+    cannot tell that from a dropped connection, and a final event cut short
+    and read as whole is a wrong reply, where an error is a transport
+    failure the caller may retry. An event is under way once any field
+    line, or part of one, has been read since the last blank line; a
+    stream that ends in or after a comment between events ended cleanly.
+
+37. **An event's `ID` is its own.** Rejected: the standard's rule that the
+    last id carries onto the events after it. That rule serves a client
+    that reconnects, which this reader does not do, and neither provider
+    sends ids.
+
+38. **The reader implements the part of the standard the providers use.**
+    Lines end in a line feed, with or without a carriage return before it;
+    a bare carriage return is not a line ending; a leading byte order mark
+    is not removed; `retry` is ignored. A `data` field with an empty value
+    is data, so its event is returned with empty `Data`; an event with no
+    `data` field is skipped, and its name does not carry to the next.
+    Rejected: the whole standard, which needs a line-ending state machine
+    for input neither provider sends.
+
+39. **`MaxEventBytes` measures an event's lines as they arrive.** It is the
+    sum of the lengths of the event's field lines, without their line
+    endings. Comment lines are not counted and not held, so keep-alive
+    comments of any number or length do not reach it. The check is made
+    while a line is being read, so a line that never ends is refused at the
+    bound. Rejected: checking the assembled event, which allocates first
+    and checks after. The error is not exported, since no caller has a
+    decision to make about it.

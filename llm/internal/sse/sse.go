@@ -5,6 +5,11 @@
 // it; a bare carriage return is not a line ending, and a leading byte order
 // mark is not removed. The retry field is ignored, and an id belongs to the
 // event that carries it instead of persisting onto the events after it.
+//
+// A stream is only over when it ends between events. One that stops before
+// the blank line that would end an event is reported as io.ErrUnexpectedEOF,
+// the same error a transport gives for a body cut short, so a provider can
+// treat both as the connection failing.
 package sse
 
 import (
@@ -28,7 +33,10 @@ type Event struct {
 	ID   string
 }
 
-var errTooLarge = fmt.Errorf("sse: event is larger than %d bytes", MaxEventBytes)
+var (
+	errTooLarge = fmt.Errorf("sse: event is larger than %d bytes", MaxEventBytes)
+	errCutShort = fmt.Errorf("sse: stream ended in the middle of an event: %w", io.ErrUnexpectedEOF)
+)
 
 // Reader reads events from a stream.
 type Reader struct {
@@ -46,9 +54,10 @@ func NewReader(r io.Reader) *Reader {
 }
 
 // Next returns the next event. It skips comment lines and events with no
-// data, and returns io.EOF when the stream ends. An event the stream ends
-// in the middle of, with no blank line after it, is still returned: some
-// servers close the connection straight after their last data line.
+// data, and returns io.EOF when the stream ends after a complete event. A
+// stream that ends in the middle of an event, with no blank line after it,
+// is a connection that dropped: the event is not returned, and the error
+// wraps io.ErrUnexpectedEOF.
 func (r *Reader) Next() (Event, error) {
 	if r.err != nil {
 		return Event{}, r.err
@@ -63,11 +72,20 @@ func (r *Reader) Next() (Event, error) {
 	)
 	for {
 		line, comment, err := r.readLine(MaxEventBytes - size)
-		if err != nil && !errors.Is(err, io.EOF) {
+		if errors.Is(err, io.EOF) {
+			// line is what was left after the last line ending. With that,
+			// or with fields read and no blank line to end them, the stream
+			// stopped part way through an event.
+			r.err = io.EOF
+			if size > 0 || len(line) > 0 {
+				r.err = errCutShort
+			}
+			return Event{}, r.err
+		}
+		if err != nil {
 			r.err = err
 			return Event{}, err
 		}
-		ended := err != nil
 
 		switch {
 		case comment:
@@ -87,9 +105,6 @@ func (r *Reader) Next() (Event, error) {
 			case "id":
 				ev.ID = string(value)
 			}
-		case ended:
-			// The stream stopped after a line ending, so this is the end
-			// of the input and not a blank line.
 		case hasData:
 			return ev, nil
 		default:
@@ -97,21 +112,13 @@ func (r *Reader) Next() (Event, error) {
 			// belong to an event that is skipped.
 			ev, size = Event{}, 0
 		}
-
-		if ended {
-			r.err = io.EOF
-			if hasData {
-				return ev, nil
-			}
-			return Event{}, io.EOF
-		}
 	}
 }
 
 // readLine reads one line and returns it without its line ending, or
 // reports that it was a comment, which is consumed without being kept. The
-// error is io.EOF when the stream ended with this line, which may still hold
-// the text of a last line that had no line ending.
+// error is io.EOF when the stream ended with this line, which then holds
+// whatever followed the last line ending.
 //
 // room is how many bytes the line may add to its event. The check is made as
 // the line arrives, so a line that never ends is refused once it has outgrown

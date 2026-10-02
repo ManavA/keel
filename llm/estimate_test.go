@@ -73,6 +73,62 @@ func TestEstimateInputTokens(t *testing.T) {
 			},
 			want: 16 + 4,
 		},
+		{
+			// A provider that replays its own form sends thinking blocks and
+			// signatures the text and tool calls do not show.
+			name: "a provider's form larger than the message's fields is what is counted",
+			req: llm.Request{Messages: []llm.Message{{
+				Role:   llm.RoleAssistant,
+				Text:   "abc",
+				Opaque: &llm.Opaque{Provider: "anthropic", Data: json.RawMessage(strings.Repeat("o", 30))},
+			}}},
+			want: 8 + 10,
+		},
+		{
+			// Another provider builds the turn from the fields instead.
+			name: "a provider's form smaller than the message's fields is not",
+			req: llm.Request{Messages: []llm.Message{{
+				Role:      llm.RoleAssistant,
+				Text:      strings.Repeat("a", 18),
+				ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "read", Input: json.RawMessage(`{"id":"abcd"}`)}},
+				Opaque:    &llm.Opaque{Provider: "anthropic", Data: json.RawMessage(`[]`)},
+			}}},
+			want: 8 + (18+13+2)/3,
+		},
+		{
+			name: "the two forms of one turn are never both counted",
+			req: llm.Request{Messages: []llm.Message{{
+				Role:   llm.RoleAssistant,
+				Text:   strings.Repeat("a", 30),
+				Opaque: &llm.Opaque{Provider: "anthropic", Data: json.RawMessage(strings.Repeat("o", 30))},
+			}}},
+			want: 8 + 10,
+		},
+		{
+			name: "the larger form is chosen for each message on its own",
+			req: llm.Request{Messages: []llm.Message{
+				{
+					Role:   llm.RoleAssistant,
+					Text:   "abc",
+					Opaque: &llm.Opaque{Provider: "anthropic", Data: json.RawMessage(strings.Repeat("o", 30))},
+				},
+				{
+					Role:   llm.RoleAssistant,
+					Text:   strings.Repeat("a", 30),
+					Opaque: &llm.Opaque{Provider: "anthropic", Data: json.RawMessage(`[]`)},
+				},
+			}},
+			want: 16 + 20,
+		},
+		{
+			name: "a provider's form with no data counts as the fields",
+			req: llm.Request{Messages: []llm.Message{{
+				Role:   llm.RoleAssistant,
+				Text:   strings.Repeat("a", 30),
+				Opaque: &llm.Opaque{Provider: "anthropic"},
+			}}},
+			want: 8 + 10,
+		},
 	}
 
 	for _, tt := range tests {
@@ -130,6 +186,32 @@ func TestEstimateInputTokens_NeverFallsAsARequestGrows(t *testing.T) {
 				return r
 			},
 			mustRise: true,
+		},
+		{
+			// Thinking blocks and their signatures: what a replayed turn
+			// costs beyond its text. This is the case a budget's worst case
+			// must not come out low for.
+			name: "an assistant turn whose provider's form is larger than its text",
+			grow: func(r llm.Request) llm.Request {
+				r.Messages = append(append([]llm.Message(nil), r.Messages...), llm.Message{
+					Role:   llm.RoleAssistant,
+					Text:   "ok",
+					Opaque: &llm.Opaque{Provider: "anthropic", Data: json.RawMessage(strings.Repeat("o", 3000))},
+				})
+				return r
+			},
+			mustRise: true,
+		},
+		{
+			name: "a provider's form put on every message already there",
+			grow: func(r llm.Request) llm.Request {
+				messages := append([]llm.Message(nil), r.Messages...)
+				for i := range messages {
+					messages[i].Opaque = &llm.Opaque{Provider: "anthropic", Data: json.RawMessage(`[{"type":"text"}]`)}
+				}
+				r.Messages = messages
+				return r
+			},
 		},
 		{
 			name: "a tool with a one-byte name",
