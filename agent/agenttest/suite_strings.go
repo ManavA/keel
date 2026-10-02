@@ -418,7 +418,7 @@ func cursorCases() []storeCase {
 		{"a cursor whose id is not a UUID in the one form is refused", func(k *kit) {
 			runs, instants := stored(k)
 			ids := map[string]string{
-				"no id at all":                 malformedID,
+				"no UUID at all":               malformedID,
 				"a run's id in upper case":     upperCase(runs[4].ID),
 				"a run's id without hyphens":   noHyphens(runs[4].ID),
 				"a run's id with space around": " " + runs[4].ID + " ",
