@@ -717,6 +717,58 @@ func TestParse_ErrorTextNamesThePackageOnce(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(err.Error(), "policy:"), err.Error())
 }
 
+// A threshold past what is compared says which bound it is past, not only that
+// it is not a number.
+func TestValidate_NamesTheBoundANumberIsPast(t *testing.T) {
+	tests := []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{name: "an exponent past the bound", value: json.Number("1e99999"), want: "exponent past 4096"},
+		{name: "a negative exponent past it", value: json.Number("1e-4097"), want: "exponent past 4096"},
+		{name: "an exponent just past it", value: json.Number("1e4097"), want: "exponent past 4096"},
+		{name: "text longer than the bound", value: json.Number(strings.Repeat("9", 4097)), want: "more than 4096 bytes"},
+		{name: "text that is not a number", value: json.Number("abc"), want: "not a JSON number"},
+		{name: "text that is a number but not JSON's", value: json.Number("+5"), want: "not a JSON number"},
+		{name: "empty text", value: json.Number(""), want: "not a JSON number"},
+	}
+	for _, tt := range tests {
+		for _, op := range []policy.Op{policy.OpGt, policy.OpEq} {
+			t.Run(string(op)+" with "+tt.name, func(t *testing.T) {
+				p := policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: cond("x", op, tt.value)}}}
+				err := p.Validate()
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.want)
+				assert.Contains(t, err.Error(), string(op)+" needs a number")
+			})
+		}
+	}
+
+	t.Run("an element of a list", func(t *testing.T) {
+		p := policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: cond("x", policy.OpIn, []any{1, json.Number("1e99999")})}}}
+		err := p.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "in list element 1")
+		assert.Contains(t, err.Error(), "exponent past 4096")
+	})
+
+	t.Run("and through Parse", func(t *testing.T) {
+		_, err := policy.Parse([]byte(`{"rules": [{"name": "r", "effect": "block", "when": {"attrs": [{"attr": "x", "op": "gt", "value": 1e99999}]}}]}`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "policy: parse")
+		assert.Contains(t, err.Error(), "gt needs a number")
+		assert.Contains(t, err.Error(), "exponent past 4096")
+	})
+
+	t.Run("the largest that is compared is accepted", func(t *testing.T) {
+		for _, v := range []json.Number{"1e4096", "1e-4096", json.Number(strings.Repeat("9", 4096))} {
+			p := policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: cond("x", policy.OpGt, v)}}}
+			assert.NoError(t, p.Validate(), "%.20s", v)
+		}
+	})
+}
+
 func TestValidate_NamesNaNAsNaN(t *testing.T) {
 	for _, op := range []policy.Op{policy.OpEq, policy.OpNe, policy.OpGt, policy.OpGte, policy.OpLt, policy.OpLte} {
 		for name, v := range map[string]any{"float64": math.NaN(), "float32": float32(math.NaN())} {
@@ -746,7 +798,7 @@ func TestValidate_RefusesWhatCannotMatchOrMatchesTooMuchByMistake(t *testing.T) 
 		{name: "exists false with eq on the same attribute", p: rule(existsFalse, policy.Cond{Attr: "x", Op: policy.OpEq, Value: 1}), want: []string{`rule 0 ("r")`, "conditions 0 and 1", `"x"`, "exists false"}},
 		{name: "exists false after another condition on the attribute", p: rule(policy.Cond{Attr: "x", Op: policy.OpGt, Value: 1}, existsFalse), want: []string{"conditions 0 and 1", `"x"`, "exists false"}},
 		{name: "exists false with exists true", p: rule(existsFalse, policy.Cond{Attr: "x", Op: policy.OpExists, Value: true}), want: []string{"conditions 0 and 1", "exists false"}},
-		{name: "exists false with another exists false", p: rule(existsFalse, existsFalse), want: []string{"conditions 0 and 1", "exists false"}},
+		{name: "exists false written twice", p: rule(existsFalse, existsFalse), want: []string{`rule 0 ("r")`, "conditions 0 and 1", `"x"`, "exists false is written twice"}},
 		{name: "exists false with in", p: rule(existsFalse, policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{"a"}}), want: []string{"exists false"}},
 		{name: "exists false with ne", p: rule(existsFalse, policy.Cond{Attr: "x", Op: policy.OpNe, Value: "a"}), want: []string{"exists false"}},
 		{name: "exists false with a condition between them", p: rule(existsFalse, policy.Cond{Attr: "y", Op: policy.OpEq, Value: 1}, policy.Cond{Attr: "x", Op: policy.OpLt, Value: 1}), want: []string{"conditions 0 and 2", `"x"`}},
@@ -786,6 +838,18 @@ func TestValidate_RefusesWhatCannotMatchOrMatchesTooMuchByMistake(t *testing.T) 
 			assert.NoError(t, tt.p.Validate())
 		})
 	}
+
+	t.Run("a repeated exists false says it is repeated, and not that something else is combined with it", func(t *testing.T) {
+		err := rule(existsFalse, existsFalse).Validate()
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "combined")
+		assert.NotContains(t, err.Error(), "never meets")
+
+		err = rule(existsFalse, policy.Cond{Attr: "x", Op: policy.OpEq, Value: 1}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "combined")
+		assert.NotContains(t, err.Error(), "written twice")
+	})
 
 	t.Run("Parse refuses them too", func(t *testing.T) {
 		_, err := policy.Parse([]byte(`{"rules": [{"name": "r", "effect": "block", "when": {"target": "*"}}]}`))

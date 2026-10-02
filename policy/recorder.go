@@ -2,6 +2,8 @@ package policy
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"reflect"
 	"slices"
 	"sync"
@@ -31,12 +33,20 @@ const defaultMemoryRecords = 1000
 // that never reads it does not grow with every decision; a Decider built with
 // Options.MemoryRecords keeps another number. What it keeps and what it returns
 // are copies, down to the lists and objects inside an action's attributes. It
-// is safe for concurrent use.
+// is safe for concurrent use, and its zero value is ready to use.
 type MemoryRecorder struct {
 	mu   sync.Mutex
-	keep int
-	recs []Record // at most keep; once full, a ring whose oldest is at next
+	keep int      // how many to keep; zero or less is the default
+	recs []Record // at most the bound; once full, a ring whose oldest is at next
 	next int
+}
+
+// bound is how many records m keeps.
+func (m *MemoryRecorder) bound() int {
+	if m.keep > 0 {
+		return m.keep
+	}
+	return defaultMemoryRecords
 }
 
 func newMemoryRecorder(keep int) *MemoryRecorder {
@@ -48,17 +58,22 @@ func NewMemoryRecorder() *MemoryRecorder {
 	return newMemoryRecorder(defaultMemoryRecords)
 }
 
-// Record implements Recorder. It keeps a copy of rec, and cannot fail.
+// Record implements Recorder. It keeps a copy of rec. It fails only when rec
+// holds more than 10000 values to copy, since a record kept with its inside
+// shared with the caller could be changed by the caller.
 func (m *MemoryRecorder) Record(_ context.Context, rec Record) error {
-	rec = rec.clone()
+	rec, err := rec.clone(maxCopyValues)
+	if err != nil {
+		return fmt.Errorf("policy: record: %w", err)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.recs) < m.keep {
+	if bound := m.bound(); len(m.recs) >= bound {
+		m.recs[m.next] = rec
+		m.next = (m.next + 1) % bound
+	} else {
 		m.recs = append(m.recs, rec)
-		return nil
 	}
-	m.recs[m.next] = rec
-	m.next = (m.next + 1) % m.keep
 	return nil
 }
 
@@ -68,24 +83,30 @@ func (m *MemoryRecorder) Records() []Record {
 	defer m.mu.Unlock()
 	out := make([]Record, len(m.recs))
 	for i := range m.recs {
-		out[i] = m.recs[(m.next+i)%len(m.recs)].clone()
+		// Kept records were copied within the bound, so copying one out cannot
+		// exceed it, and needs none.
+		out[i], _ = m.recs[(m.next+i)%len(m.recs)].clone(noCopyLimit)
 	}
 	return out
 }
 
-// clone copies everything in r that a caller could change in place.
-func (r Record) clone() Record {
-	r.Action = r.Action.clone()
+// clone copies everything in r that a caller could change in place, or fails if
+// that is more than budget values.
+func (r Record) clone(budget int) (Record, error) {
+	action, err := r.Action.clone(budget)
+	r.Action = action
 	r.Decision = r.Decision.clone()
-	return r
+	return r, err
 }
 
-// clone copies the attributes, down to every list and object inside them.
-func (a Action) clone() Action {
-	if attrs, ok := copyValue(a.Attrs).(map[string]any); ok {
+// clone copies the attributes, down to every list and object inside them, or
+// fails if that is more than budget values.
+func (a Action) clone(budget int) (Action, error) {
+	c := newCopier(budget)
+	if attrs, ok := c.value(a.Attrs).(map[string]any); ok {
 		a.Attrs = attrs
 	}
-	return a
+	return a, c.err()
 }
 
 // clone copies the lists in d.
@@ -95,45 +116,82 @@ func (d Decision) clone() Decision {
 	return d
 }
 
-// maxCopyDepth bounds how far copyValue follows a value, so that one that
-// refers to itself cannot loop. Past it a value is shared, not copied.
-const maxCopyDepth = 64
+// How far a copy follows a value, and how much of it. The depth bound stops a
+// value that refers to itself; the count of values bounds the work, which depth
+// alone does not: a value that shares a child twice at every level is a few
+// levels deep and doubles with each. A copy past either bound fails, and its
+// result is not used. A few thousand values is ample for an action's attributes
+// or a policy's conditions.
+const (
+	maxCopyDepth  = 64
+	maxCopyValues = 10000
+	noCopyLimit   = math.MaxInt
+)
 
-// copyValue returns a copy of v that shares no list, object, pointer target or
-// array with it, however deeply they nest. What Go cannot copy is shared: a
-// function, a channel, and the unexported fields of a struct.
-func copyValue(v any) any {
+var errCopyTooLarge = fmt.Errorf("more than %d values to copy", maxCopyValues)
+
+// copier copies values, each one a copy that shares no list, object, pointer
+// target or array with its original, however deeply they nest. What Go cannot
+// copy is shared: a function, a channel, and the unexported fields of a struct.
+// Everything one copier copies counts against one budget.
+type copier struct {
+	left int
+	over bool
+}
+
+func newCopier(budget int) *copier {
+	return &copier{left: budget}
+}
+
+// value returns a copy of v. After the budget or the depth bound is passed, what
+// it returns is not a copy, and err says so.
+func (c *copier) value(v any) any {
 	if v == nil {
 		return nil
 	}
-	return copyReflect(reflect.ValueOf(v), 0).Interface()
+	return c.reflect(reflect.ValueOf(v), 0).Interface()
 }
 
-func copyReflect(v reflect.Value, depth int) reflect.Value {
-	if depth > maxCopyDepth {
+// err reports whether a copy went past its budget.
+func (c *copier) err() error {
+	if c.over {
+		return errCopyTooLarge
+	}
+	return nil
+}
+
+func (c *copier) reflect(v reflect.Value, depth int) reflect.Value {
+	if c.over || depth > maxCopyDepth {
 		return v
 	}
-	switch v.Kind() {
-	case reflect.Interface:
+	// An interface is the value inside it, and is not counted twice.
+	if v.Kind() == reflect.Interface {
 		if v.IsNil() {
 			return v
 		}
 		out := reflect.New(v.Type()).Elem()
-		out.Set(copyReflect(v.Elem(), depth+1))
+		out.Set(c.reflect(v.Elem(), depth+1))
 		return out
+	}
+	if c.left <= 0 {
+		c.over = true
+		return v
+	}
+	c.left--
+	switch v.Kind() {
 	case reflect.Slice:
 		if v.IsNil() {
 			return v
 		}
 		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
 		for i := range v.Len() {
-			out.Index(i).Set(copyReflect(v.Index(i), depth+1))
+			out.Index(i).Set(c.reflect(v.Index(i), depth+1))
 		}
 		return out
 	case reflect.Array:
 		out := reflect.New(v.Type()).Elem()
 		for i := range v.Len() {
-			out.Index(i).Set(copyReflect(v.Index(i), depth+1))
+			out.Index(i).Set(c.reflect(v.Index(i), depth+1))
 		}
 		return out
 	case reflect.Map:
@@ -142,7 +200,7 @@ func copyReflect(v reflect.Value, depth int) reflect.Value {
 		}
 		out := reflect.MakeMapWithSize(v.Type(), v.Len())
 		for iter := v.MapRange(); iter.Next(); {
-			out.SetMapIndex(iter.Key(), copyReflect(iter.Value(), depth+1))
+			out.SetMapIndex(iter.Key(), c.reflect(iter.Value(), depth+1))
 		}
 		return out
 	case reflect.Pointer:
@@ -150,14 +208,14 @@ func copyReflect(v reflect.Value, depth int) reflect.Value {
 			return v
 		}
 		out := reflect.New(v.Type().Elem())
-		out.Elem().Set(copyReflect(v.Elem(), depth+1))
+		out.Elem().Set(c.reflect(v.Elem(), depth+1))
 		return out
 	case reflect.Struct:
 		out := reflect.New(v.Type()).Elem()
 		out.Set(v)
 		for i := range v.NumField() {
 			if f := out.Field(i); f.CanSet() {
-				f.Set(copyReflect(v.Field(i), depth+1))
+				f.Set(c.reflect(v.Field(i), depth+1))
 			}
 		}
 		return out

@@ -124,6 +124,27 @@ func TestMemoryRecorder_KeepsTheMostRecentRecords(t *testing.T) {
 	})
 }
 
+// A MemoryRecorder that was not built with a bound, and one built with none,
+// keep the default number and do not panic.
+func TestMemoryRecorder_ANonPositiveBoundIsTheDefault(t *testing.T) {
+	for name, m := range map[string]*MemoryRecorder{
+		"the zero value": {},
+		"zero":           newMemoryRecorder(0),
+		"negative":       newMemoryRecorder(-3),
+	} {
+		t.Run(name, func(t *testing.T) {
+			for i := range defaultMemoryRecords + 5 {
+				require.NoError(t, m.Record(t.Context(), Record{Action: Action{Kind: strconv.Itoa(i)}}))
+			}
+			got := m.Records()
+			require.Len(t, got, defaultMemoryRecords)
+			assert.Equal(t, "5", got[0].Action.Kind)
+			assert.Equal(t, strconv.Itoa(defaultMemoryRecords+4), got[len(got)-1].Action.Kind)
+			assert.LessOrEqual(t, len(m.recs), defaultMemoryRecords, "what is held is bounded")
+		})
+	}
+}
+
 func kinds(recs []Record) []string {
 	out := make([]string, len(recs))
 	for i, r := range recs {

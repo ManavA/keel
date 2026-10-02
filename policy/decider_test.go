@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -526,6 +527,121 @@ func TestDecider_HandsTheRecorderACopy(t *testing.T) {
 		assert.Equal(t, action(), a)
 		assert.Equal(t, []string{"a", "b"}, got.Matched)
 		assert.Equal(t, policy.Ask, got.Effect)
+	})
+}
+
+// The copy of a policy or an action is bounded in work, not only in depth: a
+// value that shares a child twice at every level would otherwise double at each
+// level. Past a few thousand values NewDecider refuses the policy, and Decide
+// returns an error and no decision, as when a record cannot be written.
+func TestDecider_RefusesWhatIsTooLargeToCopy(t *testing.T) {
+	flat := func(n int) []any {
+		list := make([]any, n)
+		for i := range list {
+			list[i] = "v" + strconv.Itoa(i)
+		}
+		return list
+	}
+	inRule := func(name string, values []any) policy.Rule {
+		return policy.Rule{Name: name, Effect: policy.Block, When: policy.Match{Attrs: []policy.Cond{{Attr: "a", Op: policy.OpIn, Value: values}}}}
+	}
+
+	t.Run("an action that shares a child at every level gets an error and no decision", func(t *testing.T) {
+		rec := &captureRecorder{}
+		var logs bytes.Buffer
+		d, err := policy.NewDecider(deciderPolicy(), policy.Options{Recorder: rec, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+		require.NoError(t, err)
+		action := policy.Action{Kind: "read", Target: "doc:private", Attrs: map[string]any{"deep": sharedChild(20), "secret": "hunter2"}}
+		require.Equal(t, policy.Allow, deciderPolicy().Decide(action).Effect, "the fixture is an action the policy allows")
+
+		started := time.Now()
+		got, err := d.Decide(t.Context(), action)
+		elapsed := time.Since(started)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "policy:")
+		assert.Contains(t, err.Error(), "10000")
+		assert.Equal(t, policy.Decision{}, got)
+		assert.False(t, got.Effect.Valid())
+		assert.Empty(t, rec.recs, "nothing was recorded")
+		assert.Less(t, elapsed, 2*time.Second, "the work is bounded, not only the depth")
+		assert.Contains(t, logs.String(), "level=ERROR")
+		assert.NotContains(t, logs.String(), "hunter2")
+		assert.NotContains(t, logs.String(), "doc:private")
+	})
+
+	t.Run("the same action without the sharing is decided and recorded", func(t *testing.T) {
+		rec := &captureRecorder{}
+		d, err := policy.NewDecider(deciderPolicy(), policy.Options{Recorder: rec})
+		require.NoError(t, err)
+		got, err := d.Decide(t.Context(), policy.Action{Kind: "read", Attrs: map[string]any{"list": flat(5000)}})
+		require.NoError(t, err)
+		assert.Equal(t, policy.Allow, got.Effect)
+		assert.Len(t, rec.recs, 1)
+	})
+
+	t.Run("a flat list too large for a record is refused too", func(t *testing.T) {
+		d, err := policy.NewDecider(deciderPolicy(), policy.Options{Recorder: &captureRecorder{}, Logger: slog.New(slog.DiscardHandler)})
+		require.NoError(t, err)
+		got, err := d.Decide(t.Context(), policy.Action{Kind: "read", Attrs: map[string]any{"list": flat(20000)}})
+		require.Error(t, err)
+		assert.Equal(t, policy.Decision{}, got)
+	})
+
+	t.Run("NewDecider refuses a policy with more values in its conditions than can be copied", func(t *testing.T) {
+		d, err := policy.NewDecider(policy.Policy{Rules: []policy.Rule{inRule("big", flat(20000))}}, policy.Options{})
+		require.Error(t, err)
+		assert.Nil(t, d)
+		assert.Contains(t, err.Error(), "policy: new decider")
+		assert.Contains(t, err.Error(), "10000")
+	})
+
+	t.Run("the bound is on the whole policy, not on each condition", func(t *testing.T) {
+		rules := []policy.Rule{inRule("a", flat(4000)), inRule("b", flat(4000)), inRule("c", flat(4000))}
+		d, err := policy.NewDecider(policy.Policy{Rules: rules}, policy.Options{})
+		require.Error(t, err)
+		assert.Nil(t, d)
+		d, err = policy.NewDecider(policy.Policy{Rules: rules[:2]}, policy.Options{})
+		require.NoError(t, err)
+		assert.Len(t, d.Policy().Rules, 2, "and what was accepted can be copied out")
+	})
+
+	// A value counts once, a list once and each element once; an interface is
+	// the value inside it. So the attributes map and a list of n strings are
+	// n+2 values, and a condition's list of n strings is n+1.
+	t.Run("the bound for an action is exact", func(t *testing.T) {
+		d, err := policy.NewDecider(deciderPolicy(), policy.Options{Recorder: &captureRecorder{}, Logger: slog.New(slog.DiscardHandler)})
+		require.NoError(t, err)
+		_, err = d.Decide(t.Context(), policy.Action{Kind: "read", Attrs: map[string]any{"list": make([]string, 9998)}})
+		assert.NoError(t, err, "10000 values")
+		got, err := d.Decide(t.Context(), policy.Action{Kind: "read", Attrs: map[string]any{"list": make([]string, 9999)}})
+		assert.Error(t, err, "10001 values")
+		assert.Equal(t, policy.Decision{}, got)
+	})
+
+	t.Run("the bound for a policy is exact", func(t *testing.T) {
+		strings := func(n int) []string {
+			list := make([]string, n)
+			for i := range list {
+				list[i] = "v" + strconv.Itoa(i)
+			}
+			return list
+		}
+		rule := func(n int) policy.Policy {
+			return policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: policy.Match{
+				Attrs: []policy.Cond{{Attr: "a", Op: policy.OpIn, Value: strings(n)}},
+			}}}}
+		}
+		_, err := policy.NewDecider(rule(9999), policy.Options{})
+		assert.NoError(t, err, "10000 values")
+		_, err = policy.NewDecider(rule(10000), policy.Options{})
+		assert.Error(t, err, "10001 values")
+	})
+
+	t.Run("a policy of ordinary size is accepted", func(t *testing.T) {
+		d, err := policy.NewDecider(policy.Policy{Rules: []policy.Rule{inRule("ok", flat(5000))}}, policy.Options{})
+		require.NoError(t, err)
+		assert.Equal(t, policy.Block, mustDecide(t, d, policy.Action{Kind: "k", Attrs: map[string]any{"a": "v4999"}}).Effect)
 	})
 }
 

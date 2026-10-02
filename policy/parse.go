@@ -255,9 +255,13 @@ func (m Match) check() error {
 			continue
 		}
 		for j, other := range m.Attrs {
-			if j != i && other.Attr == c.Attr {
-				return fmt.Errorf("conditions %d and %d on %q: exists false cannot be combined with another condition on the same attribute, which an attribute that is absent never meets", min(i, j), max(i, j), c.Attr)
+			if j == i || other.Attr != c.Attr {
+				continue
 			}
+			if otherAbsent, ok := boolOf(other.Value); other.Op == OpExists && ok && !otherAbsent {
+				return fmt.Errorf("conditions %d and %d on %q: exists false is written twice", min(i, j), max(i, j), c.Attr)
+			}
+			return fmt.Errorf("conditions %d and %d on %q: exists false cannot be combined with another condition on the same attribute, which an attribute that is absent never meets", min(i, j), max(i, j), c.Attr)
 		}
 	}
 	return nil
@@ -316,12 +320,18 @@ func (c Cond) check() error {
 	return nil
 }
 
-// describe names what v is, for an error: NaN by name, anything else by its Go
-// type.
+// describe names what v is, for an error: NaN by name, a json.Number that
+// cannot be compared by the bound it is past or the rule it breaks, anything
+// else by its Go type.
 func describe(v any) string {
 	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Float32 || rv.Kind() == reflect.Float64 {
 		if math.IsNaN(rv.Float()) {
 			return "NaN"
+		}
+	}
+	if n, ok := v.(json.Number); ok {
+		if _, fault := parseNumber(string(n)); fault != "" {
+			return "a json.Number that " + fault
 		}
 	}
 	return fmt.Sprintf("%T", v)

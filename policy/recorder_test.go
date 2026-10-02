@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -176,6 +177,101 @@ func TestMemoryRecorder_AValueThatRefersToItselfIsCopiedToABound(t *testing.T) {
 	}
 	assert.Greater(t, steps, 1, "the copy is a copy")
 	assert.Less(t, steps, 200, "and it ends")
+}
+
+// A MemoryRecorder that was declared and not built with NewMemoryRecorder works,
+// and keeps what a built one does.
+func TestMemoryRecorder_TheZeroValueWorks(t *testing.T) {
+	t.Run("a declared recorder", func(t *testing.T) {
+		var m policy.MemoryRecorder
+		assert.Empty(t, m.Records())
+		require.NoError(t, m.Record(t.Context(), record("read")))
+		require.NoError(t, m.Record(t.Context(), record("send")))
+		assert.Equal(t, []policy.Record{record("read"), record("send")}, m.Records())
+	})
+
+	t.Run("a pointer to an empty one", func(t *testing.T) {
+		m := &policy.MemoryRecorder{}
+		require.NoError(t, m.Record(t.Context(), record("read")))
+		assert.Equal(t, []policy.Record{record("read")}, m.Records())
+	})
+
+	t.Run("it keeps the most recent 1000, as a built one does", func(t *testing.T) {
+		var m policy.MemoryRecorder
+		for i := range 1250 {
+			require.NoError(t, m.Record(t.Context(), policy.Record{Action: policy.Action{Kind: strconv.Itoa(i)}}))
+		}
+		got := m.Records()
+		require.Len(t, got, 1000)
+		assert.Equal(t, "250", got[0].Action.Kind)
+		assert.Equal(t, "1249", got[999].Action.Kind)
+	})
+
+	t.Run("a Decider over it decides and records", func(t *testing.T) {
+		d, err := policy.NewDecider(policy.Policy{Default: policy.Allow}, policy.Options{Recorder: &policy.MemoryRecorder{}})
+		require.NoError(t, err)
+		got, err := d.Decide(t.Context(), policy.Action{Kind: "read"})
+		require.NoError(t, err)
+		assert.Equal(t, policy.Allow, got.Effect)
+	})
+
+	t.Run("a Decider over it keeps what it recorded", func(t *testing.T) {
+		m := &policy.MemoryRecorder{}
+		d, err := policy.NewDecider(policy.Policy{Default: policy.Allow}, policy.Options{Recorder: m})
+		require.NoError(t, err)
+		for _, k := range []string{"read", "write", "send"} {
+			_, err := d.Decide(t.Context(), policy.Action{Kind: k})
+			require.NoError(t, err)
+		}
+		got := m.Records()
+		require.Len(t, got, 3)
+		assert.Equal(t, "write", got[1].Action.Kind)
+	})
+
+	t.Run("first records from many goroutines at once", func(t *testing.T) {
+		m := &policy.MemoryRecorder{}
+		var wg sync.WaitGroup
+		for i := range 16 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				assert.NoError(t, m.Record(t.Context(), policy.Record{Action: policy.Action{Kind: strconv.Itoa(i)}}))
+			}()
+		}
+		wg.Wait()
+		assert.Len(t, m.Records(), 16)
+	})
+}
+
+// A record too large to copy is refused, not stored with its inside shared.
+func TestMemoryRecorder_RefusesARecordTooLargeToCopy(t *testing.T) {
+	m := policy.NewMemoryRecorder()
+	rec := record("send")
+	rec.Action.Attrs = map[string]any{"deep": sharedChild(20)}
+
+	started := time.Now()
+	err := m.Record(t.Context(), rec)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "10000")
+	assert.Less(t, time.Since(started), 2*time.Second, "the work is bounded, not only the depth")
+	assert.Empty(t, m.Records())
+
+	t.Run("and one at the bound is not", func(t *testing.T) {
+		rec := record("send")
+		rec.Action.Attrs = map[string]any{"list": make([]any, 4000)}
+		require.NoError(t, m.Record(t.Context(), rec))
+		assert.Len(t, m.Records(), 1)
+	})
+}
+
+// sharedChild is a value in which every level holds the same child twice, so
+// that copying it value by value doubles at every level.
+func sharedChild(levels int) any {
+	var v any = []any{"leaf"}
+	for range levels {
+		v = []any{v, v}
+	}
+	return v
 }
 
 func TestMemoryRecorder_IsSafeForConcurrentUse(t *testing.T) {

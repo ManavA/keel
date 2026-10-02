@@ -1229,14 +1229,21 @@ A `Match` holds when every part that is set holds:
   `OpNe` also compare strings and booleans; `OpGt`, `OpGte`, `OpLt`, `OpLte`
   hold only between numbers; `OpIn` holds when the attribute equals any
   element of the list in `Value`; `OpExists` compares presence with the
-  boolean in `Value`.
+  boolean in `Value`, and an attribute that is present and `null` is
+  present. Attribute names and string values are matched exactly as written,
+  as targets and kinds are: `Amount` is not `amount`, and `"prod "` is not
+  `"prod"`.
 
 **Three values.** A condition holds, does not hold, or cannot be told. It
 cannot be told when the attribute is present but its type is one the
 operator cannot compare: a string where a number is wanted, a boolean, a
 list, a pointer, `null`, NaN, a number written too long to compare, or a
 type different from the one the value is (`OpEq` of the number 5 against the
-string `"5"`). It also cannot be told when the condition itself is
+string `"5"`). `OpIn` is `OpEq` on each element joined by "or", and in three
+values: it holds if any element equals the attribute; it does not hold only
+if every element could be compared with the attribute and none equalled it;
+otherwise it cannot be told. A block rule on `in [22, "ssh"]` therefore
+blocks the attribute `"22"`, as `in [22]` and `eq 22` do. It also cannot be told when the condition itself is
 malformed, which only a `Policy` that skipped `Validate` can have: an
 operator that is not listed, or a value its operator cannot use. A target
 pattern that does not compile, on such a `Policy`, cannot be told either. A
@@ -1255,10 +1262,18 @@ so the record explains why a rule whose condition looks unmet decided. It is
 empty when the deciding rule matched for certain, and it belongs to the rule
 that decided, not to others that also matched.
 
-**Numbers.** A number is compared exactly. An integer is itself. A float is
-the shortest decimal that gives it back, so a `float64` 0.1 is the number
+**Numbers.** A number is compared exactly. An integer is itself. A float
+with an integer value is that integer, so a `float64` 2^70 is
+1180591620717411303424 and is above a threshold of 1180591620717411303000,
+and a `float32` 1000000064 is above 1000000062 (above 2^53 every float is an
+integer, and its shortest decimal is not the number it is). Any other float
+is the shortest decimal that gives it back, so a `float64` 0.1 is the number
 0.1 and meets a threshold written 0.1; comparing the binary value instead
-would leave 0.3 below a threshold of 0.3. A `json.Number` is the decimal it
+would leave 0.3 below a threshold of 0.3. The price of the first rule is
+that a `float64` 1e23, which is 99999999999999991611392, is below a
+threshold written 1e23. A number must reach the package unrounded: tool
+input decoded into a `float64` has already lost its digits, so decode it
+with `json.Decoder.UseNumber` and pass the `json.Number` on. A `json.Number` is the decimal it
 spells, of any size or precision up to 4096 bytes of text and an exponent of
 4096, which bounds what a hostile value can cost; text past either bound, or
 that is not a JSON number (no plus sign, no leading zero, no `Infinity`), is
@@ -1458,13 +1473,15 @@ type Recorder interface {
 }
 
 // MemoryRecorder is the in-process Recorder. It keeps the most recent 1000
-// decisions, and what it keeps and returns are deep copies.
+// decisions, and what it keeps and returns are deep copies. Its zero value is
+// ready to use.
 type MemoryRecorder struct{ /* unexported fields */ }
 
 // NewMemoryRecorder builds an empty MemoryRecorder.
 func NewMemoryRecorder() *MemoryRecorder
 
-// Record implements Recorder.
+// Record implements Recorder. It fails only when rec holds more than 10000
+// values to copy.
 func (m *MemoryRecorder) Record(ctx context.Context, rec Record) error
 
 // Records returns a copy of the log, oldest first.
@@ -1489,7 +1506,7 @@ type Decider struct{ /* unexported fields */ }
 
 // NewDecider builds a Decider. It returns an error when p does not validate.
 // The Decider takes a deep copy of the rules, every list and every value in
-// them.
+// them; a policy whose conditions hold more than 10000 values is refused.
 func NewDecider(p Policy, opts Options) (*Decider, error)
 
 // Decide decides a and records the decision. When the record cannot be
@@ -1542,7 +1559,7 @@ each means every kind, every target and no condition. Two conditions that
 contradict one another are not detected, with one exception: `OpExists` with
 value `false`, which says the attribute is absent, is refused together with
 any other condition on the same attribute, since an absent attribute meets
-none. A bare `*` target is refused, with a message that says to leave the
+none, and written twice it is refused as a repeat. A bare `*` target is refused, with a message that says to leave the
 target empty for every target. A rule named `RuleDefault` is refused, since
 the record would then not say whether a rule matched.
 
@@ -1654,6 +1671,11 @@ does afterwards, from any goroutine, changes the rules it decides under; to
 change the rules, build another. A `Recorder` is handed a deep copy of the
 record, so neither side can change what the other holds. What Go cannot
 copy (a function, a channel, the unexported fields of a struct) is shared.
+A copy is bounded in work: a policy whose conditions hold more than 10000
+values between them is refused by `NewDecider`, and an action whose
+attributes hold more is a record that cannot be written, so `Decide`
+returns an error and a zero `Decision`. `MemoryRecorder.Record` refuses such
+a record too, and its zero value is ready to use.
 
 `Decider.Decide` computes the decision and then records it. If the record
 cannot be written, it returns the error and a zero `Decision`. The zero
@@ -1709,7 +1731,9 @@ Without a database:
   change making the failure path return the computed decision goes red.
   A cancelled context; a recorder that panics; a policy with conditions,
   including an `in` list, changed after `NewDecider` and after `Policy()`,
-  and under `-race`; a recorder handed a copy; the bounded memory log.
+  and under `-race`; a recorder handed a copy; the bounded memory log; the
+  zero value of `MemoryRecorder`, alone and under a `Decider`; a value that
+  shares a child at every level.
 
 With `pg/testdb`: `policy/pg` records and lists; filters by effect, rule,
 kind and time; attributes survive the round trip; concurrent records all
@@ -4228,10 +4252,10 @@ chose them.
     straight past. Refusing at load time costs a startup error that names the
     rule and the condition. Not refused: an empty `Kinds`, `Target` or
     `Attrs`, which the design defines as "every", so a rule with no `when`
-    applies to every action; two conditions that contradict one another,
-    which is analysis this package does not do; and a target of `*`, which
-    `path.Match` does not let cross a slash, so it does not match a target
-    that holds one.
+    applies to every action; and two conditions that contradict one another,
+    which is analysis this package does not do. A bare `*` target, listed
+    here as not refused when this decision was first written, is refused:
+    see decision 43.
 
 41. **What cannot be evaluated counts toward the stricter outcome.** A
     condition holds, does not hold, or cannot be told; a rule with nothing
@@ -4246,16 +4270,28 @@ chose them.
     what the model meant and leaves `"abc"` to be allowed; and returning an
     error, which stops the run for what a person could settle with one
     answer. Asking is the outcome that leaves the decision to a person and
-    leaves the reason on the record. The same reading settles a rule that
+    leaves the reason on the record. `in` follows from the same reading: it
+    is `eq` on each element joined by "or", and unknown-or-false is unknown,
+    so it does not hold only when every element could be compared and none
+    equalled; `in [22, "ssh"]` against `"22"` cannot be told, and a block
+    rule blocks it, as `in [22]` and `eq 22` do. Rejected: reading it as not
+    held once any one element was comparable, which let the same attribute be
+    blocked by a list of one type and allowed by a list of two. The same reading settles a rule that
     cannot be evaluated at all: "does not match" is safe for an allow rule and
     for no other.
 
-42. **Numbers are compared exactly, a float as the shortest decimal that
-    gives it back, and `Parse` keeps every number as written.** Rejected:
-    `float64` for everything, which turns `9007199254740993` into
-    `9007199254740992` and a threshold into a different threshold; and the
-    exact binary value of a float, which leaves a `float64` 0.3 below a
-    threshold of 0.3. Text is read to 4096 bytes and an exponent of 4096, and
+42. **Numbers are compared exactly, a float with an integer value as that
+    integer and any other float as the shortest decimal that gives it back,
+    and `Parse` keeps every number as written.** Rejected: `float64` for
+    everything, which turns `9007199254740993` into `9007199254740992` and a
+    threshold into a different threshold; the exact binary value of every
+    float, which leaves a `float64` 0.3 below a threshold of 0.3; and the
+    shortest decimal of every float, which turns a `float64` 2^70 into
+    1180591620717411300000 and puts it below a threshold of
+    1180591620717411303000. The mixed rule has a price: a `float64` 1e23, which
+    is 99999999999999991611392, is below a threshold written 1e23. Tool input
+    must reach the package as `json.Number`, not as a `float64` that has
+    already rounded it. Text is read to 4096 bytes and an exponent of 4096, and
     past that cannot be told, because the value is a model's and an exponent
     of a million is an allocation of that size.
 
@@ -4275,7 +4311,11 @@ chose them.
     Every list and nested value of its policy is copied in and out, and a
     `Recorder` is handed a copy. Rejected: sharing a condition's value, which
     let a caller change a live rule through an `in` list and race with
-    `Decide`. The in-memory log keeps the most recent 1000 decisions,
+    `Decide`. The copy is bounded in work and not only in depth: a value that
+    shares a child twice at every level doubles at each, so more than 10000
+    values to copy is refused, by `NewDecider` for a policy and by `Decide`
+    with an error and no decision for an action, as when a record cannot be
+    written. The in-memory log keeps the most recent 1000 decisions,
     because with the zero `Options` it cannot be reached and growing with
     every decision is a leak. Targets are matched as written, with no
     normalisation, so whatever builds an `Action` puts them in one canonical

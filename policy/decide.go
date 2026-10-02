@@ -197,23 +197,24 @@ func ordered(op Op, x, y any) truth {
 	}
 }
 
-// in reports whether v equals an element of list. When it equals none, that is
-// a finding only if some element could be compared with it; a list of strings
-// says nothing about a number.
+// in is eq on each element of list, joined by "or": it holds if any element
+// equals v, and does not hold only if every element could be compared with v
+// and none equalled it. An element that could not be compared leaves the rest
+// unable to say, since it might have been the one: a list of 22 and "ssh" does
+// not rule out the string "22".
 func in(v, list any) truth {
 	rl := reflect.ValueOf(list)
-	compared := false
+	allCompared := true
 	for i := range rl.Len() {
 		equal, ok := compare(v, rl.Index(i).Interface())
-		if !ok {
-			continue
-		}
-		if equal {
+		switch {
+		case !ok:
+			allCompared = false
+		case equal:
 			return met
 		}
-		compared = true
 	}
-	if compared {
+	if allCompared {
 		return unmet
 	}
 	return unclear
@@ -249,14 +250,17 @@ const (
 
 // numberOf reads v as a number, whatever Go type holds it: any integer or float
 // type, a named type over one, or a json.Number. It is exact. An integer is the
-// integer it is; a float is the shortest decimal that gives it back, so a
-// float64 0.1 is the number 0.1 and a threshold written 0.1 meets it; text is
-// the decimal it spells, of any size or precision up to the bounds above, and
-// must be a JSON number. A NaN is not a number, nor is text that is not one.
+// integer it is. A float with an integer value is that integer, so a float64
+// 2^70 is 1180591620717411303424 and is above a threshold of
+// 1180591620717411303000. Any other float is the shortest decimal that gives it
+// back, so a float64 0.1 is the number 0.1 and a threshold written 0.1 meets
+// it. Text is the decimal it spells, of any size or precision up to the bounds
+// above, and must be a JSON number. A NaN is not a number, nor is text that is
+// not one.
 func numberOf(v any) (number, bool) {
 	if n, ok := v.(json.Number); ok {
-		r, ok := parseNumber(string(n))
-		return number{r: r}, ok
+		r, fault := parseNumber(string(n))
+		return number{r: r}, fault == ""
 	}
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
@@ -282,15 +286,30 @@ func floatNumber(f float64, bits int) (number, bool) {
 	case math.IsInf(f, -1):
 		return number{inf: -1}, true
 	}
+	if f == math.Trunc(f) {
+		return number{r: new(big.Rat).SetFloat64(f)}, true
+	}
 	r, ok := new(big.Rat).SetString(strconv.FormatFloat(f, 'e', -1, bits))
 	return number{r: r}, ok
 }
 
+// Why text is not a number that can be compared, as a phrase to follow "a
+// json.Number that".
+var (
+	faultNotNumber = "is not a JSON number"
+	faultTooLong   = "has more than " + strconv.Itoa(maxNumberText) + " bytes of text"
+	faultExponent  = "has an exponent past " + strconv.Itoa(maxNumberExponent)
+)
+
 // parseNumber reads text as a JSON number, and nothing looser: no plus sign, no
-// leading zero, no bare point, no "Infinity", no hex, no underscores.
-func parseNumber(s string) (*big.Rat, bool) {
-	if s == "" || len(s) > maxNumberText {
-		return nil, false
+// leading zero, no bare point, no "Infinity", no hex, no underscores. When it
+// cannot, it says why, in the phrases above; the empty string is success.
+func parseNumber(s string) (*big.Rat, string) {
+	if len(s) > maxNumberText {
+		return nil, faultTooLong
+	}
+	if s == "" {
+		return nil, faultNotNumber
 	}
 	isDigit := func(i int) bool { return i < len(s) && s[i] >= '0' && s[i] <= '9' }
 	i := 0
@@ -299,7 +318,7 @@ func parseNumber(s string) (*big.Rat, bool) {
 	}
 	switch {
 	case i == len(s):
-		return nil, false
+		return nil, faultNotNumber
 	case s[i] == '0':
 		i++
 	case isDigit(i):
@@ -307,7 +326,7 @@ func parseNumber(s string) (*big.Rat, bool) {
 			i++
 		}
 	default:
-		return nil, false
+		return nil, faultNotNumber
 	}
 	if i < len(s) && s[i] == '.' {
 		i++
@@ -316,7 +335,7 @@ func parseNumber(s string) (*big.Rat, bool) {
 			i++
 		}
 		if i == digits {
-			return nil, false
+			return nil, faultNotNumber
 		}
 	}
 	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
@@ -327,18 +346,22 @@ func parseNumber(s string) (*big.Rat, bool) {
 		digits, exp := i, 0
 		for isDigit(i) {
 			if exp = exp*10 + int(s[i]-'0'); exp > maxNumberExponent {
-				return nil, false
+				return nil, faultExponent
 			}
 			i++
 		}
 		if i == digits {
-			return nil, false
+			return nil, faultNotNumber
 		}
 	}
 	if i != len(s) {
-		return nil, false
+		return nil, faultNotNumber
 	}
-	return new(big.Rat).SetString(s)
+	r, ok := new(big.Rat).SetString(s)
+	if !ok {
+		return nil, faultNotNumber
+	}
+	return r, ""
 }
 
 // stringOf reads v as a string, or a named type over one. A json.Number is

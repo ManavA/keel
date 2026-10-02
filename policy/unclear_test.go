@@ -98,7 +98,18 @@ func TestCond_ThreeValues(t *testing.T) {
 		{name: "in: not a member", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{1, 2}}, attrs: attrs("x", 3), want: unmetT},
 		{name: "in: a string where the list holds numbers", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{1, 2}}, attrs: attrs("x", "2"), want: unclearT},
 		{name: "in: a number where the list holds strings", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []string{"a", "b"}}, attrs: attrs("x", 1), want: unclearT},
-		{name: "in: not a member, with an element of its own type", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{1, "a"}}, attrs: attrs("x", "b"), want: unmetT},
+		{name: "in: not a member, though one element could not be compared", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{1, "a"}}, attrs: attrs("x", "b"), want: unclearT},
+		{name: "in: a member, though another element could not be compared", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{1, "a"}}, attrs: attrs("x", "a"), want: holdsT},
+		{name: "in: not a member, and every element could be compared", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []string{"a", "b"}}, attrs: attrs("x", "c"), want: unmetT},
+		{name: "in: mixed booleans and strings, the string true", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{true, "yes"}}, attrs: attrs("x", "true"), want: unclearT},
+		{name: "in: mixed booleans and strings, the element that is a string", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{true, "yes"}}, attrs: attrs("x", "yes"), want: holdsT},
+		{name: "in: mixed booleans and strings, the element that is a boolean", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{true, "yes"}}, attrs: attrs("x", true), want: holdsT},
+		{name: "in: mixed booleans and strings, the boolean that is not there", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{true, "yes"}}, attrs: attrs("x", false), want: unclearT},
+		{name: "in: mixed numbers and strings, the string 1250", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{1250, "unlimited"}}, attrs: attrs("x", "1250"), want: unclearT},
+		{name: "in: mixed numbers and strings, the number", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{1250, "unlimited"}}, attrs: attrs("x", 1250), want: holdsT},
+		{name: "in: mixed numbers and strings, the string that is there", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{1250, "unlimited"}}, attrs: attrs("x", "unlimited"), want: holdsT},
+		{name: "in: mixed numbers and strings, a number that is not there", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{1250, "unlimited"}}, attrs: attrs("x", 5), want: unclearT},
+		{name: "in: mixed numbers and strings, the port as a string", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{22, "ssh"}}, attrs: attrs("x", "22"), want: unclearT},
 		{name: "in: a boolean where the list holds none", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{1, "a"}}, attrs: attrs("x", true), want: unclearT},
 		{name: "in: null", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []string{"a"}}, attrs: attrs("x", nil), want: unclearT},
 		{name: "in: a list", cond: policy.Cond{Attr: "x", Op: policy.OpIn, Value: []string{"a"}}, attrs: attrs("x", []string{"a"}), want: unclearT},
@@ -215,6 +226,91 @@ func TestDecide_ABlockRuleCountsAnAttributeItCannotCompareAgainstTheAction(t *te
 		assert.Equal(t, policy.Block, got.Effect)
 		assert.Equal(t, "No region is blocked", got.Rule)
 		assert.Equal(t, policy.Allow, p.Decide(policy.Action{Kind: "visit", Attrs: attrs("region", "home")}).Effect)
+	})
+}
+
+// A list of ports written as numbers and as names: the attribute sent as the
+// string "22" is a string no element of a number can be compared with, and it
+// is not "ssh", so nothing can be told, and a block rule blocks. This has to
+// agree with the lists and the eq it is made of.
+func TestDecide_AMixedListBlocksWhatItCannotCompare(t *testing.T) {
+	rule := func(effect policy.Effect, c policy.Cond) policy.Policy {
+		return policy.Policy{Default: policy.Allow, Rules: []policy.Rule{
+			{Name: "r", Effect: effect, When: policy.Match{Kinds: []string{"connect"}, Attrs: []policy.Cond{c}}},
+		}}
+	}
+	port := func(v any) policy.Action { return policy.Action{Kind: "connect", Attrs: attrs("port", v)} }
+	mixed := policy.Cond{Attr: "port", Op: policy.OpIn, Value: []any{22, "ssh"}}
+	numbers := policy.Cond{Attr: "port", Op: policy.OpIn, Value: []any{22}}
+	one := policy.Cond{Attr: "port", Op: policy.OpEq, Value: 22}
+
+	for name, c := range map[string]policy.Cond{"in [22, ssh]": mixed, "in [22]": numbers, "eq 22": one} {
+		got := rule(policy.Block, c).Decide(port("22"))
+		assert.Equal(t, policy.Block, got.Effect, name)
+		assert.Equal(t, []string{"port"}, got.Uncertain, name)
+	}
+	assert.Equal(t, policy.RuleDefault, rule(policy.Allow, mixed).Decide(port("22")).Rule, "an allow rule does not match what cannot be told")
+
+	got := rule(policy.Block, mixed).Decide(port(22))
+	assert.Equal(t, policy.Block, got.Effect)
+	assert.Empty(t, got.Uncertain, "22 is in the list for certain")
+	got = rule(policy.Block, mixed).Decide(port("ssh"))
+	assert.Equal(t, policy.Block, got.Effect)
+	assert.Empty(t, got.Uncertain, "so is ssh")
+	assert.Equal(t, policy.RuleDefault, rule(policy.Block, numbers).Decide(port(80)).Rule, "80 is not in a list of numbers, and that can be told")
+}
+
+// in is eq on each element, joined by "or": it holds if any element equals, it
+// does not hold only if every element could be compared and none equalled, and
+// otherwise it cannot be told.
+func TestCond_InIsEqJoinedByOr(t *testing.T) {
+	pool := []any{22, "ssh", true, "yes", 1.5, "22", false}
+	attrPool := append([]any{nil, "other", 80, json.Number("22"), []any{22}}, pool...)
+
+	or := func(results []string) string {
+		all := true
+		for _, r := range results {
+			switch r {
+			case holdsT:
+				return holdsT
+			case unclearT:
+				all = false
+			}
+		}
+		if all {
+			return unmetT
+		}
+		return unclearT
+	}
+
+	checked := 0
+	var lists [][]any
+	for _, a := range pool {
+		lists = append(lists, []any{a})
+		for _, b := range pool {
+			lists = append(lists, []any{a, b})
+			for _, c := range pool[:4] {
+				lists = append(lists, []any{a, b, c})
+			}
+		}
+	}
+	for _, list := range lists {
+		for _, attr := range attrPool {
+			var each []string
+			for _, element := range list {
+				each = append(each, truthOf(policy.Cond{Attr: "x", Op: policy.OpEq, Value: element}, attrs("x", attr)))
+			}
+			got := truthOf(policy.Cond{Attr: "x", Op: policy.OpIn, Value: list}, attrs("x", attr))
+			if !assert.Equal(t, or(each), got, "in %v against %#v, where each eq gives %v", list, attr, each) {
+				return
+			}
+			checked++
+		}
+	}
+	assert.Greater(t, checked, 3000)
+
+	t.Run("an attribute that is absent does not hold under in, as under eq", func(t *testing.T) {
+		assert.Equal(t, unmetT, truthOf(policy.Cond{Attr: "x", Op: policy.OpIn, Value: []any{22, "ssh"}}, nil))
 	})
 }
 
@@ -439,6 +535,29 @@ func TestCond_NumbersAreExact(t *testing.T) {
 		{name: "float32 0.1 equals the threshold 0.1", op: policy.OpEq, value: json.Number("0.1"), attr: float32(0.1), want: holdsT},
 		{name: "float64 0.1 plus 0.2 is above 0.3, as it is", op: policy.OpGt, value: json.Number("0.3"), attr: sum, want: holdsT},
 		{name: "a float threshold and a float attribute agree", op: policy.OpLte, value: 0.7, attr: 0.7, want: holdsT},
+		// A float with an integer value is that integer, not its shortest decimal.
+		{name: "float64 2^70 is above a threshold a little below it", op: policy.OpGt, value: json.Number("1180591620717411303000"), attr: math.Ldexp(1, 70), want: holdsT},
+		{name: "float64 2^70 equals the integer it is", op: policy.OpEq, value: json.Number("1180591620717411303424"), attr: math.Ldexp(1, 70), want: holdsT},
+		{name: "float64 2^70 is above the same integer written with a decimal point", op: policy.OpGte, value: json.Number("1180591620717411303424.0"), attr: math.Ldexp(1, 70), want: holdsT},
+		{name: "float64 2^70 is not above the integer it is", op: policy.OpGt, value: json.Number("1180591620717411303424"), attr: math.Ldexp(1, 70), want: unmetT},
+		{name: "float64 -2^70 is below a threshold a little above it", op: policy.OpLt, value: json.Number("-1180591620717411303000"), attr: -math.Ldexp(1, 70), want: holdsT},
+		{name: "float32 1000000064 is above 1000000062", op: policy.OpGt, value: 1000000062, attr: float32(1000000064), want: holdsT},
+		{name: "float32 1000000064 equals the integer it is", op: policy.OpEq, value: json.Number("1000000064"), attr: float32(1000000064), want: holdsT},
+		{name: "float32 1000000064 is not above 1000000064", op: policy.OpGt, value: json.Number("1000000064"), attr: float32(1000000064), want: unmetT},
+		{name: "float32 2^40 is the integer it is", op: policy.OpEq, value: int64(1) << 40, attr: float32(1 << 40), want: holdsT},
+		{name: "a float64 2^53 is as before", op: policy.OpEq, value: int64(1) << 53, attr: float64(1 << 53), want: holdsT},
+		{name: "a float64 with a small integer value is as before", op: policy.OpEq, value: json.Number("5"), attr: 5.0, want: holdsT},
+		{name: "a float32 1e9 is exactly 1000000000", op: policy.OpEq, value: json.Number("1000000000"), attr: float32(1e9), want: holdsT},
+		{name: "a float64 1e22 is exactly 10^22", op: policy.OpEq, value: json.Number("1e22"), attr: 1e22, want: holdsT},
+		// The other side of that: a round number written large is not always a
+		// float. float64 1e23 is 99999999999999991611392, and is below 1e23.
+		{name: "a float64 1e23 is the integer it is, which is below 1e23", op: policy.OpLt, value: json.Number("1e23"), attr: 1e23, want: holdsT},
+		// A float without an integer value is still the number it was written as.
+		{name: "float64 0.5 is the number it is", op: policy.OpEq, value: json.Number("0.5"), attr: 0.5, want: holdsT},
+		{name: "float32 0.1 still equals the threshold 0.1", op: policy.OpEq, value: json.Number("0.1"), attr: float32(0.1), want: holdsT},
+		{name: "float64 0.1 plus 0.2 is still above 0.3", op: policy.OpGt, value: json.Number("0.3"), attr: sum, want: holdsT},
+		{name: "float64 0.3 still meets 0.3", op: policy.OpGte, value: json.Number("0.3"), attr: 0.3, want: holdsT},
+		{name: "float64 1e-5 is the number it was written as", op: policy.OpEq, value: json.Number("0.00001"), attr: 1e-5, want: holdsT},
 		// Integers against floats and against text, without rounding.
 		{name: "an int64 one above 2^53 is above the float64 2^53", op: policy.OpGt, value: float64(1 << 53), attr: int64(1<<53 + 1), want: holdsT},
 		{name: "the same int64 is not equal to it", op: policy.OpEq, value: float64(1 << 53), attr: int64(1<<53 + 1), want: unmetT},

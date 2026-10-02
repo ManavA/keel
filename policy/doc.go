@@ -47,8 +47,13 @@
 //
 // # Attributes: absent, present, and not comparable
 //
+// Attribute names and string values are matched exactly as written, as targets
+// and kinds are: "Amount" is not "amount", and "Prod" and "prod " are not
+// "prod". Whatever builds an action must use one spelling.
+//
 // A condition on an attribute the action does not carry does not hold, under
-// every operator, ne included. The other side of that is easy to miss: a
+// every operator, ne included. An attribute that is present and null is
+// present: exists true holds for it, and every other operator cannot tell. The other side of that is easy to miss: a
 // block rule written with ne does not block an action that lacks the
 // attribute. To block a visit unless its region is home, write two rules:
 //
@@ -68,14 +73,23 @@
 // whose condition looks unmet decided. The same holds for a [Policy] that
 // skipped Validate and has a rule that cannot be evaluated, a target pattern
 // that does not compile or a malformed condition: it matches unless it allows.
-// Strings are not read as numbers.
+// Strings are not read as numbers. In is eq on each element joined by "or": it
+// holds if any element equals the attribute, does not hold only if every
+// element could be compared with it and none equalled it, and otherwise cannot
+// be told, so a block rule on in [22, "ssh"] blocks the string "22".
 //
 // Numbers compare as numbers, exactly, whatever holds them: any integer or float
 // type, or a [encoding/json.Number], which [Parse] uses for every number so a
-// threshold keeps the digits it was written with. A float is read as the
-// shortest decimal that gives it back, so a float64 0.1 meets a threshold of 0.1.
-// Text of a number is read to a length of 4096 bytes and an exponent of 4096;
-// past that it cannot be told. Strings and booleans compare with eq and ne only.
+// threshold keeps the digits it was written with. A float with an integer value
+// is that integer, so a float64 2^70 is above 1180591620717411303000; any other
+// float is the shortest decimal that gives it back, so a float64 0.1 meets a
+// threshold of 0.1. Text of a number is read to a length of 4096 bytes and an
+// exponent of 4096; past that it cannot be told. Strings and booleans compare
+// with eq and ne only.
+//
+// A number must reach the package unrounded: one decoded into a float64 has
+// already lost its digits. Decode tool input with [encoding/json.Decoder.UseNumber],
+// as Parse does, and pass the json.Number on.
 //
 // # Ask
 //
@@ -91,7 +105,7 @@
 // word: a condition with no attribute, an eq or ne with no value, an in with
 // an empty list or an element that is not a number, a string or a boolean, a
 // number that is not finite, an empty kind, and exists false together with any
-// other condition on the same attribute. An empty Kinds, Target or Attrs is not
+// other condition on the same attribute, or written twice. An empty Kinds, Target or Attrs is not
 // a mistake: each means every action, as the field says. It also refuses a rule
 // named as a decision is named when none matched. Conditions that contradict one
 // another in other ways, such as two eq on one attribute with different
@@ -108,9 +122,13 @@
 // A Decider takes a deep copy of its policy, every list and value in it, and
 // hands out copies, so nothing a caller does afterwards, from any goroutine,
 // changes the rules it decides under. The [Recorder] is handed a copy of each
-// record too. [MemoryRecorder] is the Recorder a Decider uses when it is given
-// none. It keeps the most recent decisions, 1000 unless Options.MemoryRecords
-// says otherwise, and no more. policy/pg is the Postgres recorder.
+// record too. A copy is bounded in work as well as depth: a policy whose
+// conditions, or an action whose attributes, hold more than 10000 values is
+// refused, by NewDecider and by Decide, which returns an error and no decision.
+// [MemoryRecorder] is the Recorder a Decider uses when it is given none, and
+// its zero value is ready to use. It keeps the most recent decisions, 1000
+// unless Options.MemoryRecords says otherwise, and no more. policy/pg is the
+// Postgres recorder.
 //
 // # Beside textpolicy
 //
