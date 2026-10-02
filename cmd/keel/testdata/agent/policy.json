@@ -1,0 +1,50 @@
+{
+  "version": "agentdemo-1",
+  "rules": [
+    {
+      "name": "Documents are never deleted by an agent",
+      "effect": "block",
+      "when": {"kinds": ["delete"]}
+    },
+    {
+      "name": "Text the content check flagged is not sent",
+      "effect": "block",
+      "when": {"kinds": ["send"], "attrs": [{"attr": "text_rule", "op": "exists", "value": true}]}
+    },
+    {
+      "name": "A digest of more than two documents sent outside needs a person",
+      "effect": "ask",
+      "when": {
+        "kinds": ["send"],
+        "attrs": [
+          {"attr": "external", "op": "eq", "value": true},
+          {"attr": "documents", "op": "gt", "value": 2}
+        ]
+      }
+    },
+    {
+      "name": "A digest of one or two documents may be sent",
+      "effect": "allow",
+      "when": {
+        "kinds": ["send"],
+        "target": "email:*",
+        "attrs": [{"attr": "documents", "op": "lte", "value": 2}]
+      }
+    },
+    {
+      "name": "Reading the batch is allowed",
+      "effect": "allow",
+      "when": {"kinds": ["read"]}
+    },
+    {
+      "name": "Saving a summary is allowed",
+      "effect": "allow",
+      "when": {"kinds": ["write"], "target": "summary:*"}
+    },
+    {
+      "name": "The coordinator may delegate to the reviewer",
+      "effect": "allow",
+      "when": {"kinds": ["delegate"], "target": "reviewer"}
+    }
+  ]
+}
