@@ -442,4 +442,12 @@ func TestPark_WithTwoChildrenAndOneEndingLeavesTheRunWithItsExecution(t *testing
 	assert.Equal(t, agent.StatusRunnable, after.Status)
 	assert.Equal(t, lease.Owner, after.LeaseOwner)
 	assert.False(t, k.run(children[1].ID).Terminal())
+
+	// It collects the child that ended, and then parks on the one that runs.
+	summary := "summary"
+	require.NoError(t, k.store.UpdateStep(k.ctx, lease, agent.StepUpdate{
+		Seq: 2, From: agent.StepWaiting, To: agent.StepCompleted, Result: &summary, Now: k.tick(),
+	}))
+	k.park(lease, agent.ReasonChildren)
+	assert.Equal(t, agent.ReasonChildren, k.run(parent.ID).Reason)
 }
