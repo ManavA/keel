@@ -18,6 +18,7 @@ const (
 	actResolve                   // record a person's no on a waiting tool step
 	actAsk                       // ask a person about an interrupted at-most-once call
 	actPark                      // nothing can proceed until a person or a child acts
+	actYield                     // give the run up for now: the journal holds what this build cannot read
 )
 
 // action is one thing for an execution to do, and what it needs to do it.
@@ -27,7 +28,7 @@ type action struct {
 	status Status // actFinish
 	reason string // actFinish, actPark
 	output string // actFinish
-	errmsg string // actFinish
+	errmsg string // actYield: what was found
 }
 
 // conversation rebuilds what the model is sent: the run's input, then each
@@ -96,7 +97,8 @@ func turnResults(turn int, after []Step) []Result {
 //     has approved this attempt; otherwise it is run again. A waiting step
 //     with a child is collected once the child has ended. Any other waiting
 //     step goes by the approval with the highest attempt: approved, it is
-//     run; pending, it is passed over; anything else is a no to record.
+//     run; pending, it is passed over; declined, expired or cancelled, the
+//     no is recorded.
 //  4. Steps were passed over and nothing else could be done: the run parks,
 //     for a person when any step waits on one, and else for its children.
 //  5. No tool step is open: the model is called, or called again where its
@@ -105,17 +107,21 @@ func turnResults(turn int, after []Step) []Result {
 // Over them all sits work: an action that would do work is replaced by the
 // run's failure when a budget is spent.
 //
-// A journal no store writes (a waiting step with nothing to wait for, a
-// child that was not given, a kind, a status or a stop this build does not
-// know) fails the run with ReasonError and says what was found. The alternatives
-// are a run that parks with nothing to wake it and a guess at what an
-// unknown value meant.
+// A journal this build cannot make sense of (a waiting step with nothing to
+// wait for, a child that was not given, a kind, a status or a stop it does
+// not know) gives the run up, with actYield and what was found, wherever in
+// that order it is met. The run is not ended for it: ending cannot be
+// undone, and what this build cannot read may be a newer build's writing
+// during a deploy, or the executor's mistake. Given up as a failed attempt,
+// the run waits out its back-off and is claimed again, by a worker that can
+// read it or after a fix; if none can, the limit on failed attempts ends it,
+// with the same message. Parking it instead would leave nothing to wake it.
 func next(run Run, def Definition, steps []Step, approvals []Approval, children map[string]Run) action {
 	if run.CancelRequested {
 		return action{kind: actFinish, status: StatusCancelled, reason: ReasonCancelled}
 	}
 	if last := lastModelStep(steps); last != nil && last.Stop == StopRefusal {
-		return failRun(ReasonRefusal, "")
+		return failRun(ReasonRefusal)
 	}
 
 	// onPerson and onChild record the steps passed over because nothing can
@@ -148,8 +154,8 @@ func next(run Run, def Definition, steps []Step, approvals []Approval, children 
 				child, ok := children[st.ChildRunID]
 				switch {
 				case !ok:
-					return failRun(ReasonError, fmt.Sprintf(
-						"step %d waits on child run %s, which is not among the run's children", st.Seq, st.ChildRunID))
+					return giveUp("step %d waits on child run %s, which is not among the run's children",
+						st.Seq, st.ChildRunID)
 				case child.Terminal():
 					return action{kind: actCollect, seq: st.Seq}
 				}
@@ -157,19 +163,22 @@ func next(run Run, def Definition, steps []Step, approvals []Approval, children 
 				continue
 			}
 			asked, ok := latestApproval(approvals, run.ID, st.Seq)
-			switch {
-			case !ok:
-				return failRun(ReasonError, fmt.Sprintf("step %d is waiting with no approval and no child run", st.Seq))
-			case asked.Status == ApprovalApproved:
+			if !ok {
+				return giveUp("step %d is waiting with no approval and no child run", st.Seq)
+			}
+			switch asked.Status {
+			case ApprovalApproved:
 				return work(run, action{kind: actRun, seq: st.Seq})
-			case asked.Status == ApprovalPending:
+			case ApprovalPending:
 				onPerson = true
-			default:
+			case ApprovalDeclined, ApprovalExpired, ApprovalCancelled:
 				return action{kind: actResolve, seq: st.Seq}
+			default:
+				return giveUp("step %d's approval has the status %q", st.Seq, asked.Status)
 			}
 
 		default:
-			return failRun(ReasonError, fmt.Sprintf("step %d has the status %q", st.Seq, st.Status))
+			return giveUp("step %d has the status %q", st.Seq, st.Status)
 		}
 	}
 	switch {
@@ -189,7 +198,7 @@ func next(run Run, def Definition, steps []Step, approvals []Approval, children 
 	last := steps[len(steps)-1]
 	switch {
 	case last.Kind != StepModel:
-		return failRun(ReasonError, fmt.Sprintf("step %d has the kind %q", last.Seq, last.Kind))
+		return giveUp("step %d has the kind %q", last.Seq, last.Kind)
 	case last.Status == StepStarted:
 		return work(run, action{kind: actModel, seq: last.Seq})
 	}
@@ -203,12 +212,11 @@ func next(run Run, def Definition, steps []Step, approvals []Approval, children 
 	case StopPause:
 		return work(run, action{kind: actModel, seq: len(steps) + 1})
 	case StopMaxTokens:
-		return failRun(ReasonTruncated, "")
+		return failRun(ReasonTruncated)
 	case StopContextWindow:
-		return failRun(ReasonContextWindow, "")
+		return failRun(ReasonContextWindow)
 	}
-	return failRun(ReasonError,
-		fmt.Sprintf("model reply at step %d ended with stop %q and made no calls", last.Seq, last.Stop))
+	return giveUp("model reply at step %d ended with stop %q and made no calls", last.Seq, last.Stop)
 }
 
 // approvedFor reports whether a person has said yes to st's current attempt.
@@ -244,7 +252,7 @@ func latestApproval(approvals []Approval, runID string, seq int) (Approval, bool
 // failed for its budget.
 func work(run Run, a action) action {
 	if reason := spent(run, a.kind == actModel); reason != "" {
-		return failRun(reason, "")
+		return failRun(reason)
 	}
 	return a
 }
@@ -269,9 +277,17 @@ func spent(run Run, model bool) string {
 	return ""
 }
 
-// failRun is the action that ends the run as failed.
-func failRun(reason, errmsg string) action {
-	return action{kind: actFinish, status: StatusFailed, reason: reason, errmsg: errmsg}
+// failRun is the action that ends the run as failed, for one of the reasons
+// the design names as ending a run.
+func failRun(reason string) action {
+	return action{kind: actFinish, status: StatusFailed, reason: reason}
+}
+
+// giveUp is the action that hands the run back as a failed attempt, saying
+// what in its journal this build could not read. It is not work, and no
+// budget turns it into the run's end.
+func giveUp(format string, args ...any) action {
+	return action{kind: actYield, errmsg: fmt.Sprintf(format, args...)}
 }
 
 // lastModelStep returns the journal's last model step, or nil.

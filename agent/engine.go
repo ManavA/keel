@@ -456,9 +456,11 @@ func (e *Engine) decide(ctx context.Context, op, approvalID, by, reason string, 
 
 // Cancel asks for a run and its child runs to be cancelled.
 //
-// It marks the run and no more. The execution that sees the mark, the one in
-// flight at its next heartbeat or else the next to claim the run, asks the
-// same of each child that has not ended and finishes the run cancelled.
+// It marks the run and no more, and publishes EventRunCancelRequested. The
+// execution that sees the mark, the one in flight at its next heartbeat or
+// else the next to claim the run, asks the same of each child that has not
+// ended and finishes the run cancelled, which is when EventRunCancelled is
+// published.
 func (e *Engine) Cancel(ctx context.Context, runID, by, reason string) error {
 	if by == "" {
 		return fmt.Errorf("agent: cancel %s: by is empty", runID)
@@ -475,7 +477,7 @@ func (e *Engine) Cancel(ctx context.Context, runID, by, reason string) error {
 		return fmt.Errorf("agent: cancel %s: %w", runID, err)
 	}
 	if !run.CancelRequested {
-		e.publish(ctx, EventRunCancelled, run, 0, now)
+		e.publish(ctx, EventRunCancelRequested, run, 0, now)
 	}
 	return nil
 }

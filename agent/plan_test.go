@@ -498,12 +498,6 @@ func TestNext_ToolSteps(t *testing.T) {
 			want:      action{kind: actResolve, seq: 2},
 		},
 		{
-			name:      "a waiting step whose approval has a status this build does not know: read as a no",
-			steps:     planJournal(planTool(2, 1, "lookup", StepWaiting)),
-			approvals: []Approval{planApproval(2, 0, ApprovalStatus("escalated"))},
-			want:      action{kind: actResolve, seq: 2},
-		},
-		{
 			name:      "a waiting step for a delegating tool whose approval is approved: run, which starts its child",
 			steps:     planJournal(planTool(2, 1, "helper", StepWaiting)),
 			approvals: []Approval{planApproval(2, 0, ApprovalApproved)},
@@ -740,19 +734,11 @@ func TestNext_LastModelStep(t *testing.T) {
 			want:  action{kind: actFinish, status: StatusFailed, reason: ReasonRefusal},
 		},
 		{
-			name:  "a reply that says it used tools and made no calls: the run fails",
+			name:  "a reply that says it used tools and made no calls: the run is given up, not ended",
 			steps: []Step{planReply(1, StopToolUse, "")},
 			want: action{
-				kind: actFinish, status: StatusFailed, reason: ReasonError,
+				kind:   actYield,
 				errmsg: `model reply at step 1 ended with stop "tool_use" and made no calls`,
-			},
-		},
-		{
-			name:  "a reply with a stop this build does not know: the run fails",
-			steps: []Step{planReply(1, Stop("length"), "the total is")},
-			want: action{
-				kind: actFinish, status: StatusFailed, reason: ReasonError,
-				errmsg: `model reply at step 1 ended with stop "length" and made no calls`,
 			},
 		},
 		{
@@ -1146,14 +1132,53 @@ func TestNext_Budgets(t *testing.T) {
 	})
 }
 
-// Journals no store produces. Each fails the run and says why, since the
-// alternatives are a panic in a worker or a run that parks and can never be
-// woken.
+// Journals this build cannot make sense of. For each the run is given up as
+// a failed attempt, with what was found, and is not ended: ending a run
+// cannot be undone, and what this build cannot read may be a newer build's
+// writing, or the executor's mistake. The alternatives next must not take
+// are a panic in a worker and a run that parks with nothing to wake it.
 func TestNext_AJournalThatDoesNotAddUp(t *testing.T) {
 	broken := func(errmsg string) action {
-		return action{kind: actFinish, status: StatusFailed, reason: ReasonError, errmsg: errmsg}
+		return action{kind: actYield, errmsg: errmsg}
 	}
 	checkPlan(t, []planCase{
+		{
+			name: "a step kind this build does not know: yield, not fail",
+			steps: append(planJournal(planTool(2, 1, "lookup", StepCompleted)),
+				Step{RunID: planRunID, Seq: 3, Kind: StepKind("summary"), Status: StepCompleted}),
+			want: broken(`step 3 has the kind "summary"`),
+		},
+		{
+			name:  "a step status this build does not know: yield, not fail",
+			steps: planJournal(planTool(2, 1, "lookup", StepStatus("paused"))),
+			want:  broken(`step 2 has the status "paused"`),
+		},
+		{
+			name:      "an approval status this build does not know: yield, and not a no",
+			steps:     planJournal(planTool(2, 1, "lookup", StepWaiting)),
+			approvals: []Approval{planApproval(2, 0, ApprovalStatus("escalated"))},
+			want:      broken(`step 2's approval has the status "escalated"`),
+		},
+		{
+			name:  "a stop this build does not know: yield, not fail",
+			steps: []Step{planReply(1, Stop("length"), "the total is")},
+			want:  broken(`model reply at step 1 ended with stop "length" and made no calls`),
+		},
+		{
+			name: "a spent budget does not turn giving up into failing",
+			run: planRun(func(run *Run) {
+				run.ActiveMillis = (15 * time.Minute).Milliseconds()
+				run.ModelCalls = 50
+			}),
+			steps: planJournal(planTool(2, 1, "lookup", StepStatus("paused"))),
+			want:  broken(`step 2 has the status "paused"`),
+		},
+		{
+			name:  "cancellation still ends a run whose journal does not add up",
+			run:   planRun(planCancelRequested),
+			steps: planJournal(planTool(2, 1, "lookup", StepStatus("paused"))),
+			want:  action{kind: actFinish, status: StatusCancelled, reason: ReasonCancelled},
+		},
 		{
 			name:  "a waiting step with no approval and no child",
 			steps: planJournal(planTool(2, 1, "lookup", StepWaiting)),
@@ -1171,12 +1196,7 @@ func TestNext_AJournalThatDoesNotAddUp(t *testing.T) {
 			want:  broken("step 2 waits on child run " + planChildID + ", which is not among the run's children"),
 		},
 		{
-			name:  "a tool step in a status this build does not know",
-			steps: planJournal(planTool(2, 1, "lookup", StepStatus("paused"))),
-			want:  broken(`step 2 has the status "paused"`),
-		},
-		{
-			name: "a last step of a kind this build does not know",
+			name: "a last step of a kind this build does not know, still started",
 			steps: append(planJournal(planTool(2, 1, "lookup", StepCompleted)),
 				Step{RunID: planRunID, Seq: 3, Kind: StepKind("summary"), Status: StepStarted}),
 			want: broken(`step 3 has the kind "summary"`),
@@ -1258,6 +1278,8 @@ func TestNext_AnyJournalGetsAnAction(t *testing.T) {
 		switch a.kind {
 		case actFinish:
 			require.True(t, Run{Status: a.status}.Terminal(), "finish with status %q for %+v", a.status, steps)
+			require.NotEqual(t, ReasonError, a.reason, "next ended a run for what it could not read: %+v", steps)
+			require.Empty(t, a.errmsg)
 		case actModel:
 			started := len(steps) > 0 && a.seq == len(steps) && steps[a.seq-1].Kind == StepModel
 			require.True(t, started || a.seq == len(steps)+1, "model call at step %d for %+v", a.seq, steps)
@@ -1265,6 +1287,8 @@ func TestNext_AnyJournalGetsAnAction(t *testing.T) {
 			require.True(t, open(a.seq), "action %d on step %d, which is not an open tool step, for %+v", a.kind, a.seq, steps)
 		case actPark:
 			require.Contains(t, []string{ReasonApproval, ReasonChildren}, a.reason)
+		case actYield:
+			require.NotEmpty(t, a.errmsg, "the run was given up with nothing said for %+v", steps)
 		default:
 			require.Fail(t, "an action of no kind", "%+v for %+v", a, steps)
 		}
@@ -1782,6 +1806,9 @@ func (w *planWorld) perform(a action, run Run, steps []Step, children map[string
 		require.True(w.t, parked, "next parked a run the store says has nothing to wait for")
 		w.grown()
 		w.wake()
+
+	case actYield:
+		require.FailNow(w.t, "next gave up on a journal the store wrote", "%s", a.errmsg)
 	}
 	return false
 }
@@ -2054,7 +2081,8 @@ func TestConversation_OnlyEverGrows(t *testing.T) {
 		} {
 			assert.Positive(t, seen.ends[end], "no run ended %q", end)
 		}
-		assert.Zero(t, seen.ends["failed "+ReasonError], "a run failed on a journal next could not read")
+		assert.Zero(t, seen.kinds[actYield], "next gave up on a journal the store wrote")
+		assert.Zero(t, seen.ends["failed "+ReasonError], "a run was ended for what next could not read")
 		assert.Positive(t, seen.refusedWithCalls, "no refusal came with calls")
 		assert.Positive(t, seen.childEnded, "no child run had ended when next was asked")
 		assert.Positive(t, seen.childOpen, "no child run was still going when next was asked")

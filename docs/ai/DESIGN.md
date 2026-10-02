@@ -3063,6 +3063,7 @@ const (
 	actResolve                   // record a person's no on a waiting tool step
 	actAsk                       // ask a person about an interrupted at-most-once call
 	actPark                      // nothing can proceed until a person or a child acts
+	actYield                     // give the run up for now: the journal holds what this build cannot read
 )
 
 type action struct {
@@ -3071,7 +3072,7 @@ type action struct {
 	status Status // actFinish
 	reason string // actFinish, actPark
 	output string // actFinish
-	errmsg string // actFinish
+	errmsg string // actYield: what was found
 }
 
 // conversation rebuilds what the model is sent. See 6.4.
@@ -3089,7 +3090,10 @@ the action is instead finish, `StatusFailed`, with the budget's reason. A
 run whose work is done is never failed for its budget.
 
 1. `run.CancelRequested`: finish, `StatusCancelled`.
-2. Walk the tool steps that are not final, in `seq` order. For each:
+2. Walk the tool steps that are not final, in `seq` order. A refusal comes
+   first: when the last model step's `Stop` is `StopRefusal` the walk is
+   not made and the run finishes as rule 3 says, since a refusal is never a
+   turn, whatever calls came with it. For each:
    - `proposed`: `actJudge`.
    - `started`, the tool delegates: `actSpawn`.
    - `started`, the tool is `AtMostOnce` and the step has no approved
@@ -3122,6 +3126,21 @@ them. A step waiting on a person does not hold up the steps after it:
 `next` passes over a pending step and acts on the next one, and the run
 parks only when everything left is pending.
 
+A journal `next` cannot make sense of gives `actYield`, with what was found
+in `errmsg`, at the point in the rules where it is met: a `waiting` step
+with no approval and no `ChildRunID`; a `waiting` step whose child is not
+in `children`; a tool step, an approval or a last step whose status, kind
+or `Stop` is none this build knows; a reply that made no calls and whose
+`Stop` rule 3 does not list. The run is given up as a failed attempt and
+not ended, because ending a run cannot be undone and neither cause is the
+run's own: a value this build does not know is what an older worker reads
+during a deploy once a newer build has written to the journal, and a child
+that was not passed in is the executor's mistake. Given up, the run waits
+out its back-off and is claimed again, by a worker that can read it or
+after a fix, and if none can, the limit on failed executions ends it with
+the same message; parking it instead would leave nothing to wake it. A
+budget does not replace `actYield`, and cancellation still comes first.
+
 How each action is performed:
 
 | Action | Store calls | Notes |
@@ -3135,6 +3154,7 @@ How each action is performed:
 | `actAsk` | `RequestApproval` | `From: StepStarted`, cause `interrupted`, rule `RuleInterrupted` |
 | `actPark` | `Park` | If `Park` reports false, something changed since the journal was read; the loop goes round again |
 | `actFinish` | `Finish` | For a run that fails or is cancelled, each child that has not ended is sent `RequestCancel` first |
+| `actYield` | `Yield` | The execution ends as one whose step failed (6.6), with `errmsg` as the error: `Yield{Failed: true}` with the back-off, or, when this is failure number `MaxFailures`, `Finish` as failed, `ReasonError`, with the same message. Nothing is written to the journal |
 
 A delegating tool is described to the `Guard` as
 `Action{Kind: "delegate", Target: <agent name>}` unless it has its own
@@ -3441,6 +3461,17 @@ After each change it makes, the engine publishes an `Event` to
 bus := events.NewInMemoryBus(events.InMemoryBusOptions{})
 engine, err := agent.New(agent.Options{Model: model, Store: store, Events: bus})
 ```
+
+The types, and who publishes each: `EventRunStarted` by `Start`, for a run
+that is new; `EventApprovalDecided` by `Approve` and `Decline`;
+`EventRunCancelRequested` by `Cancel`, for the request that sets the mark;
+and by the execution, `EventStepStarted`, `EventStepCompleted`,
+`EventStepBlocked`, `EventApprovalRequested`, `EventRunWaiting`, and one of
+`EventRunCompleted`, `EventRunFailed` and `EventRunCancelled` when the run
+ends. A request to cancel and a run that ended cancelled are two events,
+so that no type means two things: `EventRunCancelRequested`
+(`"run.cancel_requested"`) says the run was asked to stop and is still to
+end, and `EventRunCancelled` says it has.
 
 The event says which run changed and how, and carries nothing from the
 journal, so tool arguments and results never travel on a bus. Publishing
@@ -4421,3 +4452,18 @@ lead confirmed its choices, and the table now states each of them.
     was not given). `Metadata` goes through JSON as `Action.Attrs` does.
     What a NUL character inside a string of either does is left to the
     Postgres store to settle with its column types in front of it.
+
+**A journal the planner cannot read gives the run up, and a request to
+cancel has its own event.** `next` has a tenth action, `actYield`, for a
+journal that does not add up: a waiting step with nothing to wait for, a
+child that was not passed in, a kind, a status or a `Stop` this build does
+not know. The execution ends as a failed attempt with what was found as
+the error, and the run stays claimable (rejected: finishing the run as
+failed, `ReasonError`, which cannot be undone, for what may be a newer
+build's writing during a deploy or the executor's own mistake; and
+parking it, which leaves a run nothing will wake). A refusal, a spent
+budget and cancellation still end a run. `Cancel` publishes
+`EventRunCancelRequested`, and `EventRunCancelled` is kept for the run
+that has ended cancelled (rejected: `EventRunCancelled` for both, which
+makes one type mean two things, and nothing at all, which leaves a
+subscriber no hint that a run is about to stop).

@@ -1050,8 +1050,22 @@ func TestEngine_Cancel(t *testing.T) {
 
 		assert.Equal(t, []string{agent.TopicRuns}, f.bus.topics)
 		assert.Equal(t, []any{agent.Event{
-			Type: agent.EventRunCancelled, RunID: run.ID, Agent: "clerk", At: now,
+			Type: agent.EventRunCancelRequested, RunID: run.ID, Agent: "clerk", At: now,
 		}}, f.bus.published())
+	})
+
+	t.Run("the request has an event of its own, which is not the one for a run that ended cancelled", func(t *testing.T) {
+		assert.Equal(t, "run.cancel_requested", agent.EventRunCancelRequested)
+		assert.NotEqual(t, agent.EventRunCancelled, agent.EventRunCancelRequested)
+
+		f := newEngineFixture(t, engineDefinition("clerk"))
+		run, _ := f.parked(t)
+		require.NoError(t, f.engine.Cancel(t.Context(), run.ID, "ops@example.test", ""))
+
+		for _, event := range f.bus.published() {
+			assert.NotEqual(t, agent.EventRunCancelled, event.(agent.Event).Type,
+				"the run was announced as cancelled when it had only been asked to stop")
+		}
 	})
 
 	t.Run("a run not yet executed is marked and stays runnable", func(t *testing.T) {
@@ -1158,6 +1172,6 @@ func TestEngine_Cancel(t *testing.T) {
 		debug := f.logs.at(slog.LevelDebug)
 		require.Len(t, debug, 1)
 		assert.Contains(t, debug[0], "bus is down")
-		assert.Contains(t, debug[0], agent.EventRunCancelled)
+		assert.Contains(t, debug[0], agent.EventRunCancelRequested)
 	})
 }
