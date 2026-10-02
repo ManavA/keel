@@ -2969,6 +2969,52 @@ How `agent.Step` maps: `message` holds `Step.Message` as JSON, `call` holds
 `Step.Call`, `idem_key` is `Step.Key`, the three usage columns are
 `Step.Usage`. `agent_runs.start_key` is `Run.Key`, null when empty.
 
+How `agent/pg` writes and reads the columns, beyond what their types say:
+
+- **Ids.** A `uuid` column reads a UUID in any spelling and hands back the
+  canonical one, so the store checks an id's form in Go before it sends
+  one (6.2) and reads every id back as text.
+- **Times.** Every time is bound from the request and none is `now()`. A
+  time is kept to the microsecond below it and read back in UTC. The time a
+  step spent working is measured in Go, between its start as the column
+  kept it and its finish.
+- **The `json` columns** (`definition`, `message`, `call`, `input`) keep the
+  text they are given. `encoding/json` rewrites a `json.RawMessage` as it
+  marshals one, dropping the space between tokens and escaping `<`, `>` and
+  `&`, so the store writes the object around each raw value itself and puts
+  the raw value in as the bytes it came as. A call's arguments, a turn in
+  its provider's form, a tool's schema and the output schema therefore read
+  back byte for byte, but for white space around the whole value. A raw
+  value that is not JSON, or not UTF-8, is refused in Go before the
+  transaction is opened. One that is nil is written as `null` and reads
+  back as `null`.
+- **The `jsonb` columns** (`metadata`, `action`) keep a value and not its
+  text. They read back equal in value, as the table in 6.2 says, and none
+  is stored as `{}`.
+- **Order.** Rows are read as `id::text`, and Postgres gives that column
+  the name `id`. A bare `id` in an `order by` then means the text: sorted in
+  the database's collation, and with a sort where the index would have
+  served. The statements that order by an id name it with its table.
+- **Counts and positions.** A `seq`, a depth or a count that does not fit a
+  four-byte column is never bound: a `seq` that does not fit names no step,
+  and a run with such a depth is refused.
+
+What each column does with a NUL character, which a model, a tool or a
+person can put in any string:
+
+| Columns | Type | A NUL |
+|---|---|---|
+| `agent_runs.definition`, `agent_steps.message`, `agent_steps.call`, `agent_approvals.input` | `json` | Kept, as the escape `\u0000`, and reads back as it was written |
+| `agent_runs.metadata`, `agent_approvals.action` | `jsonb` | Refused by Postgres, SQLSTATE `22P05` |
+| Every `TEXT` column. Those a model or a tool writes: `agent_runs.input`, `output` and `error`; `agent_steps.name` and `result`; `agent_approvals.tool`. Those a person or the service writes: `agent`, `reason`, `start_key`, `lease_owner`, `cancel_by`, `cancel_reason`, `stop`, `decision`, `rule`, `decided_by`, the approval's `reason`, and `agent_tool_effects.key` | `text` | Refused by Postgres, SQLSTATE `22021`, and so is a byte that is not UTF-8 |
+
+So the DDL as it stands lets a string wedge a run: a tool result that holds
+a NUL, or a byte that is not UTF-8, cannot be journaled, the call is made
+again, and the run ends as failed. `agent/pg` returns Postgres's error for
+these and writes nothing. Decision 48 left the rule to this store; the
+store's task raised it rather than choose, and the rule is not yet made.
+`agent/pg/nul_test.go` records each column's behaviour as it is.
+
 ### 6.4 The journal and the conversation
 
 A run's journal is its steps in `seq` order, from 1 with no gaps. There are
@@ -3195,38 +3241,63 @@ time.
 
 ```sql
 with next as (
-    select id from agent_runs
+    select id as next_id from agent_runs
     where status = 'runnable'
-      and agent = any($1)
-      and (lease_expires_at is null or lease_expires_at <= $2)
-      and (next_attempt_at is null or next_attempt_at <= $2)
-    order by created_at
+      and agent = any($4)
+      and (lease_expires_at is null or lease_expires_at <= $1)
+      and (next_attempt_at is null or next_attempt_at <= $1)
+    order by created_at, id
     for update skip locked
     limit 1
 )
-update agent_runs r
-set failures         = r.failures + case when r.lease_owner <> '' then 1 else 0 end,
-    lease_owner      = $3,
-    lease_epoch      = r.lease_epoch + 1,
-    lease_expires_at = $2::timestamptz + $4 * interval '1 microsecond',
-    rev              = r.rev + 1,
-    updated_at       = $2
+update agent_runs
+set failures         = failures + case when lease_owner <> '' then 1 else 0 end,
+    lease_owner      = $2,
+    lease_epoch      = lease_epoch + 1,
+    lease_expires_at = $3,
+    rev              = rev + 1,
+    updated_at       = $1
 from next
-where r.id = next.id
-returning r.*
+where id = next_id
+returning <the run's columns>
 ```
 
-`skip locked` means two processes claiming at once take different runs and
-neither waits. A claim that names its run (`ClaimRequest.RunID`, which
-`Execute` uses) is the same statement with the run's id among the conditions
-and without `skip locked`: it locks the row, and so waits for a write in
-progress, and then decides. Passing over the row there would answer
-`ErrNotClaimable` for a lapsed run whose last holder happened to be in the
-middle of a write. A lease is free when it was released (`lease_owner`
-empty) or has lapsed. Taking over a lapsed one adds a failure, so a run that
-kills every process that touches it is finished as `ReasonAbandoned` by the
-execution that claims it once `MaxFailures` is reached, before that
-execution does any of the run's work.
+`$1` is the claim's time and `$3` that time plus the TTL, added in Go like
+every other time the store writes. `skip locked` means two processes
+claiming at once take different runs and neither waits. Runs created at one
+instant are taken in the order of their ids. The table has no column for the
+order runs arrived in, which is how `MemoryStore` breaks the same tie, and
+the suite pins neither.
+
+A claim that names its run (`ClaimRequest.RunID`, which `Execute` uses) is
+two statements in one transaction. The first locks the row, and so waits for
+a write in progress, and reads whether the run can be taken as it then
+stands:
+
+```sql
+select status = 'runnable'
+   and agent = any($3)
+   and (lease_expires_at is null or lease_expires_at <= $2)
+   and (next_attempt_at is null or next_attempt_at <= $2)
+from agent_runs where id = $1 for update
+```
+
+No row is `ErrNotFound` and false is `ErrNotClaimable`. Otherwise the second
+statement makes the update above for that id. It is not the first statement
+with the id among its conditions and `skip locked` taken out, as this
+section first had it. Passing over the row would answer `ErrNotClaimable`
+for a lapsed run whose last holder happened to be in the middle of a write.
+And a statement that carries the conditions looks for the row in a snapshot
+taken before it waits for anything, so it would answer for the run as it
+was: a run still waiting, say, while the answer that makes it runnable is
+being committed. Locking first and deciding afterwards is what "waits for a
+write in progress and then decides" takes.
+
+A lease is free when it was released (`lease_owner` empty) or has lapsed.
+Taking over a lapsed one adds a failure, so a run that kills every process
+that touches it is finished as `ReasonAbandoned` by the execution that
+claims it once `MaxFailures` is reached, before that execution does any of
+the run's work.
 
 **Heartbeat.** While an execution holds a run, a goroutine extends
 `lease_expires_at` every `HeartbeatInterval`, matching on owner and epoch.
@@ -3243,16 +3314,31 @@ comes before every check that reads the run's state, as the table in 6.2
 orders them:
 
 ```sql
-select lease_owner, lease_epoch from agent_runs where id = $1 for update
+select lease_owner, lease_epoch, cancel_requested, coalesce(parent_id::text, '')
+from agent_runs where id = $1 for update
 ```
 
-If they differ, the transaction ends with `ErrLeaseLost` and changes
-nothing. It ends the same way when the lease names no owner, whatever the
+The last two columns are what `Park`, `Heartbeat` and `Finish` need of the
+run, read under the same lock. If owner and epoch differ from the lease's,
+the transaction ends with `ErrLeaseLost` and changes nothing. It ends the same way when the lease names no owner, whatever the
 row holds: a run nobody holds records an empty owner, and a lease with none
 must not match it. A claim takes the same row lock, so it never lands in the
 middle of a write: a claim by id waits for the write, and a claim without
 one passes over the run until the write is done. Either way the next holder
-always reads a journal that includes it. A process that was paused past its
+always reads a journal that includes it.
+
+Every transaction that writes asks for read committed by name, whatever the
+database's default. Each locks a row and then reads, in a later statement,
+what the lock protects, and only at that level does the later statement see
+what was committed while the lock was waited for. Under repeatable read a
+`Park` that had waited for its row would look for a pending approval or an
+unfinished child in the snapshot it took before it waited. `Changes` is the
+one method that reads under repeatable read, so that the run and the steps
+and approvals it returns are one moment's: read one statement at a time,
+steps before the run, a write landing in between would be lost to the
+reader, who would be handed a `Rev` newer than the steps it got.
+
+A process that was paused past its
 lease, or partitioned from the database and back, therefore cannot add to a
 journal another process now owns. What it can still do is finish the tool
 call it was in the middle of. That is the one way a tool can run twice at
@@ -3407,6 +3493,32 @@ for the same reason.
 With `ApprovalTTL` set, an approval carries `ExpiresAt`. `Tick` calls
 `ExpireApprovals` first, which lapses overdue approvals and sets their runs
 runnable; a lapsed approval declines the call.
+
+What each of these does in `agent/pg`, statement by statement. In every one
+the row is locked first and what is decided on is read afterwards:
+
+| Method | Statements, in order |
+|---|---|
+| `Park` | The fence, which locks the run. Then `select exists (a pending approval of the run) or exists (a child run that has not ended)`. Then the update that sets the run waiting and releases the lease. The look and the write are separate statements on purpose: one statement that carried the look as a condition would evaluate it in a snapshot taken before it waited for the row |
+| `DecideApproval` | Lock the run the approval belongs to (`select r.id from agent_runs r join agent_approvals a on a.run_id = r.id where a.id = $1 for update of r`). Read the approval again. If it is not pending, return it with `ErrAlreadyDecided`, having changed nothing. Otherwise raise the run's `Rev` and wake it, and write the answer with that `Rev`. Of eight answers at once, seven read an approval that has its answer |
+| `ExpireApprovals` | Lock every run that has a pending approval past its time, `order by depth desc, id`, waiting for each and passing over none. Then lapse what is due among those runs' approvals, read again now that the rows are held, each stamped with its run's `Rev` plus one. Then raise each of those runs' `Rev` once and wake it. With nothing due nothing is locked or written |
+| `Finish` | The fence, on the run that is ending. The update that ends it. The update that cancels its pending approvals. Then, for a child, `select 1 from agent_runs where id = <parent> for update`, and `update … where id = <parent> and status = 'waiting'` |
+| `RequestCancel` | Lock the run and read its status and its mark. `ErrFinished`, or nothing for a run already marked, or the update |
+
+Two of these need saying why. `Finish` locks the parent's row whether or not
+the parent is waiting, because an update that matches no row locks none: a
+parent about to park would be passed by, and would then park on a child it
+still saw as running, with nobody left to wake it. And `ExpireApprovals`
+locks before it writes, in one order for every caller, for two reasons. The
+order, children before parents, is the order a child's `Finish` takes the
+same rows in, so a lapse and a child's end, or two workers' lapses, never
+each hold a row the other wants. And an approval stamped with a `Rev`
+computed from a run that was not locked could carry a `Rev` the run has
+since been given by another write, and a reader that had seen that `Rev`
+would never be sent the lapse. The order relies on a child's `Depth` being
+its parent's plus one, which the engine sets and the store does not check;
+a store handed other depths can still deadlock, which Postgres detects and
+reports as an error, and nothing is corrupted by it.
 
 ### 6.11 Child runs and cancellation
 
