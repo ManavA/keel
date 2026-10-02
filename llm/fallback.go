@@ -13,7 +13,10 @@ type FallbackOptions struct {
 	// ShouldFallback decides whether err moves on to the next model. Nil
 	// uses the default above.
 	ShouldFallback func(err error) bool
-	// OnRefusal also moves on when a model answers with StopRefusal.
+	// OnRefusal also moves on when a model answers with StopRefusal. A
+	// refusal is billed, so if no later model answers, the last refusal is the
+	// reply, with a nil error and every refused attempt in Attempts, and the
+	// failures that followed are logged.
 	OnRefusal bool
 	Logger    *slog.Logger
 }
@@ -72,10 +75,19 @@ func (f *Fallback) Generate(ctx context.Context, req Request) (*Response, error)
 }
 
 // Stream implements Model. It moves on only before the first delta: once the
-// caller's callback has been called, the failure or the refusal is returned,
-// since no other model can take the stream over without repeating itself. An
-// error returned by fn itself is the caller's own signal to stop, and comes
-// back as fn returned it.
+// caller's callback has been called, no other model can take the stream over
+// without repeating itself, so the chain ends with what that model returns.
+//
+// The returned Response is authoritative, not the deltas. If a refusal was
+// moved past and a later model then failed, even after delivering deltas, the
+// callback saw those deltas and the reply is the earlier refusal. A refusal
+// that itself delivered a delta stops the chain and is the reply, so a refused
+// attempt's own deltas never go unanswered for.
+//
+// An error returned by fn is the caller's own signal to stop, and comes back
+// as fn returned it, with no reply to carry anything. If a refusal had been
+// moved past, its billed usage is therefore in no account, and is logged at
+// warning level.
 func (f *Fallback) Stream(ctx context.Context, req Request, fn func(Delta) error) (*Response, error) {
 	return f.run(ctx, req, &streamGuard{fn: fn}, func(m Model, req Request, g *streamGuard) (*Response, error) {
 		return m.Stream(ctx, req, g.deliver)
@@ -107,6 +119,10 @@ func (f *Fallback) run(ctx context.Context, req Request, g *streamGuard, call fu
 		resp, err := requireReply(call(m, req, g))
 		if err != nil {
 			if cbErr := g.callbackErr(); cbErr != nil {
+				if refused.last != nil {
+					f.logger.Warn("llm: fallback: the caller stopped the stream after a refusal that was billed; its usage is in no reply",
+						"refused_attempts", len(refused.attempts()), "refused_tokens", refused.usage().Total())
+				}
 				return nil, cbErr
 			}
 		}
@@ -159,6 +175,15 @@ func (r *refusals) attempts() []Attempt {
 		return nil
 	}
 	return append(append([]Attempt(nil), r.earlier...), attemptsOf(r.last)...)
+}
+
+// usage is what every refused attempt was billed.
+func (r *refusals) usage() Usage {
+	var u Usage
+	for _, a := range r.attempts() {
+		u = u.Add(a.Usage)
+	}
+	return u
 }
 
 // reply is the last refusal, with the earlier ones listed in its Attempts.

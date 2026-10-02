@@ -1,10 +1,12 @@
 package llm_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"strings"
 	"sync"
@@ -188,6 +190,7 @@ func TestBudgeted_Generate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			inner := newFakeModel(fakeAnswer("model-a", real))
+			tt.opts.Logger = quietLogger()
 			b, err := llm.NewBudgeted(inner, tt.opts)
 			require.NoError(t, err)
 
@@ -284,7 +287,9 @@ func TestBudgeted_NoCallStartsOnceTheBudgetIsSpent(t *testing.T) {
 	// One call uses exactly the limit, so the budget is spent.
 	real := llm.Usage{InputTokens: 60, OutputTokens: 40}
 	inner := newFakeModelFunc(func(int, llm.Request) fakeStep { return fakeAnswer("model-a", real) })
-	b, err := llm.NewBudgeted(inner, llm.BudgetOptions{MaxTokens: real.Total()})
+	// The reply uses more than its hold, which is how the budget comes to be
+	// spent in one call; the warning that logs is not what this test is about.
+	b, err := llm.NewBudgeted(inner, llm.BudgetOptions{MaxTokens: real.Total(), Logger: quietLogger()})
 	require.NoError(t, err)
 	small := worstUsage(req, 10).Total()
 	require.Less(t, small, real.Total(), "the fixture: a request whose worst case is far under what is left")
@@ -485,6 +490,126 @@ func TestBudgeted_PricesTheReplyAtTheModelItNames(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, llm.Spend{Calls: 1, Tokens: real.Total()}, b.Spent())
 	})
+}
+
+// Real spend is real, so a settle is never clamped to its hold, and the next
+// call is refused for it. But a call that settles for more than was held for it
+// was not covered by the worst case the budget admitted it at, and that is
+// logged, with the model asked for, the model that answered, and both figures.
+func TestBudgeted_ASettleThatPassesItsHoldIsAddedAsItIsAndLogged(t *testing.T) {
+	// The request names the cheap model, so the hold is priced at its rate.
+	req := fakeRequest("model-b")
+	req.MaxTokens = 100
+	worst := worstUsage(req, 100)
+	heldTokens, heldCost := worst.Total(), mustCost(t, "model-b", worst)
+
+	dearer := llm.Usage{InputTokens: 1000, OutputTokens: 100}
+	dearerCost := mustCost(t, "model-a", dearer)
+	require.Greater(t, dearerCost, heldCost, "the fixture: the dearer model's reply costs more than was held")
+	two := fakeAnswer("model-a", dearer)
+	two.resp.Attempts = []llm.Attempt{{Model: "model-a", Usage: worst}, {Model: "model-a", Usage: worst}}
+
+	tests := []struct {
+		name  string
+		opts  llm.BudgetOptions
+		reply fakeStep
+		// wantLogged are texts the warning must carry; none means no warning.
+		wantLogged []string
+		wantSpent  llm.Spend
+	}{
+		{
+			name:  "a reply from a dearer listed model than the one asked for",
+			opts:  llm.BudgetOptions{MaxCostMicros: 1 << 40, Prices: wrapperPrices()},
+			reply: fakeAnswer("model-a", dearer),
+			wantLogged: []string{
+				"level=WARN", "asked=model-b", "answered=model-a",
+				fmt.Sprintf("held_cost_micros=%d", heldCost), fmt.Sprintf("cost_micros=%d", dearerCost),
+			},
+			wantSpent: llm.Spend{Calls: 1, Tokens: dearer.Total(), CostMicros: dearerCost},
+		},
+		{
+			name:  "a reply that used more tokens than were held",
+			opts:  llm.BudgetOptions{MaxTokens: 1 << 40},
+			reply: fakeAnswer("model-b", dearer),
+			wantLogged: []string{
+				"level=WARN", "asked=model-b", "answered=model-b",
+				fmt.Sprintf("held_tokens=%d", heldTokens), fmt.Sprintf("tokens=%d", dearer.Total()),
+			},
+			wantSpent: llm.Spend{Calls: 1, Tokens: dearer.Total()},
+		},
+		{
+			name:  "a chain's attempts that together pass the hold",
+			opts:  llm.BudgetOptions{MaxCostMicros: 1 << 40, Prices: wrapperPrices()},
+			reply: two,
+			wantLogged: []string{
+				"level=WARN", "answered=model-a", fmt.Sprintf("held_cost_micros=%d", heldCost),
+				fmt.Sprintf("cost_micros=%d", 2*mustCost(t, "model-a", worst)),
+			},
+			wantSpent: llm.Spend{Calls: 1, Tokens: 2 * worst.Total(), CostMicros: 2 * mustCost(t, "model-a", worst)},
+		},
+		{
+			name:      "a settle that stays within its hold is not logged",
+			opts:      llm.BudgetOptions{MaxTokens: 1 << 40, MaxCostMicros: 1 << 40, Prices: wrapperPrices()},
+			reply:     fakeAnswer("model-b", worst),
+			wantSpent: llm.Spend{Calls: 1, Tokens: worst.Total(), CostMicros: heldCost},
+		},
+		{
+			name:      "a dimension with no limit has no hold to pass",
+			opts:      llm.BudgetOptions{Prices: wrapperPrices()},
+			reply:     fakeAnswer("model-a", dearer),
+			wantSpent: llm.Spend{Calls: 1, Tokens: dearer.Total(), CostMicros: dearerCost},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			tt.opts.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+			b, err := llm.NewBudgeted(newFakeModel(tt.reply), tt.opts)
+			require.NoError(t, err)
+
+			_, err = b.Generate(context.Background(), req)
+
+			require.NoError(t, err, "the call itself is not refused or failed for it")
+			assert.Equal(t, tt.wantSpent, b.Spent(), "what was really spent is added, not clamped to the hold")
+			if len(tt.wantLogged) == 0 {
+				assert.Empty(t, buf.String())
+				return
+			}
+			for _, text := range tt.wantLogged {
+				assert.Contains(t, buf.String(), text)
+			}
+		})
+	}
+
+	t.Run("and the next call is refused for what was really spent", func(t *testing.T) {
+		limit := dearerCost + heldCost - 1
+		b, err := llm.NewBudgeted(newFakeModelFunc(func(int, llm.Request) fakeStep { return fakeAnswer("model-a", dearer) }),
+			llm.BudgetOptions{MaxCostMicros: limit, Prices: wrapperPrices(), Logger: quietLogger()})
+		require.NoError(t, err)
+
+		_, err = b.Generate(context.Background(), req)
+		require.NoError(t, err, "the first call fits on its worst case, priced at the cheap model")
+		_, err = b.Generate(context.Background(), req)
+
+		require.ErrorIs(t, err, llm.ErrBudgetExceeded)
+	})
+}
+
+func TestBudgeted_WithNoLoggerOptionAnOverrunStillSettles(t *testing.T) {
+	// With no Logger the warning goes to slog's default. Raising that logger's
+	// level for the test keeps it quiet, and the level is put back exactly.
+	previous := slog.SetLogLoggerLevel(slog.LevelError + 1)
+	t.Cleanup(func() { slog.SetLogLoggerLevel(previous) })
+	req := fakeRequest("model-b")
+	req.MaxTokens = 100
+	b, err := llm.NewBudgeted(newFakeModel(fakeAnswer("model-a", llm.Usage{InputTokens: 1000, OutputTokens: 100})),
+		llm.BudgetOptions{MaxCostMicros: 1 << 40, Prices: wrapperPrices()})
+	require.NoError(t, err)
+
+	_, err = b.Generate(context.Background(), req)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), b.Spent().Calls)
 }
 
 func TestBudgeted_NoPriceErrorSaysItsPrefixOnce(t *testing.T) {

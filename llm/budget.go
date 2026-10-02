@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 )
 
@@ -24,6 +25,9 @@ type BudgetOptions struct {
 	// DefaultMaxTokens is the reply bound assumed for a request that sets
 	// none. Default 16000.
 	DefaultMaxTokens int
+	// Logger receives a warning when a call settles for more than was held
+	// for it. Nil uses slog.Default().
+	Logger *slog.Logger
 }
 
 // Spend is what a Budgeted has used.
@@ -46,9 +50,18 @@ type hold struct {
 // admitted or refused in a single step with its hold taken, so calls that
 // start together cannot all be admitted against the same room. A negative
 // limit is below any spend and refuses every call.
+//
+// "Could" holds as far as the hold is an upper bound on the call, and it is
+// not always one. The estimate of the input can undercount a prompt, such as
+// one that is not English; the reply can come from a dearer model than the one
+// the hold was priced at; and a chain behind the budget can bill several
+// attempts for one call. A call that settles for more than was held is added
+// at what it really cost, never clamped, so that the next call is refused for
+// it, and the excess is logged at warning level.
 type Budgeted struct {
-	model Model
-	opts  BudgetOptions
+	model  Model
+	opts   BudgetOptions
+	logger *slog.Logger
 
 	mu    sync.Mutex
 	spent Spend
@@ -66,7 +79,11 @@ func NewBudgeted(m Model, opts BudgetOptions) (*Budgeted, error) {
 	if opts.DefaultMaxTokens <= 0 {
 		opts.DefaultMaxTokens = defaultMaxReplyTokens
 	}
-	return &Budgeted{model: m, opts: opts}, nil
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Budgeted{model: m, opts: opts, logger: logger}, nil
 }
 
 // Generate implements Model. A call it refuses returns an error wrapping
@@ -166,6 +183,7 @@ func (b *Budgeted) settle(h hold, resp *Response) {
 		if c, ok := priceReply(b.opts.Prices, resp, h.model); ok {
 			cost = c
 		}
+		b.warnIfOver(h, resp, tokens, cost)
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -176,6 +194,21 @@ func (b *Budgeted) settle(h hold, resp *Response) {
 		b.spent.Tokens += tokens
 		b.spent.CostMicros += cost
 	}
+}
+
+// warnIfOver logs a settle that passes what was held for it, in a dimension
+// that has a limit: there the budget admitted the call on a worst case that
+// turned out not to be one.
+func (b *Budgeted) warnIfOver(h hold, resp *Response, tokens, cost int64) {
+	overTokens := b.opts.MaxTokens != 0 && tokens > h.tokens
+	overCost := b.opts.MaxCostMicros != 0 && cost > h.cost
+	if !overTokens && !overCost {
+		return
+	}
+	b.logger.Warn("llm: budget: a call settled for more than was held for it",
+		"asked", h.model, "answered", resp.Model,
+		"held_tokens", h.tokens, "tokens", tokens,
+		"held_cost_micros", h.cost, "cost_micros", cost)
 }
 
 // priceReply is what resp cost. Each attempt behind it is priced at the model

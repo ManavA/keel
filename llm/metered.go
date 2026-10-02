@@ -15,8 +15,11 @@ type CallRecord struct {
 	// failed.
 	Model string
 	Usage Usage
-	// CostMicros is the call's cost, and Priced whether the table had a
-	// price for every model that worked on it.
+	// CostMicros is the call's cost, and Priced whether every attempt was
+	// priced: by its own model's name in the table or, failing that, at the
+	// model the request asked for. A model that a fallback moves to should be
+	// listed in the table, since otherwise it is priced at the first model's
+	// rate.
 	CostMicros int64
 	Priced     bool
 	Stop       StopReason
