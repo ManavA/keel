@@ -1661,12 +1661,17 @@ value `false`, which says the attribute is absent, is refused together with
 any other condition on the same attribute, since an absent attribute meets
 none, and written twice it is refused as a repeat. A bare `*` target is refused, with a message that says to leave the
 target empty for every target. A rule named `RuleDefault` is refused, since
-the record would then not say whether a rule matched. A NUL character is
-refused in a rule's name, a kind, a target pattern, an attribute name and the
-policy's version, with a message that names the rule, since a decision record
-holds the rule's name, the version and the attribute names a decision could
-not tell, and no record can hold a NUL: a rule with one would load and then
-fail to record every decision made under it.
+the record would then not say whether a rule matched. A decision record
+holds the name of the rule that decided and of each that matched, the
+policy's version, and the names of the attributes a condition could not tell;
+a name and the version go to text columns, and a name is indexed. So a rule's
+name, an attribute name and the version are refused when they hold a NUL
+character or are not valid UTF-8, and a rule's name and the version when they
+are longer than 256 bytes, each with a message that names the rule: a policy
+with one would load and then fail to record every decision made under it, or
+record something other than what decided. A kind and a target pattern are
+never in a record, and are refused for a NUL because one that holds it can
+only match an action that could never be recorded.
 
 `Parse` first reads the document once to refuse what the decoder would take
 without a word: a document that is not an object (`null` is not an empty
@@ -1706,6 +1711,8 @@ func New(db conn) *Store
 
 // Record implements policy.Recorder. An error for a record that can never be
 // stored wraps policy.ErrUnrecordable; one that is the database's does not.
+// Over a pgx.Tx the insert runs in a savepoint, rolled back when it fails, so
+// that a refusal never leaves the caller's transaction aborted.
 func (s *Store) Record(ctx context.Context, rec policy.Record) error
 
 // Cursor is a position in the log, as agent.Cursor is in a run listing: the
@@ -1715,14 +1722,15 @@ type Cursor struct {
 	ID int64
 }
 
-// Filter narrows List. The zero Filter lists the newest decisions.
+// Filter narrows List. The zero Filter lists the newest decisions. Effect,
+// Rule and Kind match exactly, and so case-sensitively.
 type Filter struct {
 	Effect policy.Effect
 	Rule   string
 	Kind   string
 	Since  time.Time
 	// Before returns decisions older than this position. A cursor whose ID is
-	// below 1 is an error.
+	// below 1, or whose time is outside the years 1 to 9999, is an error.
 	Before *Cursor
 	// Limit defaults to 100 and is at most 1000: a larger number is 1000.
 	Limit int
@@ -1760,9 +1768,10 @@ CREATE TABLE IF NOT EXISTS policy_decisions (
     policy_version TEXT NOT NULL DEFAULT ''
 );
 
--- List reads newest first, optionally narrowed by effect or rule.
+-- List reads newest first, optionally narrowed by effect or rule. The rule index
+-- is in that order within a rule, so a filter on one reads only its rows.
 CREATE INDEX IF NOT EXISTS policy_decisions_decided_idx ON policy_decisions (decided_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS policy_decisions_rule_idx ON policy_decisions (rule, id DESC);
+CREATE INDEX IF NOT EXISTS policy_decisions_rule_idx ON policy_decisions (rule, decided_at DESC, id DESC);
 ```
 
 `attrs`, `matched` and `uncertain` are written as `{}`, `[]` and `[]` when
@@ -1775,11 +1784,16 @@ The listing orders by `(decided_at, id)`, which is the order of
 `policy_decisions_decided_idx`, and pages with a row comparison on it,
 `(decided_at, id) < ($time, $id)`, so a page is a short index scan however
 far back it is, and records that share a time are each on one page and no
-more. `id` is what the log gives a record when it is listed, as `Record.ID`.
-`jsonb` keeps a number as a `numeric`, with every digit and the scale it was
-written with; it refuses `\u0000`, a number of 131072 digits or more before
-the point, and a value nested more deeply than the server's stack, and each
-of those is an error that no retry changes.
+more. A filter on a rule reads `policy_decisions_rule_idx`, which is in the
+same order within a rule, `(rule, decided_at DESC, id DESC)`, and so reads
+only that rule's rows and does not sort them; with the index on the rule and
+the id alone it read them all and sorted. `id` is what the log gives a
+record when it is listed, as `Record.ID`. `jsonb` keeps a number as a
+`numeric`, with every digit and the scale it was written with, up to 131072
+digits before the point and 16383 after it, an exponent counting as it
+expands; it refuses `\u0000`, a number past either limit, and a value nested
+more deeply than the server's stack, and each of those is an error that no
+retry changes. A time is held to years 1 to 9999.
 
 The down file drops the two indexes and the table.
 
@@ -1821,14 +1835,25 @@ caller that retries a step whose decision failed to record retries the second
 and stops at the first. `Decider.Decide` wraps it for an action with more than
 10000 values, `MemoryRecorder.Record` for a record with more, and
 `policy/pg` for what it refuses before it sends anything (a NUL character, a
-decision whose effect is none of the three, attributes JSON cannot hold, an
-empty `json.Number`) and for the errors the server gives of the record's own
-content or size: SQLSTATE class 22, a data exception, and class 54, a program
-limit. A refused connection, a cancelled context, an aborted transaction and
+decision whose effect is none of the three, a kind, target, rule or version
+that is not valid UTF-8, a time outside the years 1 to 9999, an index outside
+an integer column, attributes JSON cannot hold, an empty `json.Number`) and
+for the errors the server gives of the record's own content or size: SQLSTATE
+class 22, a data exception, and class 54, a program limit. A refused connection, a cancelled context, an aborted transaction and
 a server shutting down are the store's, and do not wrap it. The `Decider`
-returns a zero `Decision` either way. A NUL a policy holds in a name, a kind,
-a pattern or an attribute name is refused by `Validate`, since otherwise every
-decision made under that rule would fail to record, for ever.
+returns a zero `Decision` either way. A NUL, bytes that are not UTF-8, or too
+much length in a policy's names or version is refused by `Validate`, since
+otherwise every decision made under that rule would fail to record, for ever.
+
+A store built over a `pgx.Tx` shares the caller's transaction, and a statement
+the server refuses aborts a transaction, so that every statement after it
+fails until the rollback. `policy/pg` therefore refuses in Go what it can,
+and runs the insert in a savepoint when its connection is a transaction,
+rolled back to when it fails: whatever it refuses, the caller's transaction
+goes on. Over a pool the insert is one statement. A page is read from the
+records already committed: a record that commits late with a time older than
+the cursor of a pass that is already beyond it is not in that pass, and a
+fresh pass from the newest finds it.
 
 An invalid policy cannot reach `Decide` through a `Decider`, since
 `NewDecider` validates. Called on a `Policy` value directly, `Decide` treats
@@ -1881,9 +1906,24 @@ Without a database:
   shares a child at every level.
 
 With `pg/testdb`: `policy/pg` records and lists; filters by effect, rule,
-kind and time; attributes survive the round trip; concurrent records all
-land. Its migrations are found by the repository-wide replay check without
-wiring.
+kind and time, case-sensitively; attributes survive the round trip, numbers
+exactly; concurrent records all land. Paging: twelve records recorded in a
+scrambled order, several sharing a time, read back by cursor in pages of every
+size from 1 to 13 and compared with an order worked out by hand, each record
+once; each filter, alone and combined, paged and compared with the same
+filter in one piece; a cursor past the end, before everything, in another
+zone and finer than a microsecond; a malformed cursor refused before a query;
+a limit of a million giving pages of 1000 and the cursor reaching the rest.
+The sentinel: every refusal of the store, and each server error class, wraps
+`policy.ErrUnrecordable` and a refused connection, a closed pool, a
+cancelled context and an aborted transaction do not; through `New(tx)`, after
+each refusal the next statement in the caller's transaction succeeds, and the
+statements sent over a pool and over a transaction are as the package says. The
+server is asked for the plan of the statement `List` runs for a rule filter
+with a cursor, which must read the rule index and not sort. A NUL, a number
+past `numeric`'s range, a value nested too deeply, a lone surrogate and an
+empty `json.Number` are each refused. Its migrations, with the index order,
+are found by the repository-wide replay check without wiring.
 
 ### 5.9 Left out
 
@@ -4758,13 +4798,25 @@ is one sentinel in `policy`, wrapped by whichever recorder refuses a record
 for good; the server's own error stays in the chain beside it. Rejected: a
 sentinel for the failures of the moment, since what is not known to be final
 must be treated as retryable, and a type that carries a reason, which every
-caller would have to switch on. `Validate` refuses a NUL in a rule's name, a
-kind, a target pattern, an attribute name and the version because the
-alternative is a rule that loads and then fails, closed, on every record under
-it, for ever; the refusal is at load, where it costs one startup error that
-names the rule. An empty `json.Number` in an attribute is refused as
+caller would have to switch on. `Validate` refuses a NUL or bytes that are
+not UTF-8 in a rule's name, an attribute name and the version, a name or
+version of more than 256 bytes, and a NUL in a kind and a target pattern,
+because the alternative is a rule that loads and then fails, closed, on every
+record under it, for ever; the refusal is at load, where it costs one startup
+error that names the rule. An empty `json.Number` in an attribute is refused as
 unrecordable, not stored as the 0 `encoding/json` writes for it: a record is
-what was decided on, and nobody sent a zero. Invalid UTF-8 in an attribute
+what was decided on, and nobody sent a zero; it is looked for in what decoded
+JSON holds (a map, a list, a number) and a struct or a typed list is left to
+`encoding/json`, whose rules for a struct a copy would only risk disagreeing
+with. A store built over a transaction runs its insert in a savepoint, since a
+refused statement aborts a transaction that the store shares with its caller,
+and an error that says the record is final does not help a caller whose
+transaction can no longer run; rejected: refusing everything in Go, which
+cannot be done for what only the server knows (a number past `numeric`, a
+value nested past its stack).
+The rule index is `(rule, decided_at DESC, id DESC)`, the order of the
+listing, since on `(rule, id DESC)` a filter on a rare rule sorted its rows
+and a cursor on it filtered them after the fact. Invalid UTF-8 in an attribute
 is replaced by U+FFFD, as `encoding/json` does, and the log says so;
 rejected: refusing it, which would fail the record of an action the policy
 decided on without a word.
