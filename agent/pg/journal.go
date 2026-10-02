@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ManavA/keel/agent"
+	"github.com/ManavA/keel/agent/internal/storerule"
 )
 
 const stepsSQL = `select ` + stepColumns + ` from ` + StepsTable + ` where run_id = $1 order by seq`
@@ -16,7 +17,7 @@ const stepsSQL = `select ` + stepColumns + ` from ` + StepsTable + ` where run_i
 // Steps implements agent.Store.
 func (s *Store) Steps(ctx context.Context, runID string) ([]agent.Step, error) {
 	const op = "steps"
-	if !isUUID(runID) {
+	if !storerule.IsUUID(runID) {
 		return nil, notFound(op)
 	}
 	steps := []agent.Step{}
@@ -85,17 +86,6 @@ func readStep(ctx context.Context, tx pgx.Tx, runID string, seq int) (stepState,
 	}
 	st.kind, st.status = agent.StepKind(kind), agent.StepStatus(status)
 	return st, nil
-}
-
-// activeMillis is the time a step that started at start and finished at end
-// spent working, as the memory store measures it: in whole milliseconds, and
-// not clamped. It is measured in Go, between the start as the column kept it
-// and the end as the column will.
-func activeMillis(start *time.Time, end time.Time) int64 {
-	if start == nil {
-		return 0
-	}
-	return end.Truncate(time.Microsecond).Sub(*start).Milliseconds()
 }
 
 const (
@@ -178,7 +168,7 @@ func (s *Store) CompleteModel(ctx context.Context, lease agent.Lease, req agent.
 	for i, call := range req.Message.Calls {
 		// It was encoded once already, inside the message.
 		calls[i], _ = encodeCall(call)
-		names[i] = kept(call.Name)
+		names[i] = storerule.Kept(call.Name)
 	}
 
 	return s.fenced(ctx, op, lease, func(tx pgx.Tx, _ heldRun) error {
@@ -204,11 +194,11 @@ func (s *Store) CompleteModel(ctx context.Context, lease agent.Lease, req agent.
 		var rev int64
 		err = tx.QueryRow(ctx, replyRunSQL, lease.RunID,
 			req.Usage.InputTokens, req.Usage.OutputTokens, req.Usage.CostMicros,
-			activeMillis(st.startedAt, req.Now), req.Now).Scan(&rev)
+			storerule.ActiveMillis(st.startedAt, req.Now), req.Now).Scan(&rev)
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, completeModelStepSQL, lease.RunID, req.Seq, kept(req.Model), message, kept(string(req.Stop)),
+		_, err = tx.Exec(ctx, completeModelStepSQL, lease.RunID, req.Seq, storerule.Kept(req.Model), message, storerule.Kept(string(req.Stop)),
 			req.Usage.InputTokens, req.Usage.OutputTokens, req.Usage.CostMicros, req.Now, rev)
 		if err != nil || len(calls) == 0 {
 			return err
@@ -224,14 +214,6 @@ func (s *Store) CompleteModel(ctx context.Context, lease agent.Lease, req agent.
 		_, err = tx.Exec(ctx, insertToolStepsSQL, lease.RunID, req.Seq, rev, req.Now, seqs, names, calls, keys)
 		return err
 	})
-}
-
-func isStepStatus(status agent.StepStatus) bool {
-	switch status {
-	case agent.StepProposed, agent.StepWaiting, agent.StepStarted, agent.StepCompleted, agent.StepBlocked, agent.StepDeclined:
-		return true
-	}
-	return false
 }
 
 const (
@@ -265,10 +247,10 @@ where run_id = $1 and seq = $2`
 // UpdateStep implements agent.Store.
 func (s *Store) UpdateStep(ctx context.Context, lease agent.Lease, req agent.StepUpdate) error {
 	const op = "update step"
-	if !isStepStatus(req.To) {
+	if !storerule.IsStepStatus(string(req.To)) {
 		return refused(op, "%q is not a step status", req.To)
 	}
-	if req.ChildRunID != "" && !isUUID(req.ChildRunID) {
+	if req.ChildRunID != "" && !storerule.IsUUID(req.ChildRunID) {
 		return refused(op, "child run id %q is not a UUID", req.ChildRunID)
 	}
 
@@ -286,7 +268,7 @@ func (s *Store) UpdateStep(ctx context.Context, lease agent.Lease, req agent.Ste
 		// that waited on a person or a child did not.
 		var active int64
 		if final && req.From == agent.StepStarted {
-			active = activeMillis(st.startedAt, req.Now)
+			active = storerule.ActiveMillis(st.startedAt, req.Now)
 		}
 		var rev int64
 		err = tx.QueryRow(ctx, moveRunSQL, lease.RunID,
@@ -300,8 +282,8 @@ func (s *Store) UpdateStep(ctx context.Context, lease agent.Lease, req agent.Ste
 			result = *req.Result
 		}
 		_, err = tx.Exec(ctx, moveStepSQL, lease.RunID, req.Seq, string(req.To),
-			req.Decision != "", kept(string(req.Decision)), kept(req.Rule),
-			req.Result != nil, kept(result), req.IsError,
+			req.Decision != "", storerule.Kept(string(req.Decision)), storerule.Kept(req.Rule),
+			req.Result != nil, storerule.Kept(result), req.IsError,
 			nullable(req.ChildRunID),
 			req.Usage.InputTokens, req.Usage.OutputTokens, req.Usage.CostMicros,
 			starts, final, req.Now, rev)

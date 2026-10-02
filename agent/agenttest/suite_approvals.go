@@ -1,6 +1,7 @@
 package agenttest
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sync"
@@ -129,6 +130,76 @@ func requestApprovalCases() []storeCase {
 			assert.Equal(k.t, agent.StepWaiting, step.Status)
 			assert.Equal(k.t, agent.Allow, step.Decision)
 			assert.Equal(k.t, suiteRule, step.Rule)
+		}},
+		{"attributes that carry JSON of their own read back as JSON gives them", func(k *kit) {
+			// A tool that describes its call by handing on the arguments
+			// the model wrote: raw JSON, with whatever is in it. Each is
+			// asked about on its own, so that none hides behind another.
+			tests := []struct {
+				name  string
+				attrs map[string]any
+				want  map[string]any
+			}{
+				{
+					// An escape for half a character, which JSON may
+					// write and no string holds.
+					"raw JSON with a lone surrogate",
+					map[string]any{"input": raw(`{"a":"\ud800","b":[1, 2.5,"x"]}`)},
+					map[string]any{"input": map[string]any{"a": "\ufffd", "b": []any{float64(1), 2.5, "x"}}},
+				},
+				{
+					"a lone surrogate in a list",
+					map[string]any{"list": []any{raw(`"\udfff!"`), json.Number("0.5")}},
+					map[string]any{"list": []any{"\ufffd!", 0.5}},
+				},
+				{
+					"raw JSON inside a value, with a NUL in it",
+					map[string]any{"nested": map[string]any{"raw": raw(`[{"nul":"a\u0000b"}, null, true]`)}},
+					map[string]any{"nested": map[string]any{"raw": []any{map[string]any{"nul": "a\ufffdb"}, nil, true}}},
+				},
+				{
+					"numbers as text",
+					map[string]any{"count": json.Number("12"), "big": json.Number("12345678901234567890"), "raw": raw(`1e3`)},
+					map[string]any{"count": float64(12), "big": float64(12345678901234567890), "raw": float64(1000)},
+				},
+			}
+			for _, tt := range tests {
+				_, lease := k.proposed(agentAlpha)
+				req := k.askRequest(2)
+				req.Action.Attrs = tt.attrs
+
+				got, err := k.store.RequestApproval(k.ctx, lease, req)
+
+				require.NoError(k.t, err, tt.name)
+				assert.Equal(k.t, tt.want, got.Action.Attrs, "%s, as returned", tt.name)
+				assert.Equal(k.t, tt.want, k.approval(req.ID).Action.Attrs, "%s, as read", tt.name)
+			}
+		}},
+		{"a number in the attributes that no float64 holds is refused", func(k *kit) {
+			run, lease := k.proposed(agentAlpha)
+			before := k.snapshot(run.ID)
+
+			attrs := map[string]map[string]any{
+				"as a number":              {"n": json.Number("1e400000")},
+				"inside raw JSON":          {"input": raw(`{"n":1e400000}`)},
+				"inside raw JSON, nested":  {"outer": map[string]any{"input": []any{raw(`[-1e999]`)}}},
+				"raw JSON that is no JSON": {"input": raw(`{"n":`)},
+			}
+			for name, a := range attrs {
+				req := k.askRequest(2)
+				req.Action.Attrs = a
+
+				_, err := k.store.RequestApproval(k.ctx, lease, req)
+
+				require.Error(k.t, err, name)
+				assert.NotErrorIs(k.t, err, agent.ErrConflict, name)
+				k.unchanged(before)
+				_, err = k.store.GetApproval(k.ctx, req.ID)
+				assert.ErrorIs(k.t, err, agent.ErrNotFound, name)
+			}
+
+			// The lease is still good, and the question can be asked.
+			k.ask(lease, 2, nil)
 		}},
 		{"attributes JSON cannot hold are refused", func(k *kit) {
 			run, lease := k.proposed(agentAlpha)

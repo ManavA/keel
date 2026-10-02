@@ -2,12 +2,11 @@ package pg
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
-	"unicode/utf8"
 
 	"github.com/ManavA/keel/agent"
+	"github.com/ManavA/keel/agent/internal/storerule"
 )
 
 // The JSON columns hold values that carry JSON somebody else wrote: a call's
@@ -65,7 +64,7 @@ func (o *jsonObject) raw(name string, value json.RawMessage) {
 		o.buf = append(o.buf, "null"...)
 		return
 	}
-	if err := validRaw(value); err != nil && o.err == nil {
+	if err := storerule.ValidRaw(value); err != nil && o.err == nil {
 		o.err = fmt.Errorf("%s: %w", name, err)
 	}
 	o.buf = append(o.buf, value...)
@@ -103,18 +102,6 @@ func appendJSONString(buf []byte, s string) []byte {
 	// A string always marshals.
 	quoted, _ := json.Marshal(s)
 	return append(buf, quoted...)
-}
-
-// validRaw reports why a json column could not keep value. Postgres wants
-// JSON, and wants it in UTF-8, which encoding/json does not check.
-func validRaw(value json.RawMessage) error {
-	if !json.Valid(value) {
-		return errors.New("not valid JSON")
-	}
-	if !utf8.Valid(value) {
-		return errors.New("not UTF-8")
-	}
-	return nil
 }
 
 // encodeCall is c as agent_steps.call holds it.
@@ -216,30 +203,32 @@ func encodeSnapshot(s agent.Snapshot) (string, error) {
 }
 
 // encodeMetadata is a run's metadata as agent_runs.metadata holds it: an
-// object, and an empty one for none.
+// object, and an empty one for none, with nothing in it a jsonb column would
+// refuse.
 func encodeMetadata(metadata map[string]string) (string, error) {
-	if len(metadata) == 0 {
-		return "{}", nil
-	}
-	text, err := json.Marshal(metadata)
+	text, err := json.Marshal(storerule.Metadata(metadata))
 	if err != nil {
-		return "", err
-	}
-	if text, err = keptJSON(text); err != nil {
 		return "", err
 	}
 	return string(text), nil
 }
 
 // encodeAction is a as agent_approvals.action holds it. It fails for
-// attributes JSON cannot hold.
+// attributes JSON cannot hold, and for a number in them no float64 holds.
+//
+// The attributes are decoded and written again, and not written as they
+// came: an attribute may carry JSON of its own, a json.RawMessage of the
+// model's arguments, and a jsonb column refuses things JSON text may hold,
+// such as the escape for half a character. What storerule.Attrs hands back
+// is plain values a column takes, and is what MemoryStore keeps.
 func encodeAction(a agent.Action) (string, error) {
-	text, err := json.Marshal(a)
+	attrs, err := storerule.Attrs(a.Attrs)
 	if err != nil {
-		return "", fmt.Errorf("action attributes: %w", err)
+		return "", err
 	}
-	if text, err = keptJSON(text); err != nil {
-		return "", fmt.Errorf("action attributes: %w", err)
+	text, err := json.Marshal(agent.Action{Kind: storerule.Kept(a.Kind), Target: storerule.Kept(a.Target), Attrs: attrs})
+	if err != nil {
+		return "", fmt.Errorf("action: %w", err)
 	}
 	return string(text), nil
 }

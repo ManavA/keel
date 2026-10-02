@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/ManavA/keel/agent"
+	"github.com/ManavA/keel/agent/internal/storerule"
 	keelpg "github.com/ManavA/keel/pg"
 )
 
@@ -22,13 +23,6 @@ const (
 	StepsTable     = "agent_steps"
 	ApprovalsTable = "agent_approvals"
 	EffectsTable   = "agent_tool_effects"
-)
-
-// The bounds on a listing's length, for RunFilter.Limit and
-// ApprovalFilter.Limit.
-const (
-	defaultListLimit = 50
-	maxListLimit     = 200
 )
 
 // Store is an agent.Store backed by Postgres. The zero value is not usable;
@@ -134,16 +128,16 @@ const (
 // run, the second waiting on the first's row.
 func (s *Store) CreateRun(ctx context.Context, run agent.Run) (agent.Run, bool, error) {
 	const op = "create run"
-	if !isUUID(run.ID) {
+	if !storerule.IsUUID(run.ID) {
 		return agent.Run{}, false, refused(op, "id %q is not a UUID", run.ID)
 	}
-	if run.ParentID != "" && !isUUID(run.ParentID) {
+	if run.ParentID != "" && !storerule.IsUUID(run.ParentID) {
 		return agent.Run{}, false, refused(op, "parent id %q is not a UUID", run.ParentID)
 	}
 	if run.Status != agent.StatusRunnable {
 		return agent.Run{}, false, refused(op, "status is %q, not %q", run.Status, agent.StatusRunnable)
 	}
-	if !storable(run.Agent) || !storable(run.Key) || !storable(run.LeaseOwner) {
+	if !storerule.Comparable(run.Agent) || !storerule.Comparable(run.Key) || !storerule.Comparable(run.LeaseOwner) {
 		return agent.Run{}, false, refused(op, "the agent %q, the key %q or the owner %q holds a character no column keeps",
 			run.Agent, run.Key, run.LeaseOwner)
 	}
@@ -165,63 +159,97 @@ func (s *Store) CreateRun(ctx context.Context, run agent.Run) (agent.Run, bool, 
 		created bool
 	)
 	err = s.inTx(ctx, op, readCommitted, func(tx pgx.Tx) error {
-		inserted, err := scanRun(tx.QueryRow(ctx, insertRunSQL,
-			run.ID, run.Agent, string(run.Status), kept(run.Reason), kept(run.Input), kept(run.Output), kept(run.Error),
-			nullable(run.ParentID), run.ParentSeq, run.Depth, nullable(run.Key), definition, metadata,
-			run.Usage.InputTokens, run.Usage.OutputTokens, run.Usage.CostMicros, run.ModelCalls, run.ActiveMillis,
-			run.LeaseOwner, run.LeaseEpoch, run.LeaseExpiresAt, run.Failures, run.NextAttemptAt,
-			run.CancelRequested, kept(run.CancelBy), kept(run.CancelReason), run.CreatedAt, run.UpdatedAt, run.FinishedAt))
-		if err == nil {
-			stored, created = inserted, true
-			return nil
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-
-		if run.Key != "" {
-			first, err := scanRun(tx.QueryRow(ctx, runByKeySQL, run.Agent, run.Key))
+		// The insert, and then the look for why it stored nothing. Between
+		// the two the reason can go away: the parent it did not find is
+		// stored, or the run it conflicted with is purged. The insert is
+		// then made once more, and not answered with a reason that is no
+		// longer so.
+		for try := 1; ; try++ {
+			inserted, err := scanRun(tx.QueryRow(ctx, insertRunSQL,
+				run.ID, run.Agent, string(run.Status), storerule.Kept(run.Reason), storerule.Kept(run.Input), storerule.Kept(run.Output), storerule.Kept(run.Error),
+				nullable(run.ParentID), run.ParentSeq, run.Depth, nullable(run.Key), definition, metadata,
+				run.Usage.InputTokens, run.Usage.OutputTokens, run.Usage.CostMicros, run.ModelCalls, run.ActiveMillis,
+				run.LeaseOwner, run.LeaseEpoch, run.LeaseExpiresAt, run.Failures, run.NextAttemptAt,
+				run.CancelRequested, storerule.Kept(run.CancelBy), storerule.Kept(run.CancelReason), run.CreatedAt, run.UpdatedAt, run.FinishedAt))
 			if err == nil {
-				stored = first
+				stored, created = inserted, true
 				return nil
+			}
+			// The parent was there when the insert looked and was removed
+			// before Postgres checked the reference: it does not exist.
+			var failure *pgconn.PgError
+			if errors.As(err, &failure) && failure.Code == foreignKeyViolation {
+				return fmt.Errorf("parent %s does not exist", run.ParentID)
 			}
 			if !errors.Is(err, pgx.ErrNoRows) {
 				return err
 			}
-		}
-		var taken bool
-		if err := tx.QueryRow(ctx, runExistsSQL, run.ID).Scan(&taken); err != nil {
-			return err
-		}
-		if taken {
-			return fmt.Errorf("id %q is already in use", run.ID)
-		}
-		// A child is one level below its parent, and a run nobody started
-		// is at none: the order rows are locked in, children before
-		// parents, is taken from the depth.
-		if run.ParentID == "" && run.Depth != 0 {
-			return fmt.Errorf("depth is %d for a run no other started", run.Depth)
-		}
-		if run.ParentID != "" {
-			var depth int
-			err := tx.QueryRow(ctx, runDepthSQL, run.ParentID).Scan(&depth)
-			if errors.Is(err, pgx.ErrNoRows) {
-				return fmt.Errorf("parent %s does not exist", run.ParentID)
-			}
+
+			first, err := notStored(ctx, tx, run)
 			if err != nil {
 				return err
 			}
-			if run.Depth != depth+1 {
-				return fmt.Errorf("depth is %d under a parent at depth %d", run.Depth, depth)
+			if first != nil {
+				stored = *first
+				return nil
+			}
+			if try == 2 {
+				return errors.New("the runs this one depends on changed twice while it was being stored")
 			}
 		}
-		// Purge removed it between the insert and the look.
-		return errors.New("the run this one conflicted with has since been removed")
 	})
 	if err != nil {
 		return agent.Run{}, false, err
 	}
 	return stored, created, nil
+}
+
+// foreignKeyViolation is the SQLSTATE of a reference to a row that is not
+// there.
+const foreignKeyViolation = "23503"
+
+// notStored says why the insert of run stored nothing, in the order the
+// contract gives: the run that has its key, which is returned; or an error
+// for an id in use, a parent that does not exist, or a depth that is not the
+// parent's plus one. It returns neither when none of these is so any more.
+func notStored(ctx context.Context, tx pgx.Tx, run agent.Run) (*agent.Run, error) {
+	if run.Key != "" {
+		first, err := scanRun(tx.QueryRow(ctx, runByKeySQL, run.Agent, run.Key))
+		if err == nil {
+			return &first, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	}
+	var taken bool
+	if err := tx.QueryRow(ctx, runExistsSQL, run.ID).Scan(&taken); err != nil {
+		return nil, err
+	}
+	if taken {
+		return nil, fmt.Errorf("id %q is already in use", run.ID)
+	}
+	// A child is one level below its parent, and a run nobody started is at
+	// none: the order rows are locked in, children before parents, is taken
+	// from the depth.
+	if run.ParentID == "" {
+		if run.Depth != 0 {
+			return nil, fmt.Errorf("depth is %d for a run no other started", run.Depth)
+		}
+		return nil, nil
+	}
+	var depth int
+	err := tx.QueryRow(ctx, runDepthSQL, run.ParentID).Scan(&depth)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("parent %s does not exist", run.ParentID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if run.Depth != depth+1 {
+		return nil, fmt.Errorf("depth is %d under a parent at depth %d", run.Depth, depth)
+	}
+	return nil, nil
 }
 
 // getRun reads run id, which is known to be a UUID.
@@ -236,7 +264,7 @@ func getRun(ctx context.Context, tx pgx.Tx, id string) (agent.Run, error) {
 // GetRun implements agent.Store.
 func (s *Store) GetRun(ctx context.Context, id string) (agent.Run, error) {
 	const op = "get run"
-	if !isUUID(id) {
+	if !storerule.IsUUID(id) {
 		return agent.Run{}, notFound(op)
 	}
 	var run agent.Run
@@ -273,26 +301,15 @@ func (c *conditions) where() string {
 	return " where " + strings.Join(c.clauses, " and ")
 }
 
-func listLimit(limit int) int {
-	switch {
-	case limit <= 0:
-		return defaultListLimit
-	case limit > maxListLimit:
-		return maxListLimit
-	}
-	return limit
-}
-
 // listCursor is the position a listing starts after, or nil for the start.
-// A cursor is an argument, and may have come from a client: its id must be a
-// UUID in the one form, though it need not be one a run has. The zero Cursor
-// is no position, and lists from the start.
+// storerule.Cursor says which cursors are refused.
 func listCursor(c *agent.Cursor) (*agent.Cursor, error) {
-	if c == nil || c.ID == "" && c.CreatedAt.IsZero() {
+	if c == nil {
 		return nil, nil
 	}
-	if !isUUID(c.ID) {
-		return nil, fmt.Errorf("cursor id %q is not a UUID", c.ID)
+	start, err := storerule.Cursor(c.ID, c.CreatedAt)
+	if err != nil || start {
+		return nil, err
 	}
 	return c, nil
 }
@@ -310,7 +327,7 @@ func (s *Store) ListRuns(ctx context.Context, f agent.RunFilter) ([]agent.Run, e
 	}
 	// A filter is not a lookup: a parent's id, an agent's name or a status
 	// that no run could have lists nothing, and is not sent.
-	if f.ParentID != "" && !isUUID(f.ParentID) || !storable(f.Agent) || !storable(string(f.Status)) {
+	if f.ParentID != "" && !storerule.IsUUID(f.ParentID) || !storerule.Comparable(f.Agent) || !storerule.Comparable(string(f.Status)) {
 		return []agent.Run{}, nil
 	}
 
@@ -328,7 +345,7 @@ func (s *Store) ListRuns(ctx context.Context, f agent.RunFilter) ([]agent.Run, e
 		c.and("(created_at, id) < (" + c.arg(before.CreatedAt) + ", " + c.arg(before.ID) + "::uuid)")
 	}
 	query := `select ` + runColumns + ` from ` + RunsTable + c.where() +
-		` order by created_at desc, ` + runIDColumn + ` desc limit ` + c.arg(listLimit(f.Limit))
+		` order by created_at desc, ` + runIDColumn + ` desc limit ` + c.arg(storerule.ListLimit(f.Limit))
 
 	runs := []agent.Run{}
 	err = s.inTx(ctx, op, readCommitted, func(tx pgx.Tx) error {
@@ -399,24 +416,27 @@ func (s *Store) Claim(ctx context.Context, req agent.ClaimRequest) (*agent.Run, 
 	if req.Owner == "" {
 		return nil, refused(op, "owner is empty")
 	}
-	if !storable(req.Owner) {
+	if !storerule.Comparable(req.Owner) {
 		return nil, refused(op, "owner %q holds a character no column keeps", req.Owner)
 	}
 	if req.TTL <= 0 {
 		return nil, refused(op, "ttl is %s, not more than zero", req.TTL)
 	}
-	if req.RunID != "" && !isUUID(req.RunID) {
+	if req.RunID != "" && !storerule.IsUUID(req.RunID) {
 		return nil, notFound(op)
 	}
 	// Never null: a null list makes the condition null, not false. A name
 	// no column keeps is no run's agent, and is not sent.
 	agents := []string{}
 	for _, name := range req.Agents {
-		if storable(name) {
+		if storerule.Comparable(name) {
 			agents = append(agents, name)
 		}
 	}
-	expires := req.Now.Add(req.TTL)
+	// To the microsecond above: the column keeps no more, and kept to the
+	// one below the lease would be free to take before its holder, who added
+	// the same numbers, counts it lapsed.
+	expires := storerule.Expiry(req.Now.Add(req.TTL))
 
 	var claimed *agent.Run
 	err := s.inTx(ctx, op, readCommitted, func(tx pgx.Tx) error {
@@ -477,7 +497,7 @@ type heldRun struct {
 // journal another process now owns: a claim takes the same row and raises
 // the epoch, and so comes wholly before the write or wholly after it.
 func (s *Store) fenced(ctx context.Context, op string, lease agent.Lease, fn func(tx pgx.Tx, run heldRun) error) error {
-	if !isUUID(lease.RunID) {
+	if !storerule.IsUUID(lease.RunID) {
 		return notFound(op)
 	}
 	return s.inTx(ctx, op, readCommitted, func(tx pgx.Tx) error {
@@ -535,7 +555,7 @@ func (s *Store) Heartbeat(ctx context.Context, lease agent.Lease, now time.Time,
 	var cancelRequested bool
 	err := s.fenced(ctx, op, lease, func(tx pgx.Tx, run heldRun) error {
 		cancelRequested = run.cancelRequested
-		_, err := tx.Exec(ctx, heartbeatSQL, lease.RunID, now.Add(ttl))
+		_, err := tx.Exec(ctx, heartbeatSQL, lease.RunID, storerule.Expiry(now.Add(ttl)))
 		return err
 	})
 	if err != nil {
@@ -555,7 +575,7 @@ where id = $1`
 // Yield implements agent.Store.
 func (s *Store) Yield(ctx context.Context, lease agent.Lease, req agent.YieldRequest) error {
 	return s.fenced(ctx, "yield", lease, func(tx pgx.Tx, _ heldRun) error {
-		_, err := tx.Exec(ctx, yieldSQL, lease.RunID, req.NextAttemptAt, req.Failed, kept(req.Error), req.Now)
+		_, err := tx.Exec(ctx, yieldSQL, lease.RunID, req.NextAttemptAt, req.Failed, storerule.Kept(req.Error), req.Now)
 		return err
 	})
 }
@@ -604,7 +624,7 @@ func park(ctx context.Context, tx pgx.Tx, runID string, run heldRun, req agent.P
 	if !waits {
 		return false, nil
 	}
-	if _, err := tx.Exec(ctx, parkSQL, runID, kept(req.Reason), req.Now); err != nil {
+	if _, err := tx.Exec(ctx, parkSQL, runID, storerule.Kept(req.Reason), req.Now); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -643,7 +663,7 @@ func (s *Store) Finish(ctx context.Context, lease agent.Lease, req agent.FinishR
 	return s.fenced(ctx, op, lease, func(tx pgx.Tx, run heldRun) error {
 		var rev int64
 		err := tx.QueryRow(ctx, finishSQL,
-			lease.RunID, string(req.Status), kept(req.Reason), kept(req.Output), kept(req.Error), req.Now).Scan(&rev)
+			lease.RunID, string(req.Status), storerule.Kept(req.Reason), storerule.Kept(req.Output), storerule.Kept(req.Error), req.Now).Scan(&rev)
 		if err != nil {
 			return err
 		}
@@ -682,7 +702,7 @@ where id = $1`
 // RequestCancel implements agent.Store.
 func (s *Store) RequestCancel(ctx context.Context, req agent.CancelRequest) error {
 	const op = "request cancel"
-	if !isUUID(req.RunID) {
+	if !storerule.IsUUID(req.RunID) {
 		return notFound(op)
 	}
 	return s.inTx(ctx, op, readCommitted, func(tx pgx.Tx) error {
@@ -704,7 +724,7 @@ func (s *Store) RequestCancel(ctx context.Context, req agent.CancelRequest) erro
 		if marked {
 			return nil
 		}
-		_, err = tx.Exec(ctx, cancelSQL, req.RunID, kept(req.By), kept(req.Reason), req.Now)
+		_, err = tx.Exec(ctx, cancelSQL, req.RunID, storerule.Kept(req.By), storerule.Kept(req.Reason), req.Now)
 		return err
 	})
 }
@@ -730,7 +750,7 @@ order by requested_at, ` + approvalIDColumn
 // good, since the reader would be handed a Rev newer than the steps it got.
 func (s *Store) Changes(ctx context.Context, runID string, since int64) (agent.Changes, error) {
 	const op = "changes"
-	if !isUUID(runID) {
+	if !storerule.IsUUID(runID) {
 		return agent.Changes{}, notFound(op)
 	}
 	var changes agent.Changes

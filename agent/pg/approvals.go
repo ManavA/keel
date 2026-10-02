@@ -10,15 +10,8 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ManavA/keel/agent"
+	"github.com/ManavA/keel/agent/internal/storerule"
 )
-
-func isCause(cause agent.ApprovalCause) bool {
-	switch cause {
-	case agent.CauseGuard, agent.CauseTool, agent.CauseInterrupted:
-		return true
-	}
-	return false
-}
 
 const (
 	approvalSQL = `select ` + approvalColumns + ` from ` + ApprovalsTable + ` where id = $1`
@@ -49,10 +42,10 @@ returning ` + approvalColumns
 // RequestApproval implements agent.Store.
 func (s *Store) RequestApproval(ctx context.Context, lease agent.Lease, req agent.ApprovalRequest) (agent.Approval, error) {
 	const op = "request approval"
-	if !isUUID(req.ID) {
+	if !storerule.IsUUID(req.ID) {
 		return agent.Approval{}, refused(op, "id %q is not a UUID", req.ID)
 	}
-	if !isCause(req.Cause) {
+	if !storerule.IsCause(string(req.Cause)) {
 		return agent.Approval{}, refused(op, "%q is not a cause", req.Cause)
 	}
 	action, err := encodeAction(req.Action)
@@ -92,12 +85,12 @@ func (s *Store) RequestApproval(ctx context.Context, lease agent.Lease, req agen
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, waitStepSQL, lease.RunID, req.Seq, req.Decision != "", kept(string(req.Decision)), kept(req.Rule), rev)
+		_, err = tx.Exec(ctx, waitStepSQL, lease.RunID, req.Seq, req.Decision != "", storerule.Kept(string(req.Decision)), storerule.Kept(req.Rule), rev)
 		if err != nil {
 			return err
 		}
 		approval, err = scanApproval(tx.QueryRow(ctx, insertApprovalSQL,
-			req.ID, lease.RunID, req.Seq, st.attempts, string(req.Cause), st.name, input, action, kept(req.Rule),
+			req.ID, lease.RunID, req.Seq, st.attempts, string(req.Cause), st.name, input, action, storerule.Kept(req.Rule),
 			rev, req.Now, req.ExpiresAt))
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Another run's approval has the id. Returning the error undoes
@@ -132,7 +125,7 @@ func callInput(call []byte) (string, error) {
 // GetApproval implements agent.Store.
 func (s *Store) GetApproval(ctx context.Context, id string) (agent.Approval, error) {
 	const op = "get approval"
-	if !isUUID(id) {
+	if !storerule.IsUUID(id) {
 		return agent.Approval{}, notFound(op)
 	}
 	var approval agent.Approval
@@ -153,7 +146,7 @@ func (s *Store) GetApproval(ctx context.Context, id string) (agent.Approval, err
 func (s *Store) ListApprovals(ctx context.Context, f agent.ApprovalFilter) ([]agent.Approval, error) {
 	// A filter is not a lookup: a run's id or a status that no approval
 	// could have lists nothing, and is not sent.
-	if f.RunID != "" && !isUUID(f.RunID) || !storable(string(f.Status)) {
+	if f.RunID != "" && !storerule.IsUUID(f.RunID) || !storerule.Comparable(string(f.Status)) {
 		return nil, nil
 	}
 
@@ -165,7 +158,7 @@ func (s *Store) ListApprovals(ctx context.Context, f agent.ApprovalFilter) ([]ag
 		c.and("run_id = " + c.arg(f.RunID))
 	}
 	query := `select ` + approvalColumns + ` from ` + ApprovalsTable + c.where() +
-		` order by requested_at, ` + approvalIDColumn + ` limit ` + c.arg(listLimit(f.Limit))
+		` order by requested_at, ` + approvalIDColumn + ` limit ` + c.arg(storerule.ListLimit(f.Limit))
 
 	var approvals []agent.Approval
 	err := s.inTx(ctx, "list approvals", readCommitted, func(tx pgx.Tx) error {
@@ -211,7 +204,7 @@ returning ` + approvalColumns
 // one order or the other, never in between.
 func (s *Store) DecideApproval(ctx context.Context, req agent.DecideRequest) (agent.Approval, error) {
 	const op = "decide approval"
-	if !isUUID(req.ID) {
+	if !storerule.IsUUID(req.ID) {
 		return agent.Approval{}, notFound(op)
 	}
 
@@ -247,7 +240,7 @@ func (s *Store) DecideApproval(ctx context.Context, req agent.DecideRequest) (ag
 		if req.Approved {
 			status = agent.ApprovalApproved
 		}
-		approval, err = scanApproval(tx.QueryRow(ctx, decideSQL, req.ID, string(status), kept(req.By), kept(req.Reason), req.Now, rev))
+		approval, err = scanApproval(tx.QueryRow(ctx, decideSQL, req.ID, string(status), storerule.Kept(req.By), storerule.Kept(req.Reason), req.Now, rev))
 		return err
 	})
 	if err != nil {

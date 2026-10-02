@@ -3163,7 +3163,7 @@ from the request; a store never reads a clock.
 | Method | Effect |
 |---|---|
 | Every method, in this order | First, what the request alone shows to be wrong is refused, before the store is touched: an id to be kept that is not a UUID in canonical form, a TTL of zero or less, a `To` that is no step status, a `Status` the method does not take, a cause that is none of the three, attributes JSON cannot hold, raw JSON that is not JSON, a claim with no owner, a name that cannot be kept, a list cursor whose id is not a UUID. A Postgres store makes these checks in Go before it opens a transaction. Second, a run or an approval that does not exist is `ErrNotFound`. Third, for a method that takes a `Lease`, a lease that is not the run's is `ErrLeaseLost`. Fourth, and only then, whatever depends on the state of the run, its steps and its approvals: its status, a step's `From`, a parent that does not exist or is not one level above, an approval already recorded. So a call that is wrong in two ways gets the same error from every store: a lost lease with a bad argument is refused for the argument, and a lost lease with a step in the wrong status is `ErrLeaseLost` |
-| Every string | A database column holds neither a NUL character nor a byte that is not UTF-8, and a model, a tool or a person can put either in anything they write. **A string a store only records is kept, with each such character as the replacement character U+FFFD**: a run's input, output and error, a reason, a tool's result, a rule and a decision, the name of a tool the model called and of the model that answered, why it stopped, who decided or cancelled and why, and the strings inside `Metadata` and an `Action`, keys included. So no journal write fails, and no run is wedged, for what a model or a tool wrote. **A string a store compares is refused**, as an argument and with nothing changed, because it could only be kept as another name: an agent's name, a start key, a lease's owner, and an id, which has its own rule below. In a filter such a name is no run's, and lists or claims nothing. Inside what is kept as JSON, which is a message and a definition, a NUL is kept, since JSON has an escape for it, and only the byte that is not UTF-8 becomes the replacement character. **Raw JSON is kept as the bytes it came as, or refused**: a call's arguments, the provider's form of a turn, a tool's schema and the output schema must be JSON, in UTF-8. A call the model wrote badly is not lost by this: its arguments are held as one JSON string |
+| Every string | A database column holds neither a NUL character nor a byte that is not UTF-8, and a model, a tool or a person can put either in anything they write. **A string a store only records is kept, with each such character as the replacement character U+FFFD**, byte by byte as `encoding/json` replaces, so that the three bytes of a character cut short are three replacements and not one: a run's input, output and error, a reason, a tool's result, a rule and a decision, the name of a tool the model called and of the model that answered, why it stopped, who decided or cancelled and why, and the strings inside `Metadata` and an `Action`, keys included. So no journal write fails, and no run is wedged, for what a model or a tool wrote. **A string a store compares is refused**, as an argument and with nothing changed, because it could only be kept as another name: an agent's name, a start key, a lease's owner, and an id, which has its own rule below. In a filter such a name is no run's, and lists or claims nothing. Inside what is kept as JSON, which is a message and a definition, a NUL is kept, since JSON has an escape for it, and only the byte that is not UTF-8 becomes the replacement character. **Raw JSON is kept as the bytes it came as, or refused**: a call's arguments, the provider's form of a turn, a tool's schema and the output schema must be JSON, in UTF-8. A call's arguments and a provider's form that were given as none read back as JSON's `null`, which a tool can decode where it could not decode nothing. An `Action`'s attributes are not kept as raw JSON even when they carry some: they are decoded and written again, so a number in them no `float64` holds is refused as an argument. A call the model wrote badly is not lost by this: its arguments are held as one JSON string |
 | Every method that changes anything | Adds one to the run's `Rev`, stamps each step and approval it touched with the new `Rev`, and sets `UpdatedAt` to the request's time. One call adds one, however many steps and approvals it touches: they all carry the one new `Rev`. `Heartbeat` is the exception: it changes only the lease's expiry and leaves `Rev` and `UpdatedAt` alone. A call that changes nothing leaves them alone too: a call that is refused, a `Park` that reports false, a `RequestApproval` that returns an approval already recorded, a `RequestCancel` of a run already marked, an `ExpireApprovals` with nothing due |
 | Every method taking a `Lease` | Once the request itself has passed, locks the run, and returns `ErrLeaseLost` without changing anything unless the run's owner and epoch equal the lease's. The fence comes before every check that reads the store, and after the checks of the request alone. A lease with an empty `Owner` is never the run's, even when the run records no owner, so nothing writes to a run nobody holds. The hold is the epoch and not the time: under a lease that has lapsed and that no other claim has taken, a write goes through and `Heartbeat` extends the expiry. A run that does not exist is `ErrNotFound`, whatever the lease |
 | Every method that makes a waiting run runnable | These are `DecideApproval`, `ExpireApprovals`, `RequestCancel`, and `Finish` for the run's parent. Each sets `Status` runnable and clears `Reason`, since the run no longer waits. A run that is not waiting keeps its status and its lease |
@@ -3354,7 +3354,11 @@ How `agent/pg` writes and reads the columns, beyond what their types say:
   canonical one, so the store checks an id's form in Go before it sends
   one (6.2) and reads every id back as text.
 - **Times.** Every time is bound from the request and none is `now()`. A
-  time is kept to the microsecond below it and read back in UTC. The time a
+  time is kept to the microsecond, which is all a `timestamptz` holds: the
+  microsecond below it, for every time but a lease's expiry, which is kept
+  to the microsecond above, so that the store never counts a lease lapsed
+  before its holder does. `MemoryStore` keeps times the same way. Times
+  are read back in UTC. The time a
   step spent working is measured in Go, between its start as the column
   kept it and its finish.
 - **The `json` columns** (`definition`, `message`, `call`, `input`) keep the
@@ -5495,6 +5499,19 @@ them. These are written from the OpenAI provider's side.
     refuse a raw value that is not JSON or not UTF-8 (rejected: leaving it
     to the column, which refuses it after the lease has been checked and
     with the database's error).
+
+    The replacement is one rule, made byte by byte as `encoding/json` makes
+    it, and it lives with the other things both stores must do alike (which
+    ids and cursors are taken, what raw JSON is, how a time is kept) in one
+    internal package, `agent/internal/storerule`, that both import
+    (rejected: a copy in each store, which is how one came to write one
+    replacement for a run of bad bytes and the other one for each). An
+    action's attributes are decoded and written again before the
+    transaction, since they may carry raw JSON that a `jsonb` column
+    refuses. A raw value given as none reads back as `null` from both
+    stores. A time is kept to the microsecond, and a lease's expiry to the
+    microsecond above. A parent removed while its child is being created
+    is "parent does not exist", not the database's foreign-key error.
 
     The suite now pins what it left open, so that a test passing on one
     store passes on the other. Runs created at one instant are claimed in

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ManavA/keel/agent"
@@ -30,15 +29,6 @@ const stepColumns = `run_id::text, seq, kind, status, name, message, stop,
 
 const approvalColumns = `id::text, run_id::text, seq, attempt, cause, tool, input, action, rule,
     status, decided_by, reason, rev, requested_at, decided_at, expires_at`
-
-// isUUID reports whether id is a UUID as uuid.NewString writes one. A uuid
-// column reads other spellings of the same UUID and hands back this one, so
-// an id in another spelling is checked for here and never sent: a store
-// knows an id by the one string it was given.
-func isUUID(id string) bool {
-	parsed, err := uuid.Parse(id)
-	return err == nil && parsed.String() == id
-}
 
 // nullable is s for a column that holds null where the Go field is empty.
 func nullable(s string) *string {

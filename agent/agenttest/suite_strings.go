@@ -18,227 +18,243 @@ import (
 // a tool wrote. A string a store compares names something, and is refused,
 // since it could only be kept as another name. Inside JSON a NUL is kept, as
 // JSON has an escape for it.
-const (
-	// unkeepable holds a NUL and a byte that is not UTF-8.
-	unkeepable = "a\x00b\xff"
-	// keptAs is what unkeepable reads back as where it is only recorded.
-	keptAs = "a�b�"
-	// keptInJSON is what unkeepable reads back as inside a message or a
-	// definition.
-	keptInJSON = "a\x00b�"
-)
+//
+// The replacement is made byte by byte, as encoding/json makes it: each byte
+// that is no part of a valid encoding is one replacement character, however
+// many stand together. A string cut at a byte limit ends in such bytes.
+type unkeepable struct {
+	name  string
+	given string
+	// kept is what given reads back as where it is only recorded.
+	kept string
+	// inJSON is what given reads back as inside a message or a definition.
+	inJSON string
+}
 
-// unkeepables are a string with each of the two characters on its own.
-var unkeepables = []string{"a\x00b", "caf\xff"}
+var unkeepables = []unkeepable{
+	{"a NUL and a byte that is not UTF-8", "a\x00b\xff", "a\ufffdb\ufffd", "a\x00b\ufffd"},
+	{"a three-byte character cut after two", "x\xe2\x82y", "x\ufffd\ufffdy", "x\ufffd\ufffdy"},
+	{"a four-byte character cut after three", "x\xf0\x9f\x98", "x\ufffd\ufffd\ufffd", "x\ufffd\ufffd\ufffd"},
+	{"a NUL beside a byte that is not UTF-8", "x\x00\xffy", "x\ufffd\ufffdy", "x\x00\ufffdy"},
+}
+
+// each runs check once for every string no column holds.
+func each(check func(k *kit, u unkeepable)) func(k *kit) {
+	return func(k *kit) {
+		for _, u := range unkeepables {
+			check(k, u)
+		}
+	}
+}
 
 func stringsCases() []storeCase {
 	result := func(s string) *string { return &s }
 	return []storeCase{
-		{"keeps what a run is stored with: its input, reason, output, error, and who cancelled it and why", func(k *kit) {
+		{"keeps what a run is stored with: its input, reason, output, error, and who cancelled it and why", each(func(k *kit, u unkeepable) {
 			run := k.newRun(agentAlpha)
-			run.Input, run.Reason, run.Output, run.Error = unkeepable, unkeepable, unkeepable, unkeepable
-			run.CancelBy, run.CancelReason = unkeepable, unkeepable
+			run.Input, run.Reason, run.Output, run.Error = u.given, u.given, u.given, u.given
+			run.CancelBy, run.CancelReason = u.given, u.given
 
 			stored, _, err := k.store.CreateRun(k.ctx, run)
 
-			require.NoError(k.t, err)
+			require.NoError(k.t, err, u.name)
 			want := run
 			want.Rev, want.Metadata = 1, map[string]string{}
-			want.Input, want.Reason, want.Output, want.Error = keptAs, keptAs, keptAs, keptAs
-			want.CancelBy, want.CancelReason = keptAs, keptAs
+			want.Input, want.Reason, want.Output, want.Error = u.kept, u.kept, u.kept, u.kept
+			want.CancelBy, want.CancelReason = u.kept, u.kept
 			k.equalRun(want, stored)
 			k.equalRun(want, k.run(run.ID))
-		}},
-		{"keeps metadata, its keys and its values", func(k *kit) {
+		})},
+		{"keeps metadata, its keys and its values", each(func(k *kit, u unkeepable) {
 			run := k.newRun(agentAlpha)
-			run.Metadata = map[string]string{unkeepable: unkeepable, "plain": "kept"}
-			want := map[string]string{keptAs: keptAs, "plain": "kept"}
+			run.Metadata = map[string]string{u.given: u.given, "plain": "kept"}
+			want := map[string]string{u.kept: u.kept, "plain": "kept"}
 
 			stored, _, err := k.store.CreateRun(k.ctx, run)
 
-			require.NoError(k.t, err)
-			assert.Equal(k.t, want, stored.Metadata, "as returned")
-			assert.Equal(k.t, want, k.run(run.ID).Metadata, "as read")
-		}},
-		{"keeps the definition: a NUL as it is, and a byte that is not UTF-8 as the replacement character", func(k *kit) {
+			require.NoError(k.t, err, u.name)
+			assert.Equal(k.t, want, stored.Metadata, "%s, as returned", u.name)
+			assert.Equal(k.t, want, k.run(run.ID).Metadata, "%s, as read", u.name)
+		})},
+		{"keeps the definition: a NUL as it is, and a byte that is not UTF-8 as the replacement character", each(func(k *kit, u unkeepable) {
 			run := k.newRun(agentAlpha)
 			run.Definition = agent.Snapshot{
-				System: unkeepable,
-				Model:  unkeepable,
-				Tools:  []agent.ToolSpec{{Name: unkeepable, Description: unkeepable, Schema: raw(`{"default":"a\u0000b"}`)}},
+				System: u.given,
+				Model:  u.given,
+				Tools:  []agent.ToolSpec{{Name: u.given, Description: u.given, Schema: raw(`{"default":"a\u0000b"}`)}},
 				Output: raw(`{"const":"a\u0000b"}`),
 			}
 
 			stored, _, err := k.store.CreateRun(k.ctx, run)
 
-			require.NoError(k.t, err)
+			require.NoError(k.t, err, u.name)
 			want := run.Definition
-			want.System, want.Model = keptInJSON, keptInJSON
-			want.Tools = []agent.ToolSpec{{Name: keptInJSON, Description: keptInJSON, Schema: raw(`{"default":"a\u0000b"}`)}}
-			assert.Equal(k.t, want, stored.Definition, "as returned")
-			assert.Equal(k.t, want, k.run(run.ID).Definition, "as read")
-		}},
-		{"keeps the error of an execution that failed", func(k *kit) {
+			want.System, want.Model = u.inJSON, u.inJSON
+			want.Tools = []agent.ToolSpec{{Name: u.inJSON, Description: u.inJSON, Schema: raw(`{"default":"a\u0000b"}`)}}
+			assert.Equal(k.t, want, stored.Definition, "%s, as returned", u.name)
+			assert.Equal(k.t, want, k.run(run.ID).Definition, "%s, as read", u.name)
+		})},
+		{"keeps the error of an execution that failed", each(func(k *kit, u unkeepable) {
 			run, lease := k.held(agentAlpha)
 
-			require.NoError(k.t, k.store.Yield(k.ctx, lease, agent.YieldRequest{Failed: true, Error: unkeepable, Now: k.tick()}))
+			require.NoError(k.t, k.store.Yield(k.ctx, lease, agent.YieldRequest{Failed: true, Error: u.given, Now: k.tick()}), u.name)
 
-			assert.Equal(k.t, keptAs, k.run(run.ID).Error)
-		}},
-		{"keeps the reason a run waits", func(k *kit) {
+			assert.Equal(k.t, u.kept, k.run(run.ID).Error, u.name)
+		})},
+		{"keeps the reason a run waits", each(func(k *kit, u unkeepable) {
 			run, lease := k.proposed(agentAlpha)
 			k.ask(lease, 2, nil)
 
-			parked, err := k.store.Park(k.ctx, lease, agent.ParkRequest{Reason: unkeepable, Now: k.tick()})
+			parked, err := k.store.Park(k.ctx, lease, agent.ParkRequest{Reason: u.given, Now: k.tick()})
 
-			require.NoError(k.t, err)
-			require.True(k.t, parked)
-			assert.Equal(k.t, keptAs, k.run(run.ID).Reason)
-		}},
-		{"keeps how a run ended: its reason, its output and its error", func(k *kit) {
+			require.NoError(k.t, err, u.name)
+			require.True(k.t, parked, u.name)
+			assert.Equal(k.t, u.kept, k.run(run.ID).Reason, u.name)
+		})},
+		{"keeps how a run ended: its reason, its output and its error", each(func(k *kit, u unkeepable) {
 			run, lease := k.held(agentAlpha)
 
 			require.NoError(k.t, k.store.Finish(k.ctx, lease, agent.FinishRequest{
-				Status: agent.StatusFailed, Reason: unkeepable, Output: unkeepable, Error: unkeepable, Now: k.tick(),
-			}))
+				Status: agent.StatusFailed, Reason: u.given, Output: u.given, Error: u.given, Now: k.tick(),
+			}), u.name)
 
 			after := k.run(run.ID)
-			assert.Equal(k.t, agent.StatusFailed, after.Status)
-			assert.Equal(k.t, keptAs, after.Reason)
-			assert.Equal(k.t, keptAs, after.Output, "the model's last words are not what stops a run from ending")
-			assert.Equal(k.t, keptAs, after.Error)
-		}},
-		{"keeps who asked for a run to be cancelled, and why", func(k *kit) {
+			assert.Equal(k.t, agent.StatusFailed, after.Status, u.name)
+			assert.Equal(k.t, u.kept, after.Reason, u.name)
+			assert.Equal(k.t, u.kept, after.Output, "%s: the model's last words are not what stops a run from ending", u.name)
+			assert.Equal(k.t, u.kept, after.Error, u.name)
+		})},
+		{"keeps who asked for a run to be cancelled, and why", each(func(k *kit, u unkeepable) {
 			run := k.create(agentAlpha)
 
 			require.NoError(k.t, k.store.RequestCancel(k.ctx, agent.CancelRequest{
-				RunID: run.ID, By: unkeepable, Reason: unkeepable, Now: k.tick(),
-			}))
+				RunID: run.ID, By: u.given, Reason: u.given, Now: k.tick(),
+			}), u.name)
 
 			after := k.run(run.ID)
-			assert.True(k.t, after.CancelRequested)
-			assert.Equal(k.t, keptAs, after.CancelBy)
-			assert.Equal(k.t, keptAs, after.CancelReason)
-		}},
-		{"keeps a reply: the model's name and why it stopped, and inside the message a NUL as it is", func(k *kit) {
+			assert.True(k.t, after.CancelRequested, u.name)
+			assert.Equal(k.t, u.kept, after.CancelBy, u.name)
+			assert.Equal(k.t, u.kept, after.CancelReason, u.name)
+		})},
+		{"keeps a reply: the model's name and why it stopped, and inside the message a NUL as it is", each(func(k *kit, u unkeepable) {
 			run, lease := k.held(agentAlpha)
 			require.NoError(k.t, k.store.BeginModel(k.ctx, lease, 1, k.tick()))
 			message := agent.Message{
 				Role:    agent.RoleAssistant,
-				Text:    unkeepable,
-				Results: []agent.Result{{CallID: unkeepable, Content: unkeepable}},
-				Opaque:  &agent.Opaque{Provider: unkeepable, Data: raw(`{"sig":"a\u0000b"}`)},
+				Text:    u.given,
+				Results: []agent.Result{{CallID: u.given, Content: u.given}},
+				Opaque:  &agent.Opaque{Provider: u.given, Data: raw(`{"sig":"a\u0000b"}`)},
 			}
 
 			require.NoError(k.t, k.store.CompleteModel(k.ctx, lease, agent.CompleteModelRequest{
-				Seq: 1, Message: message, Stop: agent.Stop(unkeepable), Model: unkeepable, Now: k.tick(),
-			}))
+				Seq: 1, Message: message, Stop: agent.Stop(u.given), Model: u.given, Now: k.tick(),
+			}), u.name)
 
 			step := k.step(run.ID, 1)
-			assert.Equal(k.t, agent.StepCompleted, step.Status)
-			assert.Equal(k.t, keptAs, step.Name)
-			assert.Equal(k.t, agent.Stop(keptAs), step.Stop)
-			require.NotNil(k.t, step.Message)
+			assert.Equal(k.t, agent.StepCompleted, step.Status, u.name)
+			assert.Equal(k.t, u.kept, step.Name, u.name)
+			assert.Equal(k.t, agent.Stop(u.kept), step.Stop, u.name)
+			require.NotNil(k.t, step.Message, u.name)
 			want := agent.Message{
 				Role:    agent.RoleAssistant,
-				Text:    keptInJSON,
-				Results: []agent.Result{{CallID: keptInJSON, Content: keptInJSON}},
-				Opaque:  &agent.Opaque{Provider: keptInJSON, Data: raw(`{"sig":"a\u0000b"}`)},
+				Text:    u.inJSON,
+				Results: []agent.Result{{CallID: u.inJSON, Content: u.inJSON}},
+				Opaque:  &agent.Opaque{Provider: u.inJSON, Data: raw(`{"sig":"a\u0000b"}`)},
 			}
-			assert.Equal(k.t, normalMessage(want), normalMessage(*step.Message))
-		}},
-		{"keeps a call to a tool whose name cannot be kept: the name on the step and on its approval", func(k *kit) {
+			assert.Equal(k.t, normalMessage(want), normalMessage(*step.Message), u.name)
+		})},
+		{"keeps a call to a tool whose name cannot be kept: the name on the step and on its approval", each(func(k *kit, u unkeepable) {
 			run, lease := k.held(agentAlpha)
 			require.NoError(k.t, k.store.BeginModel(k.ctx, lease, 1, k.tick()))
-			call := agent.Call{ID: unkeepable, Name: unkeepable, Input: raw(`{"to":"a\u0000b"}`)}
+			call := agent.Call{ID: u.given, Name: u.given, Input: raw(`{"to":"a\u0000b"}`)}
 
 			require.NoError(k.t, k.store.CompleteModel(k.ctx, lease, agent.CompleteModelRequest{
 				Seq: 1, Message: Use(call).Message, Stop: agent.StopToolUse, Model: suiteModel, Now: k.tick(),
-			}))
+			}), u.name)
 
 			step := k.step(run.ID, 2)
-			assert.Equal(k.t, agent.StepProposed, step.Status, "the model's turn was journaled, and the call can be answered")
-			assert.Equal(k.t, keptAs, step.Name)
+			assert.Equal(k.t, agent.StepProposed, step.Status, "%s: the model's turn was journaled, and the call can be answered", u.name)
+			assert.Equal(k.t, u.kept, step.Name, u.name)
 			// The call is JSON: its NUL is kept, in its strings and in its
 			// arguments.
-			want := agent.Call{ID: keptInJSON, Name: keptInJSON, Input: raw(`{"to":"a\u0000b"}`)}
-			require.NotNil(k.t, step.Call)
-			assert.Equal(k.t, want, *step.Call)
-			assert.Equal(k.t, []agent.Call{want}, k.step(run.ID, 1).Message.Calls)
+			want := agent.Call{ID: u.inJSON, Name: u.inJSON, Input: raw(`{"to":"a\u0000b"}`)}
+			require.NotNil(k.t, step.Call, u.name)
+			assert.Equal(k.t, want, *step.Call, u.name)
+			assert.Equal(k.t, []agent.Call{want}, k.step(run.ID, 1).Message.Calls, u.name)
 
 			approval := k.ask(lease, 2, nil)
-			assert.Equal(k.t, keptAs, approval.Tool)
-			assert.Equal(k.t, `{"to":"a\u0000b"}`, string(approval.Input))
-			assert.Equal(k.t, keptAs, k.approval(approval.ID).Tool)
-		}},
-		{"keeps what a tool returned, and the decision and rule on its step", func(k *kit) {
+			assert.Equal(k.t, u.kept, approval.Tool, u.name)
+			assert.Equal(k.t, `{"to":"a\u0000b"}`, string(approval.Input), u.name)
+			assert.Equal(k.t, u.kept, k.approval(approval.ID).Tool, u.name)
+		})},
+		{"keeps what a tool returned, and the decision and rule on its step", each(func(k *kit, u unkeepable) {
 			run, lease := k.proposed(agentAlpha)
 			k.update(lease, 2, agent.StepProposed, agent.StepStarted)
 
 			require.NoError(k.t, k.store.UpdateStep(k.ctx, lease, agent.StepUpdate{
 				Seq: 2, From: agent.StepStarted, To: agent.StepCompleted,
-				Decision: agent.Effect(unkeepable), Rule: unkeepable, Result: result(unkeepable), Now: k.tick(),
-			}))
+				Decision: agent.Effect(u.given), Rule: u.given, Result: result(u.given), Now: k.tick(),
+			}), u.name)
 
 			step := k.step(run.ID, 2)
-			assert.Equal(k.t, agent.StepCompleted, step.Status, "the result was journaled, so the call is never made again")
-			assert.Equal(k.t, keptAs, step.Result)
-			assert.Equal(k.t, agent.Effect(keptAs), step.Decision)
-			assert.Equal(k.t, keptAs, step.Rule)
-		}},
-		{"keeps a question: its rule, and the decision and rule it puts on the step", func(k *kit) {
+			assert.Equal(k.t, agent.StepCompleted, step.Status, "%s: the result was journaled, so the call is never made again", u.name)
+			assert.Equal(k.t, u.kept, step.Result, u.name)
+			assert.Equal(k.t, agent.Effect(u.kept), step.Decision, u.name)
+			assert.Equal(k.t, u.kept, step.Rule, u.name)
+		})},
+		{"keeps a question: its rule, and the decision and rule it puts on the step", each(func(k *kit, u unkeepable) {
 			run, lease := k.proposed(agentAlpha)
 			req := k.askRequest(2)
-			req.Decision, req.Rule = agent.Effect(unkeepable), unkeepable
+			req.Decision, req.Rule = agent.Effect(u.given), u.given
 
 			got, err := k.store.RequestApproval(k.ctx, lease, req)
 
-			require.NoError(k.t, err)
-			assert.Equal(k.t, keptAs, got.Rule, "as returned")
-			assert.Equal(k.t, keptAs, k.approval(req.ID).Rule, "as read")
+			require.NoError(k.t, err, u.name)
+			assert.Equal(k.t, u.kept, got.Rule, "%s, as returned", u.name)
+			assert.Equal(k.t, u.kept, k.approval(req.ID).Rule, "%s, as read", u.name)
 			step := k.step(run.ID, 2)
-			assert.Equal(k.t, agent.StepWaiting, step.Status)
-			assert.Equal(k.t, agent.Effect(keptAs), step.Decision)
-			assert.Equal(k.t, keptAs, step.Rule)
-		}},
-		{"keeps an action: its kind, its target, and the keys and values of its attributes", func(k *kit) {
+			assert.Equal(k.t, agent.StepWaiting, step.Status, u.name)
+			assert.Equal(k.t, agent.Effect(u.kept), step.Decision, u.name)
+			assert.Equal(k.t, u.kept, step.Rule, u.name)
+		})},
+		{"keeps an action: its kind, its target, and the keys and values of its attributes", each(func(k *kit, u unkeepable) {
 			_, lease := k.proposed(agentAlpha)
 			req := k.askRequest(2)
-			req.Action = agent.Action{Kind: unkeepable, Target: unkeepable, Attrs: map[string]any{
-				unkeepable: unkeepable,
-				"nested":   map[string]any{unkeepable: []any{unkeepable, 7, nil}},
+			req.Action = agent.Action{Kind: u.given, Target: u.given, Attrs: map[string]any{
+				u.given:  u.given,
+				"nested": map[string]any{u.given: []any{u.given, 7, nil}},
 				// The six characters of JSON's escape for a NUL, which are
 				// not a NUL.
 				"written": `\u0000`,
 			}}
-			want := agent.Action{Kind: keptAs, Target: keptAs, Attrs: map[string]any{
-				keptAs:    keptAs,
-				"nested":  map[string]any{keptAs: []any{keptAs, float64(7), nil}},
+			want := agent.Action{Kind: u.kept, Target: u.kept, Attrs: map[string]any{
+				u.kept:    u.kept,
+				"nested":  map[string]any{u.kept: []any{u.kept, float64(7), nil}},
 				"written": `\u0000`,
 			}}
 
 			got, err := k.store.RequestApproval(k.ctx, lease, req)
 
-			require.NoError(k.t, err)
-			assert.Equal(k.t, want, got.Action, "as returned")
-			assert.Equal(k.t, want, k.approval(req.ID).Action, "as read")
-		}},
-		{"keeps who answered an approval, and why", func(k *kit) {
+			require.NoError(k.t, err, u.name)
+			assert.Equal(k.t, want, got.Action, "%s, as returned", u.name)
+			assert.Equal(k.t, want, k.approval(req.ID).Action, "%s, as read", u.name)
+		})},
+		{"keeps who answered an approval, and why", each(func(k *kit, u unkeepable) {
 			_, pending := k.parked(agentAlpha, nil)
 
 			got, err := k.store.DecideApproval(k.ctx, agent.DecideRequest{
-				ID: pending.ID, Approved: true, By: unkeepable, Reason: unkeepable, Now: k.tick(),
+				ID: pending.ID, Approved: true, By: u.given, Reason: u.given, Now: k.tick(),
 			})
 
-			require.NoError(k.t, err)
-			assert.Equal(k.t, agent.ApprovalApproved, got.Status)
-			assert.Equal(k.t, keptAs, got.DecidedBy, "as returned")
-			assert.Equal(k.t, keptAs, got.Reason, "as returned")
+			require.NoError(k.t, err, u.name)
+			assert.Equal(k.t, agent.ApprovalApproved, got.Status, u.name)
+			assert.Equal(k.t, u.kept, got.DecidedBy, "%s, as returned", u.name)
+			assert.Equal(k.t, u.kept, got.Reason, "%s, as returned", u.name)
 			read := k.approval(pending.ID)
-			assert.Equal(k.t, keptAs, read.DecidedBy, "as read")
-			assert.Equal(k.t, keptAs, read.Reason, "as read")
-		}},
-		{"refuses a run whose agent, start key or owner cannot be kept", func(k *kit) {
+			assert.Equal(k.t, u.kept, read.DecidedBy, "%s, as read", u.name)
+			assert.Equal(k.t, u.kept, read.Reason, "%s, as read", u.name)
+		})},
+		{"refuses a run whose agent, start key or owner cannot be kept", each(func(k *kit, u unkeepable) {
 			edits := []struct {
 				name string
 				edit func(run *agent.Run, bad string)
@@ -247,33 +263,31 @@ func stringsCases() []storeCase {
 				{"its start key", func(run *agent.Run, bad string) { run.Key = bad }},
 				{"the owner it is stored with", func(run *agent.Run, bad string) { run.LeaseOwner = bad }},
 			}
-			for _, bad := range unkeepables {
-				for _, e := range edits {
-					run := k.newRun(agentAlpha)
-					e.edit(&run, bad)
+			for _, e := range edits {
+				run := k.newRun(agentAlpha)
+				e.edit(&run, u.given)
 
-					_, created, err := k.store.CreateRun(k.ctx, run)
+				_, created, err := k.store.CreateRun(k.ctx, run)
 
-					require.Error(k.t, err, "%s, given %q", e.name, bad)
-					assert.False(k.t, created, "%s, given %q", e.name, bad)
-					_, err = k.store.GetRun(k.ctx, run.ID)
-					assert.ErrorIs(k.t, err, agent.ErrNotFound, "%s, given %q: nothing was stored", e.name, bad)
-				}
+				require.Error(k.t, err, "%s, given %s", e.name, u.name)
+				assert.False(k.t, created, "%s, given %s", e.name, u.name)
+				_, err = k.store.GetRun(k.ctx, run.ID)
+				assert.ErrorIs(k.t, err, agent.ErrNotFound, "%s, given %s: nothing was stored", e.name, u.name)
 			}
-		}},
+		})},
 		{"refuses a claim under an owner that cannot be kept", func(k *kit) {
 			run := k.create(agentAlpha)
 			before := k.snapshot(run.ID)
 
-			for _, bad := range unkeepables {
-				got, err := k.store.Claim(k.ctx, agent.ClaimRequest{Owner: bad, Agents: suiteAgents, Now: k.tick(), TTL: suiteTTL})
-				require.Error(k.t, err, "owner %q", bad)
+			for _, u := range unkeepables {
+				got, err := k.store.Claim(k.ctx, agent.ClaimRequest{Owner: u.given, Agents: suiteAgents, Now: k.tick(), TTL: suiteTTL})
+				require.Error(k.t, err, u.name)
 				assert.Nil(k.t, got)
 
 				got, err = k.store.Claim(k.ctx, agent.ClaimRequest{
-					Owner: bad, Agents: suiteAgents, RunID: run.ID, Now: k.tick(), TTL: suiteTTL,
+					Owner: u.given, Agents: suiteAgents, RunID: run.ID, Now: k.tick(), TTL: suiteTTL,
 				})
-				require.Error(k.t, err, "owner %q, by id", bad)
+				require.Error(k.t, err, "%s, by id", u.name)
 				assert.NotErrorIs(k.t, err, agent.ErrNotClaimable, "the claim is refused, not the run")
 				assert.Nil(k.t, got)
 			}
@@ -283,27 +297,31 @@ func stringsCases() []storeCase {
 			run, lease := k.held(agentAlpha)
 			before := k.snapshot(run.ID)
 
-			for _, bad := range unkeepables {
-				err := k.store.BeginModel(k.ctx, agent.Lease{RunID: run.ID, Owner: bad, Epoch: lease.Epoch}, 1, k.tick())
-				require.ErrorIs(k.t, err, agent.ErrLeaseLost, "owner %q", bad)
+			for _, u := range unkeepables {
+				err := k.store.BeginModel(k.ctx, agent.Lease{RunID: run.ID, Owner: u.given, Epoch: lease.Epoch}, 1, k.tick())
+				require.ErrorIs(k.t, err, agent.ErrLeaseLost, u.name)
 			}
 			k.unchanged(before)
 		}},
 		{"an agent whose name cannot be kept has no runs to claim or to list", func(k *kit) {
 			run := k.create(agentAlpha)
 			before := k.snapshot(run.ID)
+			names := make([]string, len(unkeepables))
+			for i, u := range unkeepables {
+				names[i] = u.given
+			}
 
-			got, err := k.store.Claim(k.ctx, agent.ClaimRequest{Owner: workerA, Agents: unkeepables, Now: k.tick(), TTL: suiteTTL})
+			got, err := k.store.Claim(k.ctx, agent.ClaimRequest{Owner: workerA, Agents: names, Now: k.tick(), TTL: suiteTTL})
 			require.NoError(k.t, err)
 			assert.Nil(k.t, got)
 			got, err = k.store.Claim(k.ctx, agent.ClaimRequest{
-				Owner: workerA, Agents: unkeepables, RunID: run.ID, Now: k.tick(), TTL: suiteTTL,
+				Owner: workerA, Agents: names, RunID: run.ID, Now: k.tick(), TTL: suiteTTL,
 			})
 			require.ErrorIs(k.t, err, agent.ErrNotClaimable)
 			assert.Nil(k.t, got)
 			k.unchanged(before)
 
-			for _, bad := range unkeepables {
+			for _, bad := range names {
 				runs, err := k.store.ListRuns(k.ctx, agent.RunFilter{Agent: bad})
 				require.NoError(k.t, err, "agent %q", bad)
 				assert.Empty(k.t, runs, "agent %q", bad)
@@ -317,7 +335,7 @@ func stringsCases() []storeCase {
 
 			// Named beside one that can be kept, it is passed over.
 			got, err = k.store.Claim(k.ctx, agent.ClaimRequest{
-				Owner: workerA, Agents: append([]string{agentAlpha}, unkeepables...), Now: k.tick(), TTL: suiteTTL,
+				Owner: workerA, Agents: append([]string{agentAlpha}, names...), Now: k.tick(), TTL: suiteTTL,
 			})
 			require.NoError(k.t, err)
 			require.NotNil(k.t, got)
@@ -494,6 +512,129 @@ func cursorCases() []storeCase {
 					assert.Equal(k.t, want, runIDs(listed), "%s, %s", idName, timeName)
 				}
 			}
+		}},
+	}
+}
+
+// A store keeps a time to the microsecond, which is what a database column
+// holds: the microsecond below it, for every time but one. A lease's expiry
+// is kept to the microsecond above, so that a store never counts a lease
+// lapsed before its holder does.
+func timesCases() []storeCase {
+	const (
+		// under is less than a microsecond.
+		under = 999 * time.Nanosecond
+		micro = time.Microsecond
+	)
+	return []storeCase{
+		{"keeps every time to the microsecond below it", func(k *kit) {
+			base := k.now().Add(time.Hour)
+			at := func(ms int) time.Time { return base.Add(time.Duration(ms) * time.Millisecond) }
+
+			run := k.newRun(agentAlpha)
+			run.CreatedAt, run.UpdatedAt = at(1).Add(under), at(1).Add(1500*time.Nanosecond)
+			expires, retry := at(2).Add(under), at(2).Add(under)
+			run.LeaseExpiresAt, run.NextAttemptAt = &expires, &retry
+			stored := k.insert(run)
+			for name, got := range map[string]agent.Run{"as returned": stored, "as read": k.run(run.ID)} {
+				assert.True(k.t, at(1).Equal(got.CreatedAt), "CreatedAt %s: %s", name, got.CreatedAt)
+				assert.True(k.t, at(1).Add(micro).Equal(got.UpdatedAt), "UpdatedAt %s: %s", name, got.UpdatedAt)
+				k.timeIs(at(2), got.LeaseExpiresAt, "a lease's expiry a run is stored with, "+name)
+				k.timeIs(at(2), got.NextAttemptAt, "NextAttemptAt "+name)
+			}
+
+			held, err := k.store.Claim(k.ctx, agent.ClaimRequest{
+				Owner: workerA, Agents: suiteAgents, RunID: run.ID, Now: at(3).Add(under), TTL: suiteTTL,
+			})
+			require.NoError(k.t, err)
+			assert.True(k.t, at(3).Equal(held.UpdatedAt), "UpdatedAt after a claim: %s", held.UpdatedAt)
+			lease := held.Lease()
+
+			// A reply that took a second and a half, between two times as
+			// they are kept: a nanosecond short of that as they were given.
+			require.NoError(k.t, k.store.BeginModel(k.ctx, lease, 1, at(4).Add(under)))
+			require.NoError(k.t, k.store.CompleteModel(k.ctx, lease, agent.CompleteModelRequest{
+				Seq: 1, Message: Use(Call("call-1", toolSend, sendInput)).Message, Stop: agent.StopToolUse,
+				Model: suiteModel, Now: at(1504).Add(500 * time.Nanosecond),
+			}))
+			reply := k.step(run.ID, 1)
+			assert.True(k.t, at(4).Equal(reply.CreatedAt), "a step's CreatedAt: %s", reply.CreatedAt)
+			k.timeIs(at(4), reply.StartedAt, "a step's StartedAt")
+			k.timeIs(at(1504), reply.FinishedAt, "a step's FinishedAt")
+			assert.Equal(k.t, int64(1500), k.run(run.ID).ActiveMillis, "the time working is between the times as they are kept")
+			assert.True(k.t, at(1504).Equal(k.step(run.ID, 2).CreatedAt), "a proposed step's CreatedAt")
+
+			req := k.askRequest(2)
+			due := at(5000).Add(under)
+			req.Now, req.ExpiresAt = at(1505).Add(under), &due
+			asked, err := k.store.RequestApproval(k.ctx, lease, req)
+			require.NoError(k.t, err)
+			assert.True(k.t, at(1505).Equal(asked.RequestedAt), "RequestedAt: %s", asked.RequestedAt)
+			k.timeIs(at(5000), asked.ExpiresAt, "an approval's ExpiresAt")
+			decided, err := k.store.DecideApproval(k.ctx, agent.DecideRequest{
+				ID: req.ID, Approved: true, By: personA, Now: at(1506).Add(under),
+			})
+			require.NoError(k.t, err)
+			k.timeIs(at(1506), decided.DecidedAt, "DecidedAt")
+
+			again := at(1600).Add(under)
+			require.NoError(k.t, k.store.Yield(k.ctx, lease, agent.YieldRequest{NextAttemptAt: &again, Now: at(1507).Add(under)}))
+			yielded := k.run(run.ID)
+			k.timeIs(at(1600), yielded.NextAttemptAt, "NextAttemptAt")
+			assert.True(k.t, at(1507).Equal(yielded.UpdatedAt), "UpdatedAt after a yield: %s", yielded.UpdatedAt)
+
+			// It is claimable at the microsecond its NextAttemptAt was kept
+			// as, though that is before the time it was given.
+			held, err = k.store.Claim(k.ctx, agent.ClaimRequest{
+				Owner: workerA, Agents: suiteAgents, RunID: run.ID, Now: at(1600), TTL: suiteTTL,
+			})
+			require.NoError(k.t, err)
+			require.NoError(k.t, k.store.Finish(k.ctx, held.Lease(), agent.FinishRequest{
+				Status: agent.StatusCompleted, Now: at(1601).Add(under),
+			}))
+			k.timeIs(at(1601), k.run(run.ID).FinishedAt, "FinishedAt")
+		}},
+		{"keeps a lease's expiry to the microsecond above it, so that it is never taken before its holder counts it lapsed", func(k *kit) {
+			run := k.create(agentAlpha)
+			now := k.tick()
+			// The lease lapses half a microsecond past a whole one.
+			ttl := suiteTTL + 500*time.Nanosecond
+			lapses := now.Add(ttl)
+
+			held, err := k.store.Claim(k.ctx, agent.ClaimRequest{Owner: workerA, Agents: suiteAgents, RunID: run.ID, Now: now, TTL: ttl})
+			require.NoError(k.t, err)
+			k.timeIs(now.Add(suiteTTL+micro), held.LeaseExpiresAt, "the expiry as returned")
+			k.timeIs(now.Add(suiteTTL+micro), k.run(run.ID).LeaseExpiresAt, "the expiry as read")
+			before := k.snapshot(run.ID)
+
+			claim := func(at time.Time) (*agent.Run, error) {
+				return k.store.Claim(k.ctx, agent.ClaimRequest{Owner: workerB, Agents: suiteAgents, Now: at, TTL: suiteTTL})
+			}
+			// A nanosecond before the holder counts its lease lapsed, and
+			// at every instant up to the end of that microsecond.
+			for _, early := range []time.Time{lapses.Add(-time.Nanosecond), now.Add(suiteTTL), lapses, now.Add(suiteTTL + under)} {
+				got, err := claim(early)
+				require.NoError(k.t, err)
+				require.Nil(k.t, got, "the lease was taken at %s, and its holder counts it good until %s", early, lapses)
+			}
+			k.unchanged(before)
+
+			got, err := claim(now.Add(suiteTTL + micro))
+			require.NoError(k.t, err)
+			require.NotNil(k.t, got, "at the microsecond the expiry was kept as")
+			assert.Equal(k.t, workerB, got.LeaseOwner)
+		}},
+		{"a heartbeat extends the lease to the microsecond above, and a lease of whole microseconds is kept as it is", func(k *kit) {
+			run, lease := k.held(agentAlpha)
+			now := k.tick()
+
+			_, err := k.store.Heartbeat(k.ctx, lease, now.Add(time.Nanosecond), suiteTTL)
+			require.NoError(k.t, err)
+			k.timeIs(now.Add(suiteTTL+micro), k.run(run.ID).LeaseExpiresAt, "a nanosecond past a whole microsecond")
+
+			_, err = k.store.Heartbeat(k.ctx, lease, now, suiteTTL+3*micro)
+			require.NoError(k.t, err)
+			k.timeIs(now.Add(suiteTTL+3*micro), k.run(run.ID).LeaseExpiresAt, "a whole number of microseconds")
 		}},
 	}
 }

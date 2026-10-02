@@ -57,7 +57,13 @@
 // the canonical one.
 //
 // Every time comes from the request. The store reads no clock, in Go or in
-// SQL. A time is kept to the microsecond below it and read back in UTC.
+// SQL. A time is kept to the microsecond below it and read back in UTC,
+// except a lease's expiry, which is kept to the microsecond above: the store
+// never counts a lease lapsed before its holder does.
+//
+// What the two stores must do alike, which strings and ids are taken, what
+// replaces a character no column holds, how a time is kept, is written once,
+// in agent/internal/storerule, and both follow it.
 //
 // JSON that somebody else wrote is kept as the bytes it came as: a call's
 // arguments, a turn in its provider's own form, a tool's schema and the

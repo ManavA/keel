@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -128,6 +129,86 @@ func TestCreateRun_TheSecondCreatorOfAKeyWaitsForTheFirst(t *testing.T) {
 			assert.ErrorIs(t, err, agent.ErrNotFound, "the first run was undone")
 		})
 	}
+}
+
+// A child is created under a parent that a purge is removing. The create
+// saw the parent, and Postgres checks the reference when the purge is over:
+// the store answers as it does for any parent that is not there, and not
+// with the database's complaint about a foreign key.
+func TestCreateRun_AParentRemovedUnderneathIsNoParent(t *testing.T) {
+	tests := []struct {
+		name string
+		// commit says whether the parent's removal goes through.
+		commit bool
+	}{
+		{"the removal commits: the parent does not exist", true},
+		{"the removal is undone: the child is stored", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			k, pool := newKit(t)
+			parent := k.create()
+			child := k.newRun(agentBeta)
+			child.ParentID, child.ParentSeq, child.Depth = parent.ID, 2, 1
+
+			removing := begin(t, pool)
+			_, err := removing.Exec(k.ctx, "delete from "+agentpg.RunsTable+" where id = $1", parent.ID)
+			require.NoError(t, err)
+
+			done := make(chan createResult, 1)
+			go func() {
+				stored, created, err := k.store.CreateRun(k.ctx, child)
+				done <- createResult{stored, created, err}
+			}()
+			waits(t, pool, done)
+			if tt.commit {
+				require.NoError(t, removing.Commit(k.ctx))
+			} else {
+				require.NoError(t, removing.Rollback(k.ctx))
+			}
+
+			got := result(t, done)
+			if !tt.commit {
+				require.NoError(t, got.err)
+				assert.True(t, got.created)
+				assert.Equal(t, parent.ID, k.run(child.ID).ParentID)
+				return
+			}
+			require.ErrorContains(t, got.err, "does not exist")
+			var fromDatabase *pgconn.PgError
+			assert.NotErrorAs(t, got.err, &fromDatabase, "the refusal is the store's own, not a constraint's")
+			assert.False(t, got.created)
+			_, err = k.store.GetRun(k.ctx, child.ID)
+			assert.ErrorIs(t, err, agent.ErrNotFound, "the child was not stored")
+		})
+	}
+}
+
+// A create that stored nothing looks for why. If the reason has gone by the
+// time it looks, because the parent it did not find has since been stored,
+// it stores the run after all: it does not report a reason that is not so.
+func TestCreateRun_AParentStoredWhileItIsLookedForIsFound(t *testing.T) {
+	pool := newDatabase(t).pool(t)
+	k := kitOver(t, agentpg.New(pool))
+	parent := k.newRun(agentAlpha)
+	child := k.newRun(agentBeta)
+	child.ParentID, child.ParentSeq, child.Depth = parent.ID, 2, 1
+
+	// The parent is stored after the child's insert found none, and before
+	// the child's create looks for what was wrong.
+	var once sync.Once
+	creating := agentpg.New(stepped{Beginner: pool, before: func(st statement) {
+		if st.n == 2 {
+			once.Do(func() { k.insert(parent) })
+		}
+	}})
+
+	stored, created, err := creating.CreateRun(k.ctx, child)
+
+	require.NoError(t, err)
+	assert.True(t, created)
+	assert.Equal(t, child.ID, stored.ID)
+	assert.Equal(t, parent.ID, k.run(child.ID).ParentID)
 }
 
 // Changes is one view of the run. A write that commits while it is being

@@ -141,6 +141,20 @@ func TestStore_AnswersForTheRequestAloneWithoutATransaction(t *testing.T) {
 			})
 			return err
 		},
+		"RequestApproval with a number in its attributes that no float64 holds": func() error {
+			_, err := store.RequestApproval(ctx, lease, agent.ApprovalRequest{
+				ID: newID(), Seq: 2, Cause: agent.CauseGuard, Now: now,
+				Action: agent.Action{Kind: "run", Attrs: map[string]any{"input": raw(`{"n":1e400000}`)}},
+			})
+			return err
+		},
+		"RequestApproval with raw attributes that are not JSON": func() error {
+			_, err := store.RequestApproval(ctx, lease, agent.ApprovalRequest{
+				ID: newID(), Seq: 2, Cause: agent.CauseGuard, Now: now,
+				Action: agent.Action{Kind: "run", Attrs: map[string]any{"input": raw(`{"n":`)}},
+			})
+			return err
+		},
 		"CompleteModel with arguments that are not JSON": func() error {
 			return store.CompleteModel(ctx, lease, agent.CompleteModelRequest{
 				Seq: 1, Message: agent.Message{Calls: []agent.Call{{ID: "c", Name: toolSend, Input: raw(`{"a":`)}}}, Now: now,

@@ -4,9 +4,12 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ManavA/keel/agent"
 	agentpg "github.com/ManavA/keel/agent/pg"
 )
 
@@ -122,4 +125,50 @@ func TestOnce_ARolledBackTransactionLeavesTheKeyUnrecorded(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, first, "the effect was undone with its key, so the next attempt makes it")
 	require.NoError(t, tx.Commit(ctx))
+}
+
+// Once is for a transaction at read committed, which is what a pool gives. A
+// caller that asked for repeatable read or above, and whose transaction
+// began before another attempt recorded the key, is not told false:
+// Postgres ends its statement with a serialization failure, as it does for
+// any write that meets one it could not see. The effect is still not made
+// twice. The caller's transaction is over, and tried again it is told false.
+func TestOnce_UnderAStricterTransactionIsASerializationFailure(t *testing.T) {
+	pool := newDatabase(t).pool(t)
+	ctx := t.Context()
+
+	for i, level := range []pgx.TxIsoLevel{pgx.RepeatableRead, pgx.Serializable} {
+		// A key of its own for each level, that nothing has recorded.
+		key := agent.StepKey("run", i+1)
+
+		// The stricter transaction has begun, and looked at the database.
+		strict, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: level})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = strict.Rollback(context.Background()) })
+		var one int
+		require.NoError(t, strict.QueryRow(ctx, "select 1").Scan(&one))
+
+		// Another attempt of the same call records the key and commits.
+		other := begin(t, pool)
+		_, err = agentpg.Once(ctx, other, key)
+		require.NoError(t, err)
+		require.NoError(t, other.Commit(ctx))
+
+		first, err := agentpg.Once(ctx, strict, key)
+
+		var failure *pgconn.PgError
+		require.ErrorAs(t, err, &failure, "isolation %s", level)
+		assert.Equal(t, "40001", failure.Code, "isolation %s", level)
+		assert.False(t, first)
+		require.NoError(t, strict.Rollback(ctx))
+
+		// Tried again, the caller's transaction sees the key.
+		again, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: level})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = again.Rollback(context.Background()) })
+		first, err = agentpg.Once(ctx, again, key)
+		require.NoError(t, err, "isolation %s", level)
+		assert.False(t, first, "isolation %s", level)
+		require.NoError(t, again.Commit(ctx))
+	}
 }

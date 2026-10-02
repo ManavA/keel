@@ -1,6 +1,7 @@
 package agenttest
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -273,6 +274,40 @@ func completeModelCases() []storeCase {
 			step := k.step(run.ID, 1)
 			require.NotNil(k.t, step.Message)
 			assert.Equal(k.t, normalMessage(message), normalMessage(*step.Message))
+		}},
+		{"a call with no arguments, and a provider's form with no data, read back as JSON's null", func(k *kit) {
+			run, lease := k.held(agentAlpha)
+			require.NoError(k.t, k.store.BeginModel(k.ctx, lease, 1, k.tick()))
+			message := agent.Message{
+				Role:   agent.RoleAssistant,
+				Calls:  []agent.Call{{ID: "call-1", Name: toolSend}, {ID: "call-2", Name: toolSend, Input: raw(``)}},
+				Opaque: &agent.Opaque{Provider: "provider-a"},
+			}
+			require.Nil(k.t, message.Calls[0].Input)
+
+			require.NoError(k.t, k.store.CompleteModel(k.ctx, lease, agent.CompleteModelRequest{
+				Seq: 1, Message: message, Stop: agent.StopToolUse, Model: suiteModel, Now: k.tick(),
+			}))
+
+			// What a tool is handed is JSON it can read: null, and never
+			// nothing at all.
+			steps := k.steps(run.ID)
+			require.Len(k.t, steps, 3)
+			require.NotNil(k.t, steps[0].Message)
+			for i, call := range steps[0].Message.Calls {
+				assert.Equal(k.t, "null", string(call.Input), "call %d, in the reply", i+1)
+			}
+			require.NotNil(k.t, steps[0].Message.Opaque)
+			assert.Equal(k.t, "null", string(steps[0].Message.Opaque.Data), "the provider's form")
+			for _, step := range steps[1:] {
+				require.NotNil(k.t, step.Call)
+				assert.Equal(k.t, "null", string(step.Call.Input), "step %d", step.Seq)
+				var input any
+				assert.NoError(k.t, json.Unmarshal(step.Call.Input, &input), "step %d", step.Seq)
+			}
+			approval := k.ask(lease, 2, nil)
+			assert.Equal(k.t, "null", string(approval.Input), "the approval, as returned")
+			assert.Equal(k.t, "null", string(k.approval(approval.ID).Input), "the approval, as read")
 		}},
 		{"a wrong seq is ErrConflict", func(k *kit) {
 			empty, emptyLease := k.held(agentAlpha)
