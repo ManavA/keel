@@ -11,15 +11,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/ManavA/keel/agent/internal/storerule"
 )
 
-// The bounds on a listing's length, for RunFilter.Limit and
-// ApprovalFilter.Limit.
-const (
-	defaultListLimit = 50
-	maxListLimit     = 200
-)
+// maxListLimit is the most a listing returns, whatever it is asked for.
+const maxListLimit = storerule.MaxListLimit
+
+// isUUID reports whether id is one a store keeps: a UUID in its canonical
+// form.
+func isUUID(id string) bool { return storerule.IsUUID(id) }
 
 // MemoryStore is the in-process Store. Its runs last as long as the process;
 // use agent/pg for runs that must outlive it.
@@ -33,8 +33,21 @@ const (
 // Like every Store it never reads a clock. What it refuses and how values
 // read back are as agent/pg has them, so that a test passing on one passes
 // on the other: an id must be a UUID in its canonical form, a child's parent
-// must exist, and metadata and an action's attributes come back as a JSON
-// round trip gives them.
+// must exist and be one level above it, and metadata and an action's
+// attributes come back as a JSON round trip gives them.
+//
+// That holds for the strings a database cannot keep too: one with a NUL
+// character in it, or a byte that is not UTF-8. A string the store only
+// records is kept with each such character as the replacement character,
+// U+FFFD: a tool's result, a run's input, output and error, a reason, a
+// rule, the name of a tool or a model, who decided or cancelled and why, and
+// the strings inside metadata and an action. So nothing a model or a tool
+// wrote can make a journal write fail. Inside a message and a definition,
+// which are kept as JSON, a NUL is kept and only the byte that is not UTF-8
+// is replaced. A string the store compares names something and is refused
+// before the store is looked at: an agent's name, a start key and an owner,
+// as an id is. Raw JSON that is not JSON, or not UTF-8, is refused the same
+// way.
 //
 // Every method makes its checks in one order. First what the request alone
 // shows to be wrong, before the store is looked at; then whether the run
@@ -43,8 +56,7 @@ const (
 type MemoryStore struct {
 	mu   sync.Mutex
 	runs map[string]*memoryRun
-	// order holds the runs as they arrived. Claim breaks a tie between runs
-	// created at the same instant by it.
+	// order holds the runs as they arrived.
 	order []*memoryRun
 	// keys maps an agent and a start key to the run that has them.
 	keys      map[startKey]*memoryRun
@@ -89,9 +101,13 @@ func (s *MemoryStore) CreateRun(_ context.Context, run Run) (Run, bool, error) {
 	if run.Status != StatusRunnable {
 		return Run{}, false, fmt.Errorf("agent: create run: status is %q, not %q", run.Status, StatusRunnable)
 	}
-	metadata, err := storedMetadata(run.Metadata)
+	if !storerule.Comparable(run.Agent) || !storerule.Comparable(run.Key) || !storerule.Comparable(run.LeaseOwner) {
+		return Run{}, false, fmt.Errorf("agent: create run: the agent %q, the key %q or the owner %q holds a character no store keeps",
+			run.Agent, run.Key, run.LeaseOwner)
+	}
+	definition, err := storedSnapshot(run.Definition)
 	if err != nil {
-		return Run{}, false, fmt.Errorf("agent: create run: %w", err)
+		return Run{}, false, fmt.Errorf("agent: create run: definition: %w", err)
 	}
 
 	s.mu.Lock()
@@ -115,10 +131,25 @@ func (s *MemoryStore) CreateRun(_ context.Context, run Run) (Run, bool, error) {
 		}
 		parent = named
 	}
+	// A child is one level below its parent, and a run nobody started is at
+	// none. The order rows are locked in, children before parents, is taken
+	// from this.
+	if parent == nil && run.Depth != 0 {
+		return Run{}, false, fmt.Errorf("agent: create run: depth is %d for a run no other started", run.Depth)
+	}
+	if parent != nil && run.Depth != parent.run.Depth+1 {
+		return Run{}, false, fmt.Errorf("agent: create run: depth is %d under a parent at depth %d", run.Depth, parent.run.Depth)
+	}
 
 	r := &memoryRun{run: cloneRun(run)}
 	r.run.Rev = 1
-	r.run.Metadata = metadata
+	r.run.Definition = definition
+	r.run.Metadata = storerule.Metadata(run.Metadata)
+	r.run.CreatedAt, r.run.UpdatedAt = storerule.Instant(run.CreatedAt), storerule.Instant(run.UpdatedAt)
+	r.run.LeaseExpiresAt, r.run.NextAttemptAt = storerule.InstantPtr(run.LeaseExpiresAt), storerule.InstantPtr(run.NextAttemptAt)
+	r.run.FinishedAt = storerule.InstantPtr(run.FinishedAt)
+	r.run.Reason, r.run.Input, r.run.Output, r.run.Error = storerule.Kept(run.Reason), storerule.Kept(run.Input), storerule.Kept(run.Output), storerule.Kept(run.Error)
+	r.run.CancelBy, r.run.CancelReason = storerule.Kept(run.CancelBy), storerule.Kept(run.CancelReason)
 	s.runs[run.ID] = r
 	s.order = append(s.order, r)
 	if run.Key != "" {
@@ -128,14 +159,6 @@ func (s *MemoryStore) CreateRun(_ context.Context, run Run) (Run, bool, error) {
 		parent.children = append(parent.children, r)
 	}
 	return cloneRun(r.run), true, nil
-}
-
-// isUUID reports whether id is a UUID as uuid.NewString writes one. Other
-// spellings of the same UUID are refused: a database would take them and
-// hand back this one, and the id would no longer be the one given.
-func isUUID(id string) bool {
-	parsed, err := uuid.Parse(id)
-	return err == nil && parsed.String() == id
 }
 
 // GetRun implements Store.
@@ -152,6 +175,11 @@ func (s *MemoryStore) GetRun(_ context.Context, id string) (Run, error) {
 
 // ListRuns implements Store.
 func (s *MemoryStore) ListRuns(_ context.Context, f RunFilter) ([]Run, error) {
+	before, err := listCursor(f.Before)
+	if err != nil {
+		return nil, fmt.Errorf("agent: list runs: %w", err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -161,7 +189,7 @@ func (s *MemoryStore) ListRuns(_ context.Context, f RunFilter) ([]Run, error) {
 		case f.Status != "" && r.run.Status != f.Status:
 		case f.Agent != "" && r.run.Agent != f.Agent:
 		case f.ParentID != "" && r.run.ParentID != f.ParentID:
-		case f.Before != nil && !olderThan(r.run, *f.Before):
+		case before != nil && !olderThan(r.run, *before):
 		default:
 			found = append(found, r)
 		}
@@ -170,12 +198,25 @@ func (s *MemoryStore) ListRuns(_ context.Context, f RunFilter) ([]Run, error) {
 		return cmp.Or(b.run.CreatedAt.Compare(a.run.CreatedAt), cmp.Compare(b.run.ID, a.run.ID))
 	})
 
-	found = found[:min(len(found), listLimit(f.Limit))]
+	found = found[:min(len(found), storerule.ListLimit(f.Limit))]
 	out := make([]Run, len(found))
 	for i, r := range found {
 		out[i] = cloneRun(r.run)
 	}
 	return out, nil
+}
+
+// listCursor is the position a listing starts after, or nil for the start.
+// storerule.Cursor says which cursors are refused.
+func listCursor(c *Cursor) (*Cursor, error) {
+	if c == nil {
+		return nil, nil
+	}
+	start, err := storerule.Cursor(c.ID, c.CreatedAt)
+	if err != nil || start {
+		return nil, err
+	}
+	return c, nil
 }
 
 // olderThan reports whether run comes after the position c in a listing,
@@ -185,16 +226,6 @@ func olderThan(run Run, c Cursor) bool {
 		return order < 0
 	}
 	return run.ID < c.ID
-}
-
-func listLimit(limit int) int {
-	switch {
-	case limit <= 0:
-		return defaultListLimit
-	case limit > maxListLimit:
-		return maxListLimit
-	}
-	return limit
 }
 
 // Claim implements Store. The conditions and the update are those of the
@@ -208,6 +239,9 @@ func (s *MemoryStore) Claim(_ context.Context, req ClaimRequest) (*Run, error) {
 	}
 	if req.TTL <= 0 {
 		return nil, fmt.Errorf("agent: claim: ttl is %s, not more than zero", req.TTL)
+	}
+	if !storerule.Comparable(req.Owner) {
+		return nil, fmt.Errorf("agent: claim: owner %q holds a character no store keeps", req.Owner)
 	}
 
 	s.mu.Lock()
@@ -224,8 +258,10 @@ func (s *MemoryStore) Claim(_ context.Context, req ClaimRequest) (*Run, error) {
 		}
 		r = named
 	} else {
+		// The oldest, and of runs created at one instant the one whose id
+		// sorts first: a table keeps no order of arrival to break the tie by.
 		for _, candidate := range s.order {
-			if claimable(candidate.run, req) && (r == nil || candidate.run.CreatedAt.Before(r.run.CreatedAt)) {
+			if claimable(candidate.run, req) && (r == nil || claimedBefore(candidate.run, r.run)) {
 				r = candidate
 			}
 		}
@@ -239,7 +275,9 @@ func (s *MemoryStore) Claim(_ context.Context, req ClaimRequest) (*Run, error) {
 	if r.run.LeaseOwner != "" {
 		r.run.Failures++
 	}
-	expires := req.Now.Add(req.TTL)
+	// To the microsecond above, so that the store never counts the lease
+	// lapsed before its holder does.
+	expires := storerule.Expiry(req.Now.Add(req.TTL))
 	r.run.LeaseOwner = req.Owner
 	r.run.LeaseEpoch++
 	r.run.LeaseExpiresAt = &expires
@@ -247,6 +285,14 @@ func (s *MemoryStore) Claim(_ context.Context, req ClaimRequest) (*Run, error) {
 
 	out := cloneRun(r.run)
 	return &out, nil
+}
+
+// claimedBefore reports whether a claim takes a ahead of b.
+func claimedBefore(a, b Run) bool {
+	if order := a.CreatedAt.Compare(b.CreatedAt); order != 0 {
+		return order < 0
+	}
+	return a.ID < b.ID
 }
 
 func claimable(run Run, req ClaimRequest) bool {
@@ -275,7 +321,7 @@ func (s *MemoryStore) held(lease Lease) (*memoryRun, error) {
 // the caller stamps on each step and approval it changed.
 func touch(r *memoryRun, now time.Time) int64 {
 	r.run.Rev++
-	r.run.UpdatedAt = now
+	r.run.UpdatedAt = storerule.Instant(now)
 	return r.run.Rev
 }
 
@@ -306,7 +352,7 @@ func (s *MemoryStore) Heartbeat(_ context.Context, lease Lease, now time.Time, t
 	if err != nil {
 		return false, err
 	}
-	expires := now.Add(ttl)
+	expires := storerule.Expiry(now.Add(ttl))
 	r.run.LeaseExpiresAt = &expires
 	return r.run.CancelRequested, nil
 }
@@ -321,10 +367,10 @@ func (s *MemoryStore) Yield(_ context.Context, lease Lease, req YieldRequest) er
 		return err
 	}
 	release(r)
-	r.run.NextAttemptAt = cloneTime(req.NextAttemptAt)
+	r.run.NextAttemptAt = storerule.InstantPtr(req.NextAttemptAt)
 	if req.Failed {
 		r.run.Failures++
-		r.run.Error = req.Error
+		r.run.Error = storerule.Kept(req.Error)
 	}
 	touch(r, req.Now)
 	return nil
@@ -343,7 +389,7 @@ func (s *MemoryStore) Park(_ context.Context, lease Lease, req ParkRequest) (boo
 		return false, nil
 	}
 	r.run.Status = StatusWaiting
-	r.run.Reason = req.Reason
+	r.run.Reason = storerule.Kept(req.Reason)
 	release(r)
 	touch(r, req.Now)
 	return true, nil
@@ -373,17 +419,17 @@ func (s *MemoryStore) Finish(_ context.Context, lease Lease, req FinishRequest) 
 		return err
 	}
 
-	finished := req.Now
+	finished := storerule.Instant(req.Now)
 	r.run.Status = req.Status
-	r.run.Reason = req.Reason
-	r.run.Output = req.Output
-	r.run.Error = req.Error
+	r.run.Reason = storerule.Kept(req.Reason)
+	r.run.Output = storerule.Kept(req.Output)
+	r.run.Error = storerule.Kept(req.Error)
 	r.run.FinishedAt = &finished
 	release(r)
 	rev := touch(r, req.Now)
 	for _, a := range r.approvals {
 		if a.approval.Status == ApprovalPending {
-			cancelled := req.Now
+			cancelled := finished
 			a.approval.Status = ApprovalCancelled
 			a.approval.DecidedAt = &cancelled
 			a.approval.Rev = rev
@@ -430,7 +476,7 @@ func (s *MemoryStore) BeginModel(_ context.Context, lease Lease, seq int, now ti
 	if err != nil {
 		return err
 	}
-	started := now
+	started := storerule.Instant(now)
 	if seq == len(r.steps)+1 {
 		r.steps = append(r.steps, &Step{
 			RunID:     r.run.ID,
@@ -439,7 +485,7 @@ func (s *MemoryStore) BeginModel(_ context.Context, lease Lease, seq int, now ti
 			Status:    StepStarted,
 			Attempts:  1,
 			Rev:       touch(r, now),
-			CreatedAt: now,
+			CreatedAt: started,
 			StartedAt: &started,
 		})
 		return nil
@@ -456,6 +502,11 @@ func (s *MemoryStore) BeginModel(_ context.Context, lease Lease, seq int, now ti
 
 // CompleteModel implements Store.
 func (s *MemoryStore) CompleteModel(_ context.Context, lease Lease, req CompleteModelRequest) error {
+	message, err := storedMessage(req.Message)
+	if err != nil {
+		return fmt.Errorf("agent: complete model: message: %w", err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -474,22 +525,24 @@ func (s *MemoryStore) CompleteModel(_ context.Context, lease Lease, req Complete
 	}
 
 	rev := touch(r, req.Now)
-	message := cloneMessage(req.Message)
-	finished := req.Now
+	finished := storerule.Instant(req.Now)
 	st.Status = StepCompleted
-	st.Name = req.Model
+	st.Name = storerule.Kept(req.Model)
 	st.Message = &message
-	st.Stop = req.Stop
+	st.Stop = Stop(storerule.Kept(string(req.Stop)))
 	st.Usage = req.Usage
 	st.FinishedAt = &finished
 	st.Rev = rev
 
 	r.run.Usage = r.run.Usage.Add(req.Usage)
 	r.run.ModelCalls++
-	r.run.ActiveMillis += activeMillis(st.StartedAt, req.Now)
+	r.run.ActiveMillis += storerule.ActiveMillis(st.StartedAt, req.Now)
 	r.run.Failures = 0
 
-	for i, call := range req.Message.Calls {
+	// Each call is the message's own, copied, so the step shares nothing
+	// with the reply. The step's name is a column of its own, where the
+	// call's is inside JSON.
+	for i, call := range message.Calls {
 		seq := req.Seq + 1 + i
 		call.Input = slices.Clone(call.Input)
 		r.steps = append(r.steps, &Step{
@@ -497,24 +550,15 @@ func (s *MemoryStore) CompleteModel(_ context.Context, lease Lease, req Complete
 			Seq:       seq,
 			Kind:      StepTool,
 			Status:    StepProposed,
-			Name:      call.Name,
+			Name:      storerule.Kept(req.Message.Calls[i].Name),
 			Turn:      req.Seq,
 			Call:      &call,
 			Key:       StepKey(r.run.ID, seq),
 			Rev:       rev,
-			CreatedAt: req.Now,
+			CreatedAt: finished,
 		})
 	}
 	return nil
-}
-
-// activeMillis is the time a step that started at start and finished at end
-// spent working.
-func activeMillis(start *time.Time, end time.Time) int64 {
-	if start == nil {
-		return 0
-	}
-	return end.Sub(*start).Milliseconds()
 }
 
 // UpdateStep implements Store.
@@ -541,11 +585,11 @@ func (s *MemoryStore) UpdateStep(_ context.Context, lease Lease, req StepUpdate)
 	st.Rev = touch(r, req.Now)
 	st.Status = req.To
 	if req.Decision != "" {
-		st.Decision = req.Decision
-		st.Rule = req.Rule
+		st.Decision = Effect(storerule.Kept(string(req.Decision)))
+		st.Rule = storerule.Kept(req.Rule)
 	}
 	if req.Result != nil {
-		st.Result = *req.Result
+		st.Result = storerule.Kept(*req.Result)
 		st.IsError = req.IsError
 	}
 	if req.ChildRunID != "" {
@@ -554,14 +598,14 @@ func (s *MemoryStore) UpdateStep(_ context.Context, lease Lease, req StepUpdate)
 	st.Usage = st.Usage.Add(req.Usage)
 	r.run.Usage = r.run.Usage.Add(req.Usage)
 
-	at := req.Now
+	at := storerule.Instant(req.Now)
 	switch {
 	case req.To == StepStarted:
 		st.Attempts++
 		st.StartedAt = &at
 	case req.To.Done():
 		if req.From == StepStarted {
-			r.run.ActiveMillis += activeMillis(st.StartedAt, req.Now)
+			r.run.ActiveMillis += storerule.ActiveMillis(st.StartedAt, req.Now)
 		}
 		st.FinishedAt = &at
 		r.run.Failures = 0
@@ -570,17 +614,16 @@ func (s *MemoryStore) UpdateStep(_ context.Context, lease Lease, req StepUpdate)
 }
 
 func isStepStatus(status StepStatus) bool {
-	switch status {
-	case StepProposed, StepWaiting, StepStarted, StepCompleted, StepBlocked, StepDeclined:
-		return true
-	}
-	return false
+	return storerule.IsStepStatus(string(status))
 }
 
 // RequestApproval implements Store.
 func (s *MemoryStore) RequestApproval(_ context.Context, lease Lease, req ApprovalRequest) (Approval, error) {
 	if !isUUID(req.ID) {
 		return Approval{}, fmt.Errorf("agent: request approval: id %q is not a UUID", req.ID)
+	}
+	if !storerule.IsCause(string(req.Cause)) {
+		return Approval{}, fmt.Errorf("agent: request approval: %q is not a cause", req.Cause)
 	}
 	action, err := storedAction(req.Action)
 	if err != nil {
@@ -613,8 +656,8 @@ func (s *MemoryStore) RequestApproval(_ context.Context, lease Lease, req Approv
 	rev := touch(r, req.Now)
 	st.Status = StepWaiting
 	if req.Decision != "" {
-		st.Decision = req.Decision
-		st.Rule = req.Rule
+		st.Decision = Effect(storerule.Kept(string(req.Decision)))
+		st.Rule = storerule.Kept(req.Rule)
 	}
 	st.Rev = rev
 
@@ -626,11 +669,11 @@ func (s *MemoryStore) RequestApproval(_ context.Context, lease Lease, req Approv
 		Cause:       req.Cause,
 		Tool:        st.Name,
 		Action:      action,
-		Rule:        req.Rule,
+		Rule:        storerule.Kept(req.Rule),
 		Status:      ApprovalPending,
 		Rev:         rev,
-		RequestedAt: req.Now,
-		ExpiresAt:   cloneTime(req.ExpiresAt),
+		RequestedAt: storerule.Instant(req.Now),
+		ExpiresAt:   storerule.InstantPtr(req.ExpiresAt),
 	}}
 	if st.Call != nil {
 		a.approval.Input = slices.Clone(st.Call.Input)
@@ -668,7 +711,7 @@ func (s *MemoryStore) ListApprovals(_ context.Context, f ApprovalFilter) ([]Appr
 	}
 	slices.SortFunc(found, oldestFirst)
 
-	found = found[:min(len(found), listLimit(f.Limit))]
+	found = found[:min(len(found), storerule.ListLimit(f.Limit))]
 	for i := range found {
 		found[i] = cloneApproval(found[i])
 	}
@@ -693,13 +736,13 @@ func (s *MemoryStore) DecideApproval(_ context.Context, req DecideRequest) (Appr
 		return cloneApproval(a.approval), ErrAlreadyDecided
 	}
 
-	decided := req.Now
+	decided := storerule.Instant(req.Now)
 	a.approval.Status = ApprovalDeclined
 	if req.Approved {
 		a.approval.Status = ApprovalApproved
 	}
-	a.approval.DecidedBy = req.By
-	a.approval.Reason = req.Reason
+	a.approval.DecidedBy = storerule.Kept(req.By)
+	a.approval.Reason = storerule.Kept(req.Reason)
 	a.approval.DecidedAt = &decided
 	a.approval.Rev = touch(a.run, req.Now)
 	wake(a.run)
@@ -723,7 +766,7 @@ func (s *MemoryStore) ExpireApprovals(_ context.Context, now time.Time) (int, er
 				rev = touch(r, now)
 				wake(r)
 			}
-			decided := now
+			decided := storerule.Instant(now)
 			a.approval.Status = ApprovalExpired
 			a.approval.DecidedAt = &decided
 			a.approval.Rev = rev
@@ -750,8 +793,8 @@ func (s *MemoryStore) RequestCancel(_ context.Context, req CancelRequest) error 
 		return nil
 	}
 	r.run.CancelRequested = true
-	r.run.CancelBy = req.By
-	r.run.CancelReason = req.Reason
+	r.run.CancelBy = storerule.Kept(req.By)
+	r.run.CancelReason = storerule.Kept(req.Reason)
 	wake(r)
 	touch(r, req.Now)
 	return nil
@@ -851,41 +894,77 @@ func cloneApproval(a Approval) Approval {
 	return a
 }
 
-// storedMetadata is metadata as it reads back from a store: through JSON,
-// so a byte that is no UTF-8 is the replacement character, and none is an
-// empty map.
-func storedMetadata(metadata map[string]string) (map[string]string, error) {
-	text, err := json.Marshal(metadata)
-	if err != nil {
-		return nil, fmt.Errorf("metadata: %w", err)
+// storedSnapshot is a definition as it reads back from a store, which keeps
+// it as JSON: each schema as the bytes it came as, and each string with a
+// byte that is not UTF-8 as the replacement character. It fails for a schema
+// that is not JSON.
+func storedSnapshot(def Snapshot) (Snapshot, error) {
+	if err := storerule.ValidRaw(def.Output); err != nil {
+		return Snapshot{}, fmt.Errorf("output: %w", err)
 	}
-	var stored map[string]string
-	if err := json.Unmarshal(text, &stored); err != nil {
-		return nil, fmt.Errorf("metadata: %w", err)
+	def.System, def.Model = storerule.KeptInJSON(def.System), storerule.KeptInJSON(def.Model)
+	def.Output = rawOrNone(def.Output)
+	if def.Tools != nil {
+		tools := make([]ToolSpec, len(def.Tools))
+		for i, tool := range def.Tools {
+			if err := storerule.ValidRaw(tool.Schema); err != nil {
+				return Snapshot{}, fmt.Errorf("tool %q: schema: %w", tool.Name, err)
+			}
+			tool.Name, tool.Description = storerule.KeptInJSON(tool.Name), storerule.KeptInJSON(tool.Description)
+			tool.Schema = rawOrNone(tool.Schema)
+			tools[i] = tool
+		}
+		def.Tools = tools
 	}
-	if stored == nil {
-		stored = map[string]string{}
-	}
-	return stored, nil
+	return def, nil
 }
 
-// storedAction is a as it reads back from a store: its attributes through
-// JSON, so a number is a float64 (and an integer past 2^53 is no longer
-// exact), an object a map[string]any and a list a []any, and no attributes
-// are an empty map. It fails for attributes JSON cannot hold.
+// rawOrNone is a schema as it reads back from a store: a copy, and nil for
+// one that was empty, which JSON leaves out.
+func rawOrNone(value json.RawMessage) json.RawMessage {
+	if len(value) == 0 {
+		return nil
+	}
+	return slices.Clone(value)
+}
+
+// storedMessage is a reply as it reads back from a store, which keeps it as
+// JSON: the arguments of each call and the provider's form as the bytes they
+// came as, or JSON's null for none, and each string with a byte that is not
+// UTF-8 as the replacement character. It fails for arguments or a provider's
+// form that are not JSON.
+func storedMessage(m Message) (Message, error) {
+	m = cloneMessage(m)
+	m.Role, m.Text = Role(storerule.KeptInJSON(string(m.Role))), storerule.KeptInJSON(m.Text)
+	for i := range m.Calls {
+		call := &m.Calls[i]
+		if err := storerule.ValidRaw(call.Input); err != nil {
+			return Message{}, fmt.Errorf("call %d: input: %w", i+1, err)
+		}
+		call.ID, call.Name, call.Input = storerule.KeptInJSON(call.ID), storerule.KeptInJSON(call.Name), storerule.OrNull(call.Input)
+	}
+	for i := range m.Results {
+		result := &m.Results[i]
+		result.CallID, result.Content = storerule.KeptInJSON(result.CallID), storerule.KeptInJSON(result.Content)
+	}
+	if m.Opaque != nil {
+		if err := storerule.ValidRaw(m.Opaque.Data); err != nil {
+			return Message{}, fmt.Errorf("opaque: data: %w", err)
+		}
+		m.Opaque.Provider, m.Opaque.Data = storerule.KeptInJSON(m.Opaque.Provider), storerule.OrNull(m.Opaque.Data)
+	}
+	return m, nil
+}
+
+// storedAction is a as it reads back from a store: its attributes as
+// storerule.Attrs gives them, and its kind and target as strings that are
+// only recorded. It fails for attributes JSON cannot hold.
 func storedAction(a Action) (Action, error) {
-	text, err := json.Marshal(a.Attrs)
+	attrs, err := storerule.Attrs(a.Attrs)
 	if err != nil {
-		return Action{}, fmt.Errorf("action attributes: %w", err)
+		return Action{}, err
 	}
-	var attrs map[string]any
-	if err := json.Unmarshal(text, &attrs); err != nil {
-		return Action{}, fmt.Errorf("action attributes: %w", err)
-	}
-	if attrs == nil {
-		attrs = map[string]any{}
-	}
-	a.Attrs = attrs
+	a.Kind, a.Target, a.Attrs = storerule.Kept(a.Kind), storerule.Kept(a.Target), attrs
 	return a, nil
 }
 

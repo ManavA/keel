@@ -22,6 +22,8 @@ import (
 // comes from a Clock it moves in whole milliseconds, far from the wall clock,
 // so a store that reads a clock of its own fails; every id it makes is a
 // UUID; and every JSON value is compact, so a store may keep them as text.
+// The cases about a time finer than a microsecond are the ones that pass
+// one.
 func RunStoreSuite(t *testing.T, newStore func(t *testing.T) agent.Store) {
 	t.Helper()
 
@@ -46,7 +48,11 @@ func RunStoreSuite(t *testing.T, newStore func(t *testing.T) agent.Store) {
 		{"RequestCancel", requestCancelCases()},
 		{"Changes", changesCases()},
 		{"ListRuns", listRunsCases()},
+		{"Cursor", cursorCases()},
 		{"ListApprovals", listApprovalsCases()},
+		{"Strings", stringsCases()},
+		{"RawJSON", rawJSONCases()},
+		{"Times", timesCases()},
 		{"NotFound", notFoundCases()},
 		{"Order", orderCases()},
 	}

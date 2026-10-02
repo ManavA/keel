@@ -257,8 +257,11 @@ func (s textStore) BeginModel(ctx context.Context, lease agent.Lease, seq int, n
 }
 
 func (s textStore) CompleteModel(ctx context.Context, lease agent.Lease, req agent.CompleteModelRequest) error {
-	// What a database is sent is the message as JSON.
-	req.Message = mustText(req.Message)
+	// What a database is sent is the message as JSON. A message JSON cannot
+	// hold goes to the store as it is, to be refused.
+	if message, ok := asText(req.Message); ok {
+		req.Message = message
+	}
 	return s.inner.CompleteModel(ctx, s.lease(lease), req)
 }
 

@@ -52,6 +52,29 @@ func orderCases() []storeCase {
 			_, err := k.store.RequestApproval(k.ctx, lease, req)
 			return err
 		}},
+		{"RequestApproval with a number in its attributes that no float64 holds", oneCall, func(k *kit, lease agent.Lease) error {
+			req := k.askRequest(2)
+			req.Action.Attrs = map[string]any{"input": raw(`{"n":1e400000}`)}
+			_, err := k.store.RequestApproval(k.ctx, lease, req)
+			return err
+		}},
+		{"RequestApproval with a cause that is none", oneCall, func(k *kit, lease agent.Lease) error {
+			req := k.askRequest(2)
+			req.Cause = "policy"
+			_, err := k.store.RequestApproval(k.ctx, lease, req)
+			return err
+		}},
+		{
+			"CompleteModel with call arguments that are not JSON",
+			func(k *kit, held agent.Lease) { require.NoError(k.t, k.store.BeginModel(k.ctx, held, 1, k.tick())) },
+			func(k *kit, lease agent.Lease) error {
+				return k.store.CompleteModel(k.ctx, lease, agent.CompleteModelRequest{
+					Seq:     1,
+					Message: agent.Message{Role: agent.RoleAssistant, Calls: []agent.Call{{ID: "call-1", Name: toolSend, Input: raw(`{"id":`)}}},
+					Stop:    agent.StopToolUse, Model: suiteModel, Now: k.tick(),
+				})
+			},
+		},
 	}
 
 	// Calls on a method that takes a Lease, refused for the state they find,
@@ -152,6 +175,7 @@ func orderCases() []storeCase {
 			}{
 				{"a TTL of zero", agent.ClaimRequest{Owner: workerA, Agents: suiteAgents, RunID: newID(), TTL: 0}},
 				{"no owner", agent.ClaimRequest{Agents: suiteAgents, RunID: newID(), TTL: suiteTTL}},
+				{"an owner that cannot be kept", agent.ClaimRequest{Owner: unkeepables[0].given, Agents: suiteAgents, RunID: newID(), TTL: suiteTTL}},
 			}
 			for _, tt := range tests {
 				tt.req.Now = k.tick()
@@ -175,6 +199,8 @@ func orderCases() []storeCase {
 				{"an id that is not a UUID", func(run *agent.Run) { run.ID = malformedID }},
 				{"a parent id that is not a UUID", func(run *agent.Run) { run.ParentID = malformedID }},
 				{"a status that is not runnable", func(run *agent.Run) { run.Status = agent.StatusWaiting }},
+				{"an owner that cannot be kept", func(run *agent.Run) { run.LeaseOwner = unkeepables[0].given }},
+				{"a definition that is not JSON", func(run *agent.Run) { run.Definition.Output = raw(`{"type":`) }},
 			}
 			for _, tt := range tests {
 				again := k.newRun(agentAlpha)

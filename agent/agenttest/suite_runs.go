@@ -157,7 +157,7 @@ func createRunCases() []storeCase {
 			assert.ErrorIs(k.t, err, agent.ErrNotFound, "nothing was stored")
 
 			// The same run under ids a store can keep is accepted.
-			valid.ParentID = parent.ID
+			valid.ParentID, valid.ParentSeq, valid.Depth = parent.ID, 2, parent.Depth+1
 			k.insert(valid)
 		}},
 		{"another spelling of a UUID is refused, as the run's id and as its parent's", func(k *kit) {
@@ -181,6 +181,57 @@ func createRunCases() []storeCase {
 				_, err = k.store.GetRun(k.ctx, asParent.ID)
 				assert.ErrorIs(k.t, err, agent.ErrNotFound, "the child was not stored")
 			}
+		}},
+		{"a depth that is not one more than the parent's is refused, and any depth but zero for a run nobody started", func(k *kit) {
+			root := k.create(agentAlpha)
+			child := k.createChild(root)
+			require.Equal(k.t, 1, child.Depth)
+
+			tests := []struct {
+				name   string
+				parent string
+				depth  int
+			}{
+				{"a run nobody started, at depth 1", "", 1},
+				{"a run nobody started, below zero", "", -1},
+				{"a root's child at depth 0", root.ID, 0},
+				{"a root's child at depth 2", root.ID, 2},
+				{"a child's child at its parent's depth", child.ID, 1},
+				{"a child's child at depth 3", child.ID, 3},
+			}
+			for _, tt := range tests {
+				run := k.newRun(agentBeta)
+				run.ParentID, run.Depth = tt.parent, tt.depth
+				if tt.parent != "" {
+					run.ParentSeq = 2
+				}
+
+				_, created, err := k.store.CreateRun(k.ctx, run)
+
+				require.Error(k.t, err, tt.name)
+				assert.False(k.t, created, tt.name)
+				_, err = k.store.GetRun(k.ctx, run.ID)
+				assert.ErrorIs(k.t, err, agent.ErrNotFound, "%s: nothing was stored", tt.name)
+			}
+
+			// At the depth its parent gives it, each is stored.
+			grandchild := k.createChild(child)
+			assert.Equal(k.t, 2, k.run(grandchild.ID).Depth)
+		}},
+		{"a create that finds its key answers for that run, whatever depth it was given", func(k *kit) {
+			first := k.newRun(agentAlpha)
+			first.Key = suiteStartKey
+			stored := k.insert(first)
+
+			// The depth is judged against the store, after the key is looked
+			// for: it is not what the request alone gets wrong.
+			again := k.newRun(agentAlpha)
+			again.Key, again.Depth = suiteStartKey, 4
+			got, created, err := k.store.CreateRun(k.ctx, again)
+
+			require.NoError(k.t, err)
+			assert.False(k.t, created)
+			k.equalRun(stored, got)
 		}},
 		{"reads metadata back as JSON gives it", func(k *kit) {
 			run := k.newRun(agentAlpha)

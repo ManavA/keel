@@ -3,6 +3,7 @@ package agenttest
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -39,6 +40,29 @@ func claimCases() []storeCase {
 				assert.Equal(k.t, want.ID, got.ID)
 			}
 			assert.Nil(k.t, claim(k, workerA, agentAlpha), "every run is held")
+		}},
+		{"runs created at one instant are taken in the order of their ids", func(k *kit) {
+			older := k.create(agentAlpha)
+			instant := k.tick()
+			var same []string
+			for range 6 {
+				run := k.newRun(agentAlpha)
+				run.CreatedAt, run.UpdatedAt = instant, instant
+				same = append(same, k.insert(run).ID)
+			}
+			newer := k.create(agentAlpha)
+			// Not the order they arrived in, which a table does not keep.
+			slices.Sort(same)
+			want := append(append([]string{older.ID}, same...), newer.ID)
+
+			var took []string
+			for range want {
+				got := claim(k, workerA, agentAlpha)
+				require.NotNil(k.t, got)
+				took = append(took, got.ID)
+			}
+
+			assert.Equal(k.t, want, took)
 		}},
 		{"records the hold on the run it returns", func(k *kit) {
 			created := k.create(agentAlpha)
