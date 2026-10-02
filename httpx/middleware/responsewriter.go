@@ -23,31 +23,56 @@ type recorder struct {
 }
 
 func (w *recorder) WriteHeader(status int) {
-	if !w.wroteHeader {
-		w.status = status
-		w.wroteHeader = true
+	// net/http sends a 1xx as it is given and still waits for the final
+	// status, so it is neither recorded nor counted as the first.
+	if isInformational(status) {
+		w.ResponseWriter.WriteHeader(status)
+		return
 	}
+	// Past the first status the response is on the wire. Forwarding another
+	// only makes net/http log it as superfluous, as it does for the 504 chi's
+	// Timeout writes after a stream the deadline ended.
+	if w.wroteHeader {
+		return
+	}
+	w.status = status
+	w.wroteHeader = true
 	w.ResponseWriter.WriteHeader(status)
 }
 
+func isInformational(status int) bool {
+	return status >= 100 && status < 200 && status != http.StatusSwitchingProtocols
+}
+
 func (w *recorder) Write(b []byte) (int, error) {
-	if !w.wroteHeader {
-		// net/http implies 200 on the first write.
-		w.status = http.StatusOK
-		w.wroteHeader = true
-	}
+	w.impliedOK()
 	n, err := w.ResponseWriter.Write(b)
 	w.bytes += int64(n)
 	return n, err
 }
 
-func (w *recorder) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		if !w.wroteHeader {
-			w.status = http.StatusOK
-			w.wroteHeader = true
-		}
-		f.Flush()
+// Flush is for callers that hold only an http.Flusher, which cannot return an
+// error. http.ResponseController prefers FlushError.
+func (w *recorder) Flush() { _ = w.FlushError() }
+
+// FlushError flushes whatever below can, and reports what happened to it. A
+// recorder with only Flush would hide a failed flush from the
+// http.ResponseController a handler flushes through, and a stream could never
+// learn that its client stopped reading.
+func (w *recorder) FlushError() error {
+	err := http.NewResponseController(w.ResponseWriter).Flush()
+	if !errors.Is(err, http.ErrNotSupported) {
+		w.impliedOK()
+	}
+	return err
+}
+
+// impliedOK records the 200 net/http sends when a handler writes or flushes
+// before choosing a status.
+func (w *recorder) impliedOK() {
+	if !w.wroteHeader {
+		w.status = http.StatusOK
+		w.wroteHeader = true
 	}
 }
 
@@ -61,10 +86,7 @@ func (w *recorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 func (w *recorder) ReadFrom(src io.Reader) (int64, error) {
 	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
-		if !w.wroteHeader {
-			w.status = http.StatusOK
-			w.wroteHeader = true
-		}
+		w.impliedOK()
 		n, err := rf.ReadFrom(src)
 		w.bytes += n
 		return n, err
