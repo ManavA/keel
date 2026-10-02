@@ -200,10 +200,16 @@ func (p Policy) check() error {
 	if p.Default != "" && !p.Default.Valid() {
 		return fmt.Errorf("default %q is not allow, ask or block", p.Default)
 	}
+	if hasNUL(p.Version) {
+		return fmt.Errorf("the version %s", nulRefusal)
+	}
 	seen := make(map[string]int, len(p.Rules))
 	for i, r := range p.Rules {
 		if r.Name == "" {
 			return fmt.Errorf("rule %d has no name", i)
+		}
+		if hasNUL(r.Name) {
+			return fmt.Errorf("rule %d (%q): the name %s", i, r.Name, nulRefusal)
 		}
 		if r.Name == RuleDefault {
 			return fmt.Errorf("rule %d is named %q, which is what a decision records when no rule matched", i, r.Name)
@@ -222,17 +228,34 @@ func (p Policy) check() error {
 	return nil
 }
 
-// check reports what is wrong with m: a kind that names nothing, a target
-// pattern that does not compile or is a bare star, a condition that can never
-// hold or holds whatever the action is, or conditions that cannot all hold. The
-// design says an empty Kinds, an empty Target and an empty Attrs each mean
-// "any", so those are accepted; anything else that would leave a part of a rule
-// silently unmatched is refused, since on a block rule that fails open.
+// nulRefusal ends the message for a NUL character in a name, a kind, a pattern
+// or a version. A decision record names the rule, and holds the version and the
+// attribute names of a condition that could not be told, and no record can hold
+// a NUL, so a rule with one would load and then fail to record every decision
+// made under it.
+const nulRefusal = "holds a NUL character, which a decision record cannot store"
+
+// hasNUL reports whether s holds a NUL character.
+func hasNUL(s string) bool { return strings.IndexByte(s, 0) >= 0 }
+
+// check reports what is wrong with m: a kind that names nothing or holds a NUL,
+// a target pattern that holds one, does not compile or is a bare star, a
+// condition that can never hold or holds whatever the action is, or conditions
+// that cannot all hold. The design says an empty Kinds, an empty Target and an
+// empty Attrs each mean "any", so those are accepted; anything else that would
+// leave a part of a rule silently unmatched is refused, since on a block rule
+// that fails open.
 func (m Match) check() error {
 	for i, k := range m.Kinds {
 		if k == "" {
 			return fmt.Errorf("kind %d is empty, which names no action", i)
 		}
+		if hasNUL(k) {
+			return fmt.Errorf("kind %d (%q) %s", i, k, nulRefusal)
+		}
+	}
+	if hasNUL(m.Target) {
+		return fmt.Errorf("target pattern %q %s", m.Target, nulRefusal)
 	}
 	// Matching against the empty string still reads the whole pattern, so a
 	// malformed one is reported whatever the target.
@@ -245,6 +268,9 @@ func (m Match) check() error {
 	for i, c := range m.Attrs {
 		if c.Attr == "" {
 			return fmt.Errorf("condition %d has no attribute", i)
+		}
+		if hasNUL(c.Attr) {
+			return fmt.Errorf("condition %d: the attribute name %q %s", i, c.Attr, nulRefusal)
 		}
 		if err := c.check(); err != nil {
 			return fmt.Errorf("condition %d on %q: %w", i, c.Attr, err)

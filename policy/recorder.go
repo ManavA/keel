@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -10,8 +11,34 @@ import (
 	"time"
 )
 
+// ErrUnrecordable is what a Recorder wraps in the error it returns for a record
+// it can never store, however often it is tried again: a value its storage
+// cannot represent, or more of them than it will take. A Recorder that cannot
+// write because of how things are at the moment (a database that is down, a
+// context that is done) does not wrap it. Whoever retries a decision that failed
+// to record retries on the second kind and stops at the first, since a retry of
+// a record that can never be stored never ends. The error that wraps it is still
+// the Recorder's own, which errors.Is and errors.As can find.
+var ErrUnrecordable = errors.New("policy: the record cannot be stored")
+
+// unrecordable is err marked as one that no retry will cure. Its text is err's,
+// and it wraps both ErrUnrecordable and err.
+func unrecordable(err error) error {
+	return unrecordableError{err}
+}
+
+type unrecordableError struct{ err error }
+
+func (e unrecordableError) Error() string   { return e.err.Error() }
+func (e unrecordableError) Unwrap() []error { return []error{ErrUnrecordable, e.err} }
+
 // Record is one decision as it is logged.
 type Record struct {
+	// ID is the store's own number for a record it lists, which with At is the
+	// record's place in the log: a Recorder that keeps an ID sets it on the
+	// records it returns and ignores it on the ones it is handed. It is zero for
+	// a record that no store has numbered, and the in-memory recorder has none.
+	ID       int64     `json:"id,omitempty"`
 	At       time.Time `json:"at"`
 	Action   Action    `json:"action"`
 	Decision Decision  `json:"decision"`
@@ -19,7 +46,10 @@ type Record struct {
 	Version string `json:"version,omitempty"`
 }
 
-// Recorder keeps the decision log.
+// Recorder keeps the decision log. Record returns nil only when the record is
+// kept; a Decider returns no decision for one that is not. An error for a record
+// that can never be stored, whatever is retried, wraps ErrUnrecordable. Any
+// other error is one a later call may not meet.
 type Recorder interface {
 	Record(ctx context.Context, rec Record) error
 }
@@ -60,11 +90,12 @@ func NewMemoryRecorder() *MemoryRecorder {
 
 // Record implements Recorder. It keeps a copy of rec. It fails only when rec
 // holds more than 10000 values to copy, since a record kept with its inside
-// shared with the caller could be changed by the caller.
+// shared with the caller could be changed by the caller, and the error wraps
+// ErrUnrecordable.
 func (m *MemoryRecorder) Record(_ context.Context, rec Record) error {
 	rec, err := rec.clone(maxCopyValues)
 	if err != nil {
-		return fmt.Errorf("policy: record: %w", err)
+		return fmt.Errorf("policy: record: %w", unrecordable(err))
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()

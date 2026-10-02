@@ -860,3 +860,86 @@ func TestValidate_RefusesWhatCannotMatchOrMatchesTooMuchByMistake(t *testing.T) 
 		assert.Contains(t, err.Error(), "conditions 0 and 1")
 	})
 }
+
+// A NUL character cannot be stored in a decision record, and a rule's name, a
+// kind, a target pattern and an attribute name each go into one, so a policy
+// that holds one would load and then fail to record every decision under that
+// rule. It is refused when it is loaded, and the message names the rule.
+func TestValidate_RefusesANULThatNoRecordCouldHold(t *testing.T) {
+	const nul = "a\x00b"
+	in := func(m policy.Match) policy.Policy {
+		return policy.Policy{Rules: []policy.Rule{
+			{Name: "first", Effect: policy.Allow},
+			{Name: "second", Effect: policy.Block, When: m},
+		}}
+	}
+	tests := []struct {
+		name string
+		p    policy.Policy
+		want []string
+	}{
+		{"a rule's name", policy.Policy{Rules: []policy.Rule{{Name: "first", Effect: policy.Allow}, {Name: nul, Effect: policy.Block}}},
+			[]string{`rule 1 ("a\x00b")`, "name", "NUL"}},
+		{"a rule's name that is only a NUL", policy.Policy{Rules: []policy.Rule{{Name: "\x00", Effect: policy.Block}}},
+			[]string{`rule 0`, "name", "NUL"}},
+		{"a kind", in(policy.Match{Kinds: []string{"read", nul}}),
+			[]string{`rule 1 ("second")`, "kind 1", "NUL"}},
+		{"a target pattern", in(policy.Match{Target: "doc:" + nul}),
+			[]string{`rule 1 ("second")`, "target pattern", "NUL"}},
+		{"an attribute name", in(policy.Match{Attrs: []policy.Cond{{Attr: "ok", Op: policy.OpExists, Value: true}, {Attr: nul, Op: policy.OpEq, Value: "x"}}}),
+			[]string{`rule 1 ("second")`, "condition 1", "attribute", "NUL"}},
+		{"the version", policy.Policy{Version: nul, Rules: []policy.Rule{{Name: "only", Effect: policy.Allow}}},
+			[]string{"version", "NUL"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.p.Validate()
+			require.Error(t, err)
+			for _, want := range tt.want {
+				assert.Contains(t, err.Error(), want)
+			}
+			assert.NotContains(t, err.Error(), "\x00", "a NUL is named as text and never printed")
+
+			d, err := policy.NewDecider(tt.p, policy.Options{})
+			require.Error(t, err)
+			assert.Nil(t, d)
+			assert.Contains(t, err.Error(), "NUL")
+		})
+	}
+
+	t.Run("Parse refuses each of them as the JSON writes a NUL", func(t *testing.T) {
+		docs := map[string]string{
+			"a rule's name":    `{"rules": [{"name": "a\u0000b", "effect": "block"}]}`,
+			"a kind":           `{"rules": [{"name": "r", "effect": "block", "when": {"kinds": ["a\u0000b"]}}]}`,
+			"a target pattern": `{"rules": [{"name": "r", "effect": "block", "when": {"target": "a\u0000b"}}]}`,
+			"an attribute":     `{"rules": [{"name": "r", "effect": "block", "when": {"attrs": [{"attr": "a\u0000b", "op": "eq", "value": 1}]}}]}`,
+			"the version":      `{"version": "a\u0000b", "rules": [{"name": "r", "effect": "block"}]}`,
+		}
+		for name, doc := range docs {
+			got, err := policy.Parse([]byte(doc))
+			require.Errorf(t, err, "%s", name)
+			assert.Contains(t, err.Error(), "NUL", name)
+			assert.Equal(t, policy.Policy{}, got, name)
+		}
+	})
+
+	t.Run("text that only looks like a NUL is accepted", func(t *testing.T) {
+		const looksLike = `a\u0000b`
+		p := policy.Policy{Version: looksLike, Rules: []policy.Rule{
+			{Name: looksLike, Effect: policy.Block, When: policy.Match{
+				Kinds: []string{looksLike}, Target: looksLike,
+				Attrs: []policy.Cond{{Attr: looksLike, Op: policy.OpEq, Value: "x"}},
+			}},
+		}}
+		assert.NoError(t, p.Validate())
+	})
+
+	t.Run("a NUL in a value a condition compares against is accepted", func(t *testing.T) {
+		// What a condition is compared with is never recorded: the record holds
+		// the action's attributes, and a rule that this matches is decided.
+		p := policy.Policy{Rules: []policy.Rule{{Name: "r", Effect: policy.Block, When: policy.Match{
+			Attrs: []policy.Cond{{Attr: "x", Op: policy.OpEq, Value: nul}},
+		}}}}
+		assert.NoError(t, p.Validate())
+	})
+}

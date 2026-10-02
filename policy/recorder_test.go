@@ -2,6 +2,7 @@ package policy_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -253,6 +254,7 @@ func TestMemoryRecorder_RefusesARecordTooLargeToCopy(t *testing.T) {
 	err := m.Record(t.Context(), rec)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "10000")
+	assert.ErrorIs(t, err, policy.ErrUnrecordable, "no retry will make it smaller")
 	assert.Less(t, time.Since(started), 2*time.Second, "the work is bounded, not only the depth")
 	assert.Empty(t, m.Records())
 
@@ -332,6 +334,16 @@ func TestRecord_JSON(t *testing.T) {
 			want: `{"at":"2026-10-02T09:00:00Z","action":{"kind":"pay","attrs":{"amount":"1250"}},"decision":{"decision":"ask","rule":"r","index":0,"matched":["r"],"uncertain":["amount"]}}`,
 		},
 		{
+			name: "the id a store gives a record it lists",
+			rec: policy.Record{
+				ID:       7,
+				At:       recordTime,
+				Action:   policy.Action{Kind: "read"},
+				Decision: policy.Decision{Effect: policy.Allow, Rule: "r", Index: 0},
+			},
+			want: `{"id":7,"at":"2026-10-02T09:00:00Z","action":{"kind":"read"},"decision":{"decision":"allow","rule":"r","index":0}}`,
+		},
+		{
 			name: "no version",
 			rec: policy.Record{
 				At:       recordTime,
@@ -348,4 +360,21 @@ func TestRecord_JSON(t *testing.T) {
 			assert.Equal(t, tt.want, string(got))
 		})
 	}
+}
+
+func TestMemoryRecorder_KeepsNoIDOfItsOwn(t *testing.T) {
+	// A record is handed to a recorder without an id, and the in-memory one has
+	// none to give: what it returns carries the id it was handed, zero.
+	m := policy.NewMemoryRecorder()
+	require.NoError(t, m.Record(t.Context(), record("send")))
+	require.NoError(t, m.Record(t.Context(), record("read")))
+	for _, rec := range m.Records() {
+		assert.Zero(t, rec.ID)
+	}
+}
+
+func TestErrUnrecordable(t *testing.T) {
+	assert.Contains(t, policy.ErrUnrecordable.Error(), "policy:")
+	assert.NotErrorIs(t, errors.New("disk full"), policy.ErrUnrecordable)
+	assert.ErrorIs(t, fmt.Errorf("store: record: %w", policy.ErrUnrecordable), policy.ErrUnrecordable)
 }
