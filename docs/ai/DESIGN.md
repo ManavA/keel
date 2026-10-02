@@ -1004,10 +1004,21 @@ type Options struct {
 	// SystemRole is the role the system prompt is sent under. Default
 	// "system"; OpenAI's newer models also accept "developer".
 	SystemRole string
-	// Header is added to every request, for a gateway that needs one.
+	// Header is added to every request, for a gateway that needs one. It
+	// cannot replace Content-Type, nor the Authorization header an APIKey
+	// sets.
 	Header http.Header
-	// HTTPClient defaults to a client with a 10 minute timeout.
+	// HTTPClient defaults to a client that follows no redirects and has no
+	// timeout of its own: a call that is not a stream is bounded by 10
+	// minutes, and a stream by IdleTimeout. A client given here keeps its own
+	// timeout, which then bounds a stream too, and its own policy on
+	// redirects, which may follow one. The key and Header are still withheld
+	// from a host other than the one first asked.
 	HTTPClient *http.Client
+	// IdleTimeout is how long a stream may go without a byte, from the
+	// request being sent to the end of the stream. Zero is two minutes;
+	// negative is no limit.
+	IdleTimeout time.Duration
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
 }
@@ -1077,16 +1088,68 @@ with `id` and `function.name` arriving on its first chunk and
 with choices, and `usage` on a final chunk whose `choices` is empty. A
 server that sends no usage chunk leaves `Usage` zero.
 
+A stream ends in one of three ways. A chunk carried a `finish_reason`: the
+reply is complete, whatever follows, and a connection cut after it, with or
+without `data: [DONE]`, costs at most a usage chunk. No chunk did, but the
+stream ended cleanly with `data: [DONE]`: some servers never send a finish
+reason, so the reply is complete and its stop reason is read from what was
+assembled (`StopToolUse` for tool calls, `StopRefusal` for a refusal,
+`StopEnd` otherwise), and the missing reason is logged at debug level, since
+`Response` has no field for it. Neither, which includes a `[DONE]` that
+follows no chunk with an id or a choice, a stream that ends between events and
+one cut in the middle of an event: a failure of the connection, an `*llm.Error`
+with `Err` set and `Retryable` true. A server that said it finished, with a
+finish reason, and said no more, has given an empty reply, which is legitimate.
+
+A response to a streaming request whose content type is not
+`text/event-stream` is an `*llm.Error` that names the content type and is not
+retryable: it is a page from a proxy, or a server that ignored `stream`, and
+asking again gets the same. An `{"error": …}` chunk in a stream, which the
+reference does not document and servers send, is an `*llm.Error` too. A piece
+of a tool call from a server that sends no `index` continues the latest call,
+and an id that is not the one a call already has starts a new one.
+
+A stream is bounded by the caller's context; by `IdleTimeout` between bytes;
+by 16 MiB in one event; and by 32 MiB in all that the reply assembles, text,
+refusal and tool-call arguments together. It is not bounded by a timeout on the
+whole request, which would cut a long reply that is going well. A reply that
+outgrows a size bound is a plain error, not retryable, since a retry meets the
+same size. After a stream ends cleanly the body is read on, for at most 64 KiB
+and 100 milliseconds, so that the connection is used again; after a failure or
+an error from `fn` it is not, and the connection is closed.
+
 Embeddings. `POST {BaseURL}/embeddings` with `model`, `input` as an array,
 `encoding_format: "float"`, and `dimensions` when set. `data[]` is ordered
 by its `index` into `Vectors`; `usage.prompt_tokens` is `InputTokens`.
 
-Errors. The body is `{"error":{"message","type","param","code"}}`.
-`Retryable` is true for 408 and every 5xx, and for 429 unless `code` is
-one of `insufficient_quota`, `credit_balance_exhausted`,
-`organization_spend_limit_exceeded`, `project_spend_limit_exceeded` or
-`organization_usage_limit_exceeded`, which no wait fixes. `RetryAfter` is
-read from `Retry-After`; `RequestID` from `x-request-id`.
+Errors. The body is `{"error":{"message","type","param","code"}}`; a server
+may send the message, type and code at the top level, or `error` as a string,
+or a `code` that is a number. `Retryable` is true for 408 and every 5xx, and
+for 429 unless `code` or `type` is one of `insufficient_quota`,
+`credit_balance_exhausted`, `organization_spend_limit_exceeded`,
+`project_spend_limit_exceeded` or `organization_usage_limit_exceeded`, which no
+wait fixes. The reference's error guide gives `insufficient_quota` as the
+`type` that can accompany those codes, so both fields are read. `RetryAfter` is
+read from `Retry-After`, as seconds or as an HTTP date; `RequestID` from
+`x-request-id`.
+
+An error object inside a 200 response, in a completion, an embeddings reply
+or a stream, is an `*llm.Error` with `Status` 200. It counts as an error only
+when it carries a message or a type: an empty string or an empty object, which
+some servers send beside a good reply, is not one. It is retryable when its
+`type` or `code` is one the reference gives as passing (`rate_limit_error`,
+`rate_limit_exceeded`, `service_unavailable_error`, `server_is_overloaded`,
+`slow_down`, `server_error`) and not one of the final codes above.
+
+A 3xx is an `*llm.Error`, not retryable, because the default client does not
+follow redirects: one would send the caller's headers, and for a 307 or 308
+the whole prompt, to whatever host the answer named. A client supplied in the
+options keeps its own redirect policy, and the package withholds the key and
+`Header` from any host other than the one first asked.
+
+When a call fails and the caller's context is done, the error is the context's
+and is not retryable. When the context is live, a transport failure or the
+client's own timeout is an `*llm.Error` with `Err` set and `Retryable` true.
 
 ### 4.6 Interfaces consumed
 
@@ -1099,11 +1162,19 @@ Every type here is safe for concurrent use. `Scripted`, `Budgeted` and
 `Metered` guard their state with a mutex; the providers hold no state beyond
 their options. No call is retried unless it is wrapped in `Retrying`: a
 provider makes one HTTP request per call. A cancelled context ends a call at
-once and is never retried and never moves a `Fallback` on.
+once, and the error a provider returns for it is the context's, never an
+`*llm.Error`, so it is never retried and never moves a `Fallback` on.
 
 A provider reads at most 32 MiB of response body, and the event reader at
 most 16 MiB per event; past either it returns an error instead of
-allocating without limit.
+allocating without limit, and a plain one that is not retryable, since a
+retry meets the same size. A stream is not a body in this sense: it is bounded
+by its context, by an idle limit between bytes (default two minutes, from the
+options; negative means none), by the event bound, and by the same 32 MiB
+applied to what the reply assembles. No timeout on the whole request applies
+to a stream. After a stream ends cleanly a provider reads the rest of the body,
+a little and for a moment, so that the connection is reused. The default
+`http.Client` a provider builds follows no redirects.
 
 The order to compose the wrappers, outermost first, is `Metered`,
 `Budgeted`, `Fallback`, then one `Retrying` per provider: each provider
@@ -4078,3 +4149,53 @@ chose them.
     bound. Rejected: checking the assembled event, which allocates first
     and checks after. The error is not exported, since no caller has a
     decision to make about it.
+
+The first review of the two providers settled five more, each for both of
+them. These are written from the OpenAI provider's side.
+
+40. **A stream is bounded by its context, an idle limit, an event size and
+    the reply's size, and by no whole-request timeout.** Rejected: the
+    client's `Timeout`, which covers reading the body and so cuts a long
+    reply that is going well; and capping a stream at the body bound as a
+    whole, for the same reason. What a stream may not do is stall (the idle
+    limit, default two minutes, `IdleTimeout` in the options, negative for
+    none) or grow without limit (16 MiB an event, 32 MiB assembled). A size
+    bound that is passed is a plain error and not retryable, since a retry
+    meets the same size, where a stall is a transport failure that is.
+
+41. **A response that is not what a call asked for is an error, and the
+    stream that delivered nothing is a retryable one.** A 200 to a streaming
+    request that is not an event stream, and an error object inside a 200 body
+    of any call, embeddings included, are `*llm.Error`s; the first is not
+    retryable, the second is when its type or code says it passes. A stream
+    that ends cleanly with no chunk that has an id or a choice is an
+    incomplete stream, like a cut one, and retryable; a stream whose server
+    said it finished, with a finish reason, and said no more is an empty
+    reply. Rejected: reading a stream of nothing but `[DONE]` as an empty
+    reply, which is what a proxy that dropped the upstream sends.
+
+42. **The caller's context ending is the context's error, and the rest is the
+    provider's.** When a call fails and the caller's context is done, the
+    provider returns that context's error and it is not retryable. When the
+    context is live, a transport failure, a stream that went quiet and the
+    client's own timeout are `*llm.Error`s marked retryable. Rejected: an
+    `*llm.Error` for a cancellation, which a wrapper could mistake for the
+    provider's failure and a retry loop would then repeat.
+
+43. **The default client follows no redirects, and no client sends a
+    credential to a host it was not given.** A 3xx is an `*llm.Error`, not
+    retryable. A client supplied in the options keeps its own policy, and the
+    package withholds the key and the caller's headers from any host other than
+    the first, since `net/http` forwards every header but `Authorization` and
+    drops that one only when the host name changes. Rejected: following
+    redirects by default, which forwards the caller's headers and, for a 307 or
+    308, the whole prompt, and which turns the POST of a 301 into a GET.
+
+44. **After a stream ends cleanly its body is drained a little, so the
+    connection is reused.** At most 64 KiB and 100 milliseconds. A stream is
+    read to `[DONE]`, which comes before the end of the chunked body, and
+    `net/http` returns a connection to the pool only for a body read to its
+    end. Rejected: draining without a bound, which makes a server that holds
+    its stream open after `[DONE]` hold the call; and draining after a failure
+    or an error from the callback, where what is left is more than the
+    connection is worth.
