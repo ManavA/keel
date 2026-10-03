@@ -319,6 +319,15 @@ When `ctx` is cancelled, nothing more is claimed and each execution finishes
 the action it is in the middle of, then gives its run back. `DrainTimeout`
 bounds that wait.
 
+A tool still running when `DrainTimeout` runs out may still be making its
+effect, so nothing is written for its run and the lease is left to lapse. The
+worker that takes the run over counts the lapse as one of the run's failures,
+as it would for a process that died; the store cannot tell the two apart. A
+run whose tool is cut off by `MaxFailures` deploys in a row is finished as
+failed. With `DrainTimeout` above every tool's `Timeout` (a tool with none has
+two minutes), a shutdown does not cut off a tool that keeps to its
+context.
+
 ## What to mount the HTTP surface behind
 
 `agent/httpapi` serves runs, timelines, approvals and a server-sent event
