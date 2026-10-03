@@ -295,6 +295,19 @@ func TestConfigValidate(t *testing.T) {
 	assert.Equal(t, providerScripted, valid().Provider())
 }
 
+// TestWorkerWait holds run to waiting as long as Work can take to return
+// after a drain, whatever SHUTDOWN_TIMEOUT is.
+func TestWorkerWait(t *testing.T) {
+	for _, shutdown := range []time.Duration{time.Second, 4 * time.Second, 10 * time.Second, 20 * time.Second, time.Minute} {
+		cfg := Config{Config: app.Config{ShutdownTimeout: shutdown}}
+		wait := workerWait(cfg)
+		assert.GreaterOrEqual(t, wait, drainTimeout(cfg)+workerLastWrites, "shutdown timeout %s", shutdown)
+		assert.GreaterOrEqual(t, wait, shutdown, "shutdown timeout %s", shutdown)
+	}
+	assert.Equal(t, 20*time.Second, workerWait(Config{Config: app.Config{ShutdownTimeout: 20 * time.Second}}))
+	assert.Equal(t, 7*time.Second, workerWait(Config{Config: app.Config{ShutdownTimeout: 4 * time.Second}}))
+}
+
 // TestScript holds the scripted model to its replies: for a request as the
 // engine sends it at each turn, the calls expected, with the document ids
 // taken from the request and not from anything the script remembers.
