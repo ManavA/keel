@@ -76,25 +76,33 @@ run-local:
 	@trap 'docker rm -f $(EXAMPLE_DB_CONTAINER) >/dev/null 2>&1 || true' EXIT INT TERM; \
 		DATABASE_URL='$(EXAMPLE_DB_URL)' go run ./examples/minimal
 
-# Run examples/agentdemo against a throwaway Postgres of its own, so this target
-# and run-local never remove each other's database. The port is the caller's
-# PORT, as with run-local: the service listens on 8080 unless PORT says
-# otherwise. OPERATOR_TOKEN=demo is a token for a laptop and nothing else.
+# Run examples/agentdemo against a Postgres of its own, so this target and
+# run-local never remove each other's database. The database outlives the
+# service, so that a service killed half way through a run can be started
+# again on the journal it left: run-agent reuses the container when it is
+# already there, and stop-agent removes it. The port is the caller's PORT, as
+# with run-local: the service listens on 8080 unless PORT says otherwise.
+# OPERATOR_TOKEN=demo is a token for a laptop and nothing else.
 AGENT_DB_CONTAINER ?= keel-agent-db
 AGENT_DB_PORT      ?= 55433
 AGENT_DB_URL       ?= postgres://keel:keel@127.0.0.1:$(AGENT_DB_PORT)/keel?sslmode=disable
 
 .PHONY: run-agent
 run-agent:
-	@docker rm -f $(AGENT_DB_CONTAINER) >/dev/null 2>&1 || true
-	docker run -d --rm --name $(AGENT_DB_CONTAINER) \
-		-e POSTGRES_USER=keel -e POSTGRES_PASSWORD=keel -e POSTGRES_DB=keel \
-		-p 127.0.0.1:$(AGENT_DB_PORT):5432 postgres:16-alpine >/dev/null
+	@if [ -z "$$(docker ps -q -f name=^$(AGENT_DB_CONTAINER)$$)" ]; then \
+		docker rm -f $(AGENT_DB_CONTAINER) >/dev/null 2>&1 || true; \
+		docker run -d --name $(AGENT_DB_CONTAINER) \
+			-e POSTGRES_USER=keel -e POSTGRES_PASSWORD=keel -e POSTGRES_DB=keel \
+			-p 127.0.0.1:$(AGENT_DB_PORT):5432 postgres:16-alpine >/dev/null; \
+	fi
 	@printf 'waiting for postgres'
 	@until docker exec $(AGENT_DB_CONTAINER) pg_isready -U keel >/dev/null 2>&1; do \
 		printf '.'; sleep 1; \
 	done; echo ' ready'
-	@echo "serving on :$${PORT:-8080} — ctrl-c to stop, the database is removed on exit"
-	@trap 'docker rm -f $(AGENT_DB_CONTAINER) >/dev/null 2>&1 || true' EXIT INT TERM; \
-		DATABASE_URL='$(AGENT_DB_URL)' OPERATOR_TOKEN=demo LEASE_TTL=5s \
+	@echo "serving on :$${PORT:-8080} — ctrl-c to stop; the database stays until make stop-agent"
+	DATABASE_URL='$(AGENT_DB_URL)' OPERATOR_TOKEN=demo LEASE_TTL=5s \
 		go run ./examples/agentdemo
+
+.PHONY: stop-agent
+stop-agent:
+	docker rm -f $(AGENT_DB_CONTAINER)
