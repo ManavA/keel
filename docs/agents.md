@@ -23,7 +23,7 @@ What "exactly once" covers:
 - A completed step is never executed again, across any number of crashes and
   takeovers. A step is recorded once, and every journal write is fenced.
 - An interrupted model call is made again. That costs money and nothing else.
-  The lost call's cost is on no record.
+  The lost call's cost is on no record, and neither is its time.
 - An interrupted tool call is executed again with the same `Invocation.Key`.
   That is at-least-once. Whether its effect happens once is up to the tool.
 - An approval is decided once, and what is approved is what runs: the
@@ -213,6 +213,11 @@ model and tool calls, not time parked; default 15 minutes), `MaxCostMicros`,
 and a negative field is no limit. They are checked before each action that does
 work, so a run can pass a limit by the size of its last step.
 
+A step's time and cost are counted when it is recorded. A model or tool call
+that a crash, a lost lease or a shutdown interrupted is on no record, so the
+time spent in it counts against `MaxDuration` no more than its cost counts
+against `MaxCostMicros`; only the attempt that completes is counted.
+
 `Definition.Limits` sets them for an agent, and `StartRequest.Limits` replaces
 them for one run. A child run's cost limit is the smaller of its own and what
 its parent has left.
@@ -319,6 +324,15 @@ When `ctx` is cancelled, nothing more is claimed and each execution finishes
 the action it is in the middle of, then gives its run back. `DrainTimeout`
 bounds that wait.
 
+A tool still running when `DrainTimeout` runs out may still be making its
+effect, so nothing is written for its run and the lease is left to lapse. The
+worker that takes the run over counts the lapse as one of the run's failures,
+as it would for a process that died; the store cannot tell the two apart. A
+run whose tool is cut off by `MaxFailures` deploys in a row is finished as
+failed. With `DrainTimeout` above every tool's `Timeout` (a tool with none has
+two minutes), a shutdown does not cut off a tool that keeps to its
+context.
+
 ## What to mount the HTTP surface behind
 
 `agent/httpapi` serves runs, timelines, approvals and a server-sent event
@@ -353,4 +367,18 @@ timeout turned off.
 
 ## What a store keeps
 
-A string a store only records keeps U+FFFD in place of a NUL or invalid UTF-8.
+The two Postgres stores treat a character a column cannot hold differently.
+
+`agent/pg`, like `agent.MemoryStore`, keeps U+FFFD in place of a NUL or a byte
+that is not UTF-8 in a string it only records: a tool's result, a run's input,
+output and error, a reason, a rule, and the strings in metadata and an action.
+So no journal write fails for what a model or a tool wrote. A string it
+compares (an agent's name, a start key, an owner, a tool effect's key) is
+refused instead. Inside the JSON it keeps as written, a call's arguments and a
+turn in its provider's form, a NUL stays as the escape `\u0000` and only a byte
+that is not UTF-8 is replaced.
+
+`policy/pg` refuses to record a decision that holds a NUL anywhere, or a kind,
+target, rule or version that is not UTF-8, and the action is then not allowed.
+Only a byte that is not UTF-8 inside a rule name or an attribute, which it
+writes as JSON, is kept as U+FFFD.

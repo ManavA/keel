@@ -77,9 +77,14 @@ func (e *Engine) Tick(ctx context.Context) (Report, error) {
 // no failure counted. An action still in flight DrainTimeout later is cut
 // off. A model call that then returns is not recorded and its run is given
 // back all the same; a tool may be running still, so nothing is written for
-// its run and the lease is left to lapse. Work waits for those last writes,
-// and for no longer than a few seconds past DrainTimeout: an execution stuck
-// in a model that ignores its context is left behind.
+// its run and the lease is left to lapse. The worker that then takes the run
+// over counts the lapse as one of the run's failures, as it does for a
+// process that died: the store cannot tell the two apart. Repeated shutdowns
+// that each cut a tool off can so finish a run as failed at MaxFailures. A
+// DrainTimeout longer than every tool's Timeout prevents it for tools that
+// keep to their context. Work waits for those last writes, and for no longer
+// than a few seconds past DrainTimeout: an execution stuck in a model that
+// ignores its context is left behind.
 func (e *Engine) Work(ctx context.Context) error {
 	lapsing := make(chan struct{})
 	go func() {

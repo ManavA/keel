@@ -295,6 +295,53 @@ func TestConfigValidate(t *testing.T) {
 	assert.Equal(t, providerScripted, valid().Provider())
 }
 
+// TestWorkerWait holds run to waiting as long as Work can take to return
+// after a drain, whatever SHUTDOWN_TIMEOUT is.
+func TestWorkerWait(t *testing.T) {
+	for _, shutdown := range []time.Duration{time.Second, 4 * time.Second, 10 * time.Second, 20 * time.Second, time.Minute} {
+		cfg := Config{Config: app.Config{ShutdownTimeout: shutdown}}
+		wait := workerWait(cfg)
+		assert.GreaterOrEqual(t, wait, drainTimeout(cfg)+workerLastWrites, "shutdown timeout %s", shutdown)
+		assert.GreaterOrEqual(t, wait, shutdown, "shutdown timeout %s", shutdown)
+	}
+	assert.Equal(t, 20*time.Second, workerWait(Config{Config: app.Config{ShutdownTimeout: 20 * time.Second}}))
+	assert.Equal(t, 7*time.Second, workerWait(Config{Config: app.Config{ShutdownTimeout: 4 * time.Second}}))
+}
+
+// TestCoveredDocuments holds the digest's documents attribute to what the
+// digest covers, whatever list the model wrote.
+func TestCoveredDocuments(t *testing.T) {
+	batch := []Document{
+		{ID: "doc-1", Title: "Quarterly plan"},
+		{ID: "doc-2", Title: "Incident review"},
+		{ID: "doc-3", Title: "Hiring update"},
+	}
+	cases := []struct {
+		name string
+		args digestInput
+		want int
+	}{
+		{name: "the ids it lists", args: digestInput{DocumentIDs: []string{"doc-1", "doc-2", "doc-3"}}, want: 3},
+		{name: "an id listed twice counts once", args: digestInput{DocumentIDs: []string{"doc-1", "doc-1", "doc-1"}}, want: 1},
+		{name: "an id not in the batch is not counted", args: digestInput{DocumentIDs: []string{"doc-1", "doc-9"}}, want: 1},
+		{
+			name: "fewer ids than the body covers counts the body",
+			args: digestInput{
+				DocumentIDs: []string{"doc-1"},
+				Body:        "- Quarterly plan: three goals.\n- incident review: an index.\n- Hiring update: two offers.\n",
+			},
+			want: 3,
+		},
+		{name: "an id in the subject", args: digestInput{Subject: "About doc-2", DocumentIDs: []string{}}, want: 1},
+		{name: "nothing", args: digestInput{Body: "nothing to report"}, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, coveredDocuments(batch, tc.args))
+		})
+	}
+}
+
 // TestScript holds the scripted model to its replies: for a request as the
 // engine sends it at each turn, the calls expected, with the document ids
 // taken from the request and not from anything the script remembers.

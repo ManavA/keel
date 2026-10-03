@@ -115,15 +115,15 @@ func run() int {
 	}
 
 	// The pool is closed by the deferred Close, after the worker has made its
-	// last writes or the shutdown timeout has passed.
+	// last writes or has had as long as Work can take to make them.
 	select {
 	case err := <-worked:
 		if err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error("worker stopped", "error", err)
 			code = 1
 		}
-	case <-time.After(cfg.ShutdownTimeout):
-		logger.Warn("worker did not stop within the shutdown timeout; its runs resume when their leases lapse")
+	case <-time.After(workerWait(cfg)):
+		logger.Warn("worker did not stop in time; its runs resume when their leases lapse")
 	}
 	spend := svc.meter.Totals()
 	logger.Info("model spend", "calls", spend.Calls, "tokens_used", spend.Tokens, "cost_micros", spend.CostMicros)
@@ -214,9 +214,7 @@ func newService(ctx context.Context, cfg Config, logger *slog.Logger) (_ *servic
 		Logger:       logger,
 		LeaseTTL:     cfg.LeaseTTL,
 		PollInterval: cfg.PollInterval,
-		// Half the shutdown timeout, so a step in flight has finished, or been
-		// cut off, before run stops waiting for the worker.
-		DrainTimeout: cfg.ShutdownTimeout / 2,
+		DrainTimeout: drainTimeout(cfg),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("engine: %w", err)
@@ -281,4 +279,19 @@ func checkJournal(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("agent runs unreachable: %w", err)
 	}
 	return nil
+}
+
+// workerLastWrites is how long Work may take past DrainTimeout to make the
+// last writes of the executions it drained, as its documentation gives it.
+const workerLastWrites = 5 * time.Second
+
+// drainTimeout is how long a step in flight is given to finish once the
+// process is told to stop: half the shutdown timeout, as the server is given.
+func drainTimeout(cfg Config) time.Duration { return cfg.ShutdownTimeout / 2 }
+
+// workerWait is how long run waits for Work to return once the server has
+// stopped: as long as Work can take, and never less than the shutdown
+// timeout, so that a run whose step was cut off has been given back.
+func workerWait(cfg Config) time.Duration {
+	return max(cfg.ShutdownTimeout, drainTimeout(cfg)+workerLastWrites)
 }

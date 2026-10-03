@@ -7,6 +7,7 @@ import (
 	"log"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -571,7 +572,10 @@ func TestKeep_ALossAfterACancelRequestEndsTheHeartbeatsAndKeepsTheCause(t *testi
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newLeaseFixture(t)
-				held, stop := f.keep()
+				var lost atomic.Int32
+				opts := f.options()
+				opts.Lost = func() { lost.Add(1) }
+				held, stop := agent.Keep(context.Background(), f.lease, opts)
 				defer stop()
 
 				require.NoError(t, f.memory.RequestCancel(context.Background(), agent.CancelRequest{
@@ -588,6 +592,7 @@ func TestKeep_ALossAfterACancelRequestEndsTheHeartbeatsAndKeepsTheCause(t *testi
 				// The caller was told to cancel and is doing so. That the
 				// lease then went does not change what it was told.
 				requireLeaseEnded(t, held, agent.ErrCancelRequested, "after the loss")
+				assert.Equal(t, int32(1), lost.Load(), "the loss is reported all the same, once")
 				require.Len(t, f.store.seen(), 3)
 				requireLeaseQuiet(t, f)
 

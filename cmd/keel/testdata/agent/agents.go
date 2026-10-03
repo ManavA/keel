@@ -242,8 +242,17 @@ func sendDigest(docs *Documents, delay time.Duration) agent.Tool {
 			attrs := map[string]any{
 				// Every address is outside this example; a service with
 				// addresses of its own decides this from the address.
-				attrExternal:  true,
-				attrDocuments: len(args.DocumentIDs),
+				attrExternal: true,
+			}
+			// How many documents the digest covers is counted here, from the
+			// batch, and not taken from the list the model wrote. A batch
+			// that cannot be read leaves the attribute out, and no rule
+			// allows a send without it.
+			ctx, cancel := context.WithTimeout(context.Background(), batchReadTimeout)
+			batch, err := docs.List(ctx)
+			cancel()
+			if err == nil {
+				attrs[attrDocuments] = coveredDocuments(batch, args)
 			}
 			if rule, matched := textRule(args.Subject, args.Body); matched {
 				attrs[attrTextRule] = rule
@@ -307,4 +316,29 @@ func deleteDocument(docs *Documents, delay time.Duration) agent.Tool {
 // being told the tool failed.
 func transient(err error) error {
 	return fmt.Errorf("%w: %w", agent.ErrTransient, err)
+}
+
+// batchReadTimeout bounds the read of the batch a digest's action is
+// described from.
+const batchReadTimeout = 5 * time.Second
+
+// coveredDocuments counts the documents of batch a digest covers: those it
+// names by id, and those whose id or title its subject or body mentions. A
+// model that lists fewer ids than its text covers is counted by its text,
+// and an id listed twice or not in the batch is not counted.
+func coveredDocuments(batch []Document, args digestInput) int {
+	listed := make(map[string]bool, len(args.DocumentIDs))
+	for _, id := range args.DocumentIDs {
+		listed[id] = true
+	}
+	text := strings.ToLower(args.Subject + "\n" + args.Body)
+	covered := 0
+	for _, doc := range batch {
+		mentioned := strings.Contains(text, strings.ToLower(doc.ID)) ||
+			(doc.Title != "" && strings.Contains(text, strings.ToLower(doc.Title)))
+		if listed[doc.ID] || mentioned {
+			covered++
+		}
+	}
+	return covered
 }

@@ -153,13 +153,9 @@ func (h *healthHandler) ready(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *healthHandler) evaluate(ctx context.Context) (healthResponse, bool) {
-	h.mu.Lock()
-	if !h.cachedAt.IsZero() && time.Since(h.cachedAt) < h.cacheTTL {
-		resp, ok := h.cached, h.cachedOK
-		h.mu.Unlock()
+	if resp, ok, fresh := h.fromCache(); fresh {
 		return resp, ok
 	}
-	h.mu.Unlock()
 
 	// One probe runs the checks and the rest wait on its result. The wait is
 	// detached from any one request and bounded by Timeout, like the run
@@ -170,6 +166,11 @@ func (h *healthHandler) evaluate(ctx context.Context) (healthResponse, bool) {
 	waitCtx, cancel := context.WithTimeout(context.Background(), h.timeout)
 	defer cancel()
 	v, _, err := h.flight.Do(waitCtx, "readyz", func(context.Context) (any, error) {
+		// A run that ended between the look above and this one has cached
+		// its result, and the checks are not run again for it.
+		if resp, ok, fresh := h.fromCache(); fresh {
+			return readinessResult{resp: resp, ok: ok}, nil
+		}
 		resp, ok, cacheable := h.run(ctx)
 		if cacheable {
 			h.mu.Lock()
@@ -186,6 +187,16 @@ func (h *healthHandler) evaluate(ctx context.Context) (healthResponse, bool) {
 		return healthResponse{Status: "degraded", Build: buildinfo.Get()}, false
 	}
 	return r.resp, r.ok
+}
+
+// fromCache returns the cached result, and whether there is one still fresh.
+func (h *healthHandler) fromCache() (resp healthResponse, ok, fresh bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cachedAt.IsZero() || time.Since(h.cachedAt) >= h.cacheTTL {
+		return healthResponse{}, false, false
+	}
+	return h.cached, h.cachedOK, true
 }
 
 // run executes the checks. The result is cacheable unless a check failed

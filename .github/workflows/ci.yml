@@ -67,7 +67,7 @@ jobs:
         env:
           KEEL_REQUIRE_DB: "1"
           KEEL_TESTDB_PG_VERSION: ${{ matrix.pg }}
-        run: go test -count=1 ./pg/...
+        run: go test -count=1 ./pg/... ./policy/pg/... ./agent/pg/...
 
   lint:
     runs-on: ubuntu-latest

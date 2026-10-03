@@ -3,6 +3,7 @@ package llm
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -38,6 +39,11 @@ type Error struct {
 func (e *Error) Error() string {
 	if e.Err != nil {
 		return fmt.Sprintf("llm: %s: %v", e.Provider, e.Err)
+	}
+	// Some servers send the status again as the error's code, which then
+	// stands in for its type; the status is written once.
+	if e.Type == "" || e.Type == strconv.Itoa(e.Status) {
+		return fmt.Sprintf("llm: %s: status %d: %s", e.Provider, e.Status, e.Message)
 	}
 	return fmt.Sprintf("llm: %s: status %d %s: %s", e.Provider, e.Status, e.Type, e.Message)
 }

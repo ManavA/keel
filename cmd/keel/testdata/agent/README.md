@@ -38,15 +38,16 @@ main_test.go   the service as this file runs it
 The commands assume port 8080. If something else has it, put `PORT=18080` in
 front of `make` and use that port below.
 
-**1. Start it.** One command, no key. It starts a throwaway Postgres in Docker
-and removes it on exit.
+**1. Start it.** One command, no key. It starts a Postgres in Docker, or reuses
+the one it started before.
 
 ```
 make run-agent
 ```
 
 That is `OPERATOR_TOKEN=demo LEASE_TTL=5s go run ./examples/agentdemo` against
-that database. In a second terminal:
+that database. The database outlives the service, so that step 3 can kill the
+service and keep the run; `make stop-agent` removes it. In a second terminal:
 
 ```
 export T='Authorization: Bearer demo'
@@ -67,12 +68,16 @@ curl -N -H "$T" localhost:8080/agent/runs/<id>/events
 
 **3. Kill it half way.** Each tool sleeps for `STEP_DELAY` (750ms) so there is
 time. Start another batch, and while the reviewers are working, `kill -9` the
-`agentdemo` process (ctrl-c is a clean shutdown, which is not the point). Start
-it again without removing the database:
+`agentdemo` process (ctrl-c is a clean shutdown, which is not the point):
 
 ```
-DATABASE_URL='postgres://keel:keel@127.0.0.1:55433/keel?sslmode=disable' \
-  OPERATOR_TOKEN=demo LEASE_TTL=5s go run ./examples/agentdemo
+pkill -9 -x agentdemo
+```
+
+Start it again; the database is still there:
+
+```
+make run-agent
 ```
 
 The log says `resuming run`, with the run and the step it had reached. Once the
@@ -89,8 +94,8 @@ curl -s -H "$T" 'localhost:8080/agent/approvals?status=pending'
 ```
 
 shows the digest it wants to send, exactly as it would be sent, and the rule
-that asked. Restart the process; the log says `run is still waiting`, and it
-is. Approve it:
+that asked. Restart the process (ctrl-c, then `make run-agent`); the log says
+`run is still waiting`, and it is. Approve it:
 
 ```
 curl -s -X POST -H "$T" localhost:8080/agent/approvals/<approval id>/approve
@@ -108,6 +113,8 @@ curl -s -H "$T" localhost:8080/agent/runs/<id>/timeline
 Each `delete_document` step is `blocked`, with the rule that blocked it:
 "Documents are never deleted by an agent". The same decisions, with every
 allow, are in the `policy_decisions` table.
+
+When you are done, `make stop-agent` removes the database.
 
 **6. Run the tests.** They need Docker, for `pg/testdb`.
 

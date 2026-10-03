@@ -226,6 +226,23 @@ func TestGenerate_ErrorBodies(t *testing.T) {
 	})
 }
 
+func TestGenerate_ErrorTextNamesTheStatusOnce(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "a code that repeats the status", body: `{"error":{"message":"no access","type":null,"code":403}}`, want: "llm: openai: status 403: no access"},
+		{name: "a type", body: apiErr("permission_error", "", "no access"), want: "llm: openai: status 403 permission_error: no access"},
+		{name: "neither", body: `{"error":{"message":"no access"}}`, want: "llm: openai: status 403: no access"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, failure(t, http.StatusForbidden, nil, tt.body).Error())
+		})
+	}
+}
+
 // Generate, Stream and Embed read one error the same way.
 func TestErrors_AreTheSameForEveryCall(t *testing.T) {
 	calls := map[string]func(ctx context.Context, c *openai.Client) error{

@@ -118,6 +118,16 @@ func TestError_Error(t *testing.T) {
 			want: "llm: anthropic: status 429 rate_limit_error: slow down",
 		},
 		{
+			name: "a type that is the status again is not written twice",
+			err:  &llm.Error{Provider: "openai", Status: 403, Type: "403", Message: "forbidden"},
+			want: "llm: openai: status 403: forbidden",
+		},
+		{
+			name: "no type",
+			err:  &llm.Error{Provider: "anthropic", Status: 502, Message: "Bad Gateway"},
+			want: "llm: anthropic: status 502: Bad Gateway",
+		},
+		{
 			name: "a transport error, with no response",
 			err:  &llm.Error{Provider: "openai", Retryable: true, Err: errors.New("dial tcp: connection refused")},
 			want: "llm: openai: dial tcp: connection refused",
