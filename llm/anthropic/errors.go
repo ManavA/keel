@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ManavA/keel/llm"
+	"github.com/ManavA/keel/llm/internal/sse"
 )
 
 // maxMessageBytes bounds the part of a body that is not the API's error
@@ -196,12 +197,11 @@ func (c *Client) eventFailure(ctx context.Context, id string, err error, stalled
 		// Whether the connection dropped or the server stopped early, the
 		// reply is not whole.
 		return callError(ctx, id, fmt.Errorf("the stream ended before message_stop: %w", io.ErrUnexpectedEOF))
+	case errors.Is(err, sse.ErrEventTooLarge):
+		// Like any size bound it is a plain error.
+		return fmt.Errorf("anthropic: a stream event is larger than %d bytes", sse.MaxEventBytes)
 	default:
-		// The body was read and the event reader would not take it: an
-		// event past its bound. This is an inference from what the error is
-		// not, until the reader's own error for it can be tested for, so the
-		// reader's words are kept. Like any size bound it is a plain error.
-		return fmt.Errorf("anthropic: %w", err)
+		return callError(ctx, id, err)
 	}
 }
 
