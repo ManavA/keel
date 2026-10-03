@@ -14,7 +14,7 @@ test:
 .PHONY: test-db
 test-db:
 	KEEL_REQUIRE_DB=1 go test -count=1 \
-		./pg/... ./auth/pg/... ./admin/pg/... ./policy/pg/... ./agent/... ./app/...
+		./pg/... ./examples/... ./auth/pg/... ./admin/pg/... ./policy/pg/... ./agent/... ./app/...
 
 .PHONY: lint
 lint:
