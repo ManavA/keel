@@ -23,7 +23,7 @@ What "exactly once" covers:
 - A completed step is never executed again, across any number of crashes and
   takeovers. A step is recorded once, and every journal write is fenced.
 - An interrupted model call is made again. That costs money and nothing else.
-  The lost call's cost is on no record.
+  The lost call's cost is on no record, and neither is its time.
 - An interrupted tool call is executed again with the same `Invocation.Key`.
   That is at-least-once. Whether its effect happens once is up to the tool.
 - An approval is decided once, and what is approved is what runs: the
@@ -212,6 +212,11 @@ model and tool calls, not time parked; default 15 minutes), `MaxCostMicros`,
 `MaxTokens` and `MaxModelCalls` (default 50). A zero field takes its default
 and a negative field is no limit. They are checked before each action that does
 work, so a run can pass a limit by the size of its last step.
+
+A step's time and cost are counted when it is recorded. A model or tool call
+that a crash, a lost lease or a shutdown interrupted is on no record, so the
+time spent in it counts against `MaxDuration` no more than its cost counts
+against `MaxCostMicros`; only the attempt that completes is counted.
 
 `Definition.Limits` sets them for an agent, and `StartRequest.Limits` replaces
 them for one run. A child run's cost limit is the smaller of its own and what
