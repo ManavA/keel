@@ -5310,6 +5310,45 @@ func TestExecute_ACallInFlightWhenCancellationIsRequestedIsCutOffAndTheRunIsCanc
 	}
 }
 
+func TestExecute_ACancelRequestThatLandsAsAFailureIsRecordedFinishesTheRunAsCancelled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var f *execFixture
+		var started agent.Run
+		armed := false
+		calls := &execCalls{}
+		flaky := calls.tool("lookup", func(context.Context, agent.Invocation) (string, error) {
+			armed = true
+			return "", fmt.Errorf("upstream busy: %w", agent.ErrTransient)
+		})
+		f = newExecFixture(t, execConfig{
+			defs: []agent.Definition{execClerk(flaky)},
+			script: agenttest.Replies(
+				agenttest.Use(agenttest.Call("call-1", "lookup", `{}`)),
+				agenttest.Say("never said"),
+			),
+		})
+		started = f.start("clerk", "look it up")
+		// The failure is read for its count; the request lands as it is, and
+		// the read is cut off by it.
+		f.wire.hold("GetRun", func(ctx context.Context) {
+			if !armed {
+				return
+			}
+			armed = false
+			assert.NoError(t, f.engine.Cancel(t.Context(), started.ID, "ops@example.test", "wrong batch"))
+			<-ctx.Done()
+		})
+
+		got, err := f.engine.Execute(t.Context(), started.ID)
+
+		require.NoError(t, err)
+		assert.Equal(t, agent.StatusCancelled, got.Status, "the execution that was told finishes the run")
+		assert.Empty(t, got.LeaseOwner, "the run is not left for its lease to lapse")
+		assert.Zero(t, got.Failures, "a run being cancelled is not charged the failure")
+		assert.Len(t, calls.of("lookup"), 1)
+	})
+}
+
 func TestExecute_ALastWriteRefusedForALostLeaseIsALostLeaseAndNoMoreIsTried(t *testing.T) {
 	for _, tc := range []struct {
 		op    string

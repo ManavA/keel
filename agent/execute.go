@@ -162,7 +162,12 @@ func (e *Engine) execute(ctx context.Context, claimed Run) (end ending, err erro
 		if r := recover(); r != nil {
 			e.log.ErrorContext(step, "agent: an execution panicked",
 				"run", claimed.ID, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
-			end, err = x.fail(claimed, fmt.Errorf("the execution panicked: %v", r), false)
+			// Not fail: the loop cannot be gone round again after a panic.
+			// A request to cancel moves the work on to step, and the failure
+			// is charged.
+			_ = x.interrupted()
+			current, readErr := x.e.store.GetRun(x.work, claimed.ID)
+			end, err = x.charge(claimed, current, readErr, fmt.Errorf("the execution panicked: %v", r), false)
 		}
 	}()
 	return x.loop(claimed)
@@ -892,8 +897,24 @@ func (x *execution) cancelChildren(run Run, status Status, reason string) error 
 //
 // The count is read fresh, since a step that completed during this
 // execution has reset it.
+//
+// When the context the execution works under has ended, before the read or
+// during it, nothing is charged and the action is halted instead: a request
+// to cancel the run sends the loop round to finish it as cancelled, a lost
+// lease writes nothing, and a drain that ran out gives the run back.
 func (x *execution) fail(run Run, failure error, longest bool) (ending, error) {
+	if x.work.Err() != nil {
+		return x.halted(run, false)
+	}
 	current, err := x.e.store.GetRun(x.work, run.ID)
+	if err != nil && x.work.Err() != nil {
+		return x.halted(run, false)
+	}
+	return x.charge(run, current, err, failure, longest)
+}
+
+// charge is fail once the run has been read, or the read failed with err.
+func (x *execution) charge(run, current Run, err, failure error, longest bool) (ending, error) {
 	if err != nil {
 		return x.unwritten(run, errors.Join(failure, fmt.Errorf("read the run to record the failure: %w", err)))
 	}
