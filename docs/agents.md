@@ -353,4 +353,18 @@ timeout turned off.
 
 ## What a store keeps
 
-A string a store only records keeps U+FFFD in place of a NUL or invalid UTF-8.
+The two Postgres stores treat a character a column cannot hold differently.
+
+`agent/pg`, like `agent.MemoryStore`, keeps U+FFFD in place of a NUL or a byte
+that is not UTF-8 in a string it only records: a tool's result, a run's input,
+output and error, a reason, a rule, and the strings in metadata and an action.
+So no journal write fails for what a model or a tool wrote. A string it
+compares (an agent's name, a start key, an owner, a tool effect's key) is
+refused instead. Inside the JSON it keeps as written, a call's arguments and a
+turn in its provider's form, a NUL stays as the escape `\u0000` and only a byte
+that is not UTF-8 is replaced.
+
+`policy/pg` refuses to record a decision that holds a NUL anywhere, or a kind,
+target, rule or version that is not UTF-8, and the action is then not allowed.
+Only a byte that is not UTF-8 inside a rule name or an attribute, which it
+writes as JSON, is kept as U+FFFD.
