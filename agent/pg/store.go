@@ -840,6 +840,10 @@ const deadlockDetected = "40P01"
 // report a deadlock all the same, the purge is tried once more before the
 // error is returned: nothing of the first try was kept, and what held the
 // other lock has gone on.
+//
+// It scans two tables in full: the runs, for those that ended before
+// olderThan, and the effect keys, for those under a removed run. It is meant
+// for a periodic job, not for a request.
 func (s *Store) Purge(ctx context.Context, olderThan time.Time) (int64, error) {
 	removed, err := s.purge(ctx, olderThan)
 	var failure *pgconn.PgError

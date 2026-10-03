@@ -98,7 +98,7 @@ func (m *Metered) account(ctx context.Context, req Request, start time.Time, res
 	c := CallRecord{At: start, Duration: m.now().Sub(start), Model: req.Model, Err: err}
 	if err == nil {
 		c.Model = cmp.Or(resp.Model, req.Model)
-		c.Usage = billed(resp)
+		c.Usage = resp.BilledUsage()
 		c.Stop = resp.Stop
 		c.CostMicros, c.Priced = priceReply(m.prices, resp, req.Model)
 	}

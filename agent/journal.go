@@ -57,7 +57,9 @@ type Run struct {
 	Error string `json:"error,omitempty"`
 
 	// ParentID and ParentSeq name the tool step of the run that started
-	// this one. Depth is 0 for a run nobody delegated.
+	// this one. Depth is 0 for a run nobody delegated, and otherwise its
+	// parent's plus one: a store refuses any other depth in CreateRun, since
+	// the order it locks rows in is taken from it.
 	ParentID  string `json:"parent_id,omitempty"`
 	ParentSeq int    `json:"parent_seq,omitempty"`
 	Depth     int    `json:"depth,omitempty"`
@@ -250,7 +252,9 @@ type RunFilter struct {
 	Status   Status
 	Agent    string
 	ParentID string
-	// Before returns runs older than this position.
+	// Before returns runs older than this position. A cursor whose ID is not
+	// a canonical UUID is refused with an error, a time with no ID included;
+	// the zero Cursor lists from the start.
 	Before *Cursor
 	// Limit defaults to 50 and is capped at 200.
 	Limit int
@@ -346,7 +350,9 @@ type ApprovalRequest struct {
 	Seq int
 	// From is the status the step must be in: StepProposed, or StepStarted
 	// for an interrupted call.
-	From     StepStatus
+	From StepStatus
+	// Cause must be one of the three causes: any other is refused, before
+	// the lease is looked at.
 	Cause    ApprovalCause
 	Action   Action
 	Decision Effect
@@ -383,7 +389,10 @@ type CancelRequest struct {
 type Store interface {
 	// CreateRun inserts run as runnable. When run.Key is set and a run of
 	// the same agent already has it, that run is returned and created is
-	// false.
+	// false. A Depth that is not the parent's plus one (zero for a run with
+	// no parent) is refused. A store whose insert can fail for a reason that
+	// goes away before it looks, such as a parent stored in between, tries
+	// the insert once more.
 	CreateRun(ctx context.Context, run Run) (stored Run, created bool, err error)
 	GetRun(ctx context.Context, id string) (Run, error)
 	ListRuns(ctx context.Context, f RunFilter) ([]Run, error)
@@ -392,7 +401,8 @@ type Store interface {
 	// whose NextAttemptAt has passed, raising its Epoch. It returns nil
 	// when there is none. Taking over a lapsed lease counts as a failure.
 	Claim(ctx context.Context, req ClaimRequest) (*Run, error)
-	// Heartbeat extends the lease to now plus ttl and reports whether
+	// Heartbeat extends the lease to now plus ttl, rounded up to the
+	// microsecond a lease's expiry is kept to, and reports whether
 	// cancellation has been requested.
 	Heartbeat(ctx context.Context, lease Lease, now time.Time, ttl time.Duration) (cancelRequested bool, err error)
 	// Yield releases the lease and leaves the run runnable.

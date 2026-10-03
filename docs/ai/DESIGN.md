@@ -332,6 +332,10 @@ type Response struct {
 	Attempts []Attempt
 }
 
+// BilledUsage is the usage of every attempt behind r: the sum over its
+// Attempts when it lists any, otherwise its one Usage.
+func (r *Response) BilledUsage() Usage
+
 // Delta is one increment of a streamed reply.
 type Delta struct {
 	Text      string
@@ -719,9 +723,14 @@ Both providers read server-sent events through one internal reader:
 // Package sse reads a server-sent event stream.
 package sse
 
-// MaxEventBytes bounds one event. A longer one is an error rather than an
-// allocation without limit.
+// MaxEventBytes bounds one event, measured as the sum of the lengths of its
+// field lines without their line endings. A longer one is an error rather
+// than an allocation without limit.
 const MaxEventBytes = 16 << 20
+
+// ErrEventTooLarge is returned for an event over MaxEventBytes. Asking again
+// meets the same event, so a provider does not treat it as a transport failure.
+var ErrEventTooLarge = fmt.Errorf("sse: event is larger than %d bytes", MaxEventBytes)
 
 // Event is one event from a stream.
 type Event struct {
@@ -742,7 +751,8 @@ func NewReader(r io.Reader) *Reader
 // data, and returns io.EOF when the stream ends after a complete event. A
 // stream that ends in the middle of an event, with no blank line after it,
 // is a connection that dropped: the event is not returned, and the error
-// wraps io.ErrUnexpectedEOF.
+// wraps io.ErrUnexpectedEOF. An event over MaxEventBytes returns
+// ErrEventTooLarge, refused while its line is being read.
 func (r *Reader) Next() (Event, error)
 ```
 
@@ -753,12 +763,19 @@ part of one, with no blank line to close the event, did not end: the
 connection dropped. `Next` then returns an error wrapping
 `io.ErrUnexpectedEOF` and never the partial event, which is what the standard
 says to do with it. A transport that notices the truncation itself gives the
-same error, so both providers test for one thing and report it as a
+same error, so a provider tests for one thing. It reports a cut as a
 transport failure, an `*llm.Error` with `Err` set, retryable unless the
-context ended. A failed read is returned wrapped, so `errors.Is` still finds
-its cause, and once `Next` has returned an error it returns that error
-again. Decisions 36 to 39 in section 12 record the rest of what the reader
-does and does not read.
+context ended, except where the reply's own terminal event has already been
+read (Anthropic's `message_stop`; for an OpenAI-compatible stream, a chunk
+carrying `finish_reason`, with or without a clean `data: [DONE]`): the reply
+is then whole and the cut is ignored. An event past `MaxEventBytes` is a
+different case: the error is `ErrEventTooLarge`, which a provider finds with
+`errors.Is`, and it is a plain error that is not retryable, since asking
+again meets the same event. Comment lines are neither counted nor held, so
+keep-alives of any number or length never reach the bound. A failed read is
+returned wrapped, so `errors.Is` still finds its cause, and once `Next` has
+returned an error it returns that error again. Decisions 36 to 39 in section
+12 record the rest of what the reader does and does not read.
 
 ### 4.3 What each piece does
 
@@ -772,8 +789,10 @@ zero, `InputTokens` is `EstimateInputTokens(req)` and `OutputTokens` is one
 per four bytes of reply text and tool arguments, plus one, so a script always
 costs the same. `Response.Model` is `Request.Model`, or `ScriptedOptions.Name`
 when the request names none. `Stream` sends the text a word at a time and
-each tool call as one delta, then returns what `Generate` would have. It is
-safe for concurrent use.
+each tool call as one delta, then returns what `Generate` would have. A tool
+call with no input carries `{}`, a refusal reply carries a non-nil empty
+refusal, and a nil script behaves as an empty one: every call is
+`ErrScriptExhausted`, and nothing panics. It is safe for concurrent use.
 
 **`EstimateInputTokens`.** One token per three bytes of the system prompt,
 the messages, the tool definitions and the output schema, rounded up once
@@ -888,7 +907,8 @@ updated and with no lock held.
 
 **`Decode`.** Unmarshals `resp.Message.Text` into `T`. It refuses a reply
 whose `Stop` is not `StopEnd`, since the reference says a refused or
-truncated reply need not match the schema.
+truncated reply need not match the schema, and a reply whose text is the JSON
+`null`, which `encoding/json` would read into any type without complaint.
 
 ### 4.4 `llm/anthropic`
 
@@ -1406,17 +1426,21 @@ context is done returns the context's error and no `*Error`. If the server had
 already answered with an error status, that status is what is returned, even
 when the cancellation cut its body short.
 
-A provider reads at most 32 MiB of response body, and the event reader at
-most 16 MiB per event; past either it returns an error instead of
-allocating without limit, and a plain one that is not retryable, since a
-retry meets the same size. A stream is not a body in this sense: it is bounded
-by its context, by an idle limit on the bytes received from the server
-(default two minutes, from the options; negative means none; comments count and
-the time a callback takes does not), by the event bound, and by the same 32 MiB
-applied to what the reply keeps. No timeout on the whole request applies
-to a stream. After a stream ends cleanly a provider reads the rest of the body,
-a little and for a moment, so that the connection is reused. The default
-`http.Client` a provider builds follows no redirects.
+A provider reads a response body that is not a stream, an error body or an
+embeddings reply for instance, up to 32 MiB, and past that it returns an
+error instead of allocating without limit: a plain one that is not
+retryable, since a retry meets the same size. A stream is not a body in this
+sense, and is bounded by four things (decisions 54 and 68): its context; an
+idle limit on the bytes received from the server (default two minutes, from
+the options; negative means none; comments count and the time a callback
+takes does not); 16 MiB for one event, told by the event reader's
+`sse.ErrEventTooLarge`; and 32 MiB applied to what the reply keeps, ids and
+names and a fixed charge per block or call included, and not to the bytes on
+the wire. Passing either size bound is a plain error that is not retryable;
+a stall is a retryable transport failure. No timeout on the whole request
+applies to a stream. After a stream ends cleanly a provider reads the rest of
+the body, at most 64 KiB and 100 milliseconds, so that the connection is
+reused. The default `http.Client` a provider builds follows no redirects.
 
 The order to compose the wrappers, outermost first, is `Budgeted`, `Metered`,
 `Fallback`, then one `Retrying` per provider: each provider retries its own
@@ -2534,7 +2558,9 @@ type Run struct {
 	Error string `json:"error,omitempty"`
 
 	// ParentID and ParentSeq name the tool step of the run that started
-	// this one. Depth is 0 for a run nobody delegated.
+	// this one. Depth is 0 for a run nobody delegated, and otherwise its
+	// parent's plus one: a store refuses any other depth in CreateRun, since
+	// the order it locks rows in is taken from it.
 	ParentID  string `json:"parent_id,omitempty"`
 	ParentSeq int    `json:"parent_seq,omitempty"`
 	Depth     int    `json:"depth,omitempty"`
@@ -2727,7 +2753,9 @@ type RunFilter struct {
 	Status   Status
 	Agent    string
 	ParentID string
-	// Before returns runs older than this position.
+	// Before returns runs older than this position. A cursor whose ID is not
+	// a canonical UUID is refused with an error, a time with no ID included;
+	// the zero Cursor lists from the start.
 	Before *Cursor
 	// Limit defaults to 50 and is capped at 200.
 	Limit int
@@ -2825,7 +2853,9 @@ type ApprovalRequest struct {
 	Seq int
 	// From is the status the step must be in: StepProposed, or StepStarted
 	// for an interrupted call.
-	From     StepStatus
+	From StepStatus
+	// Cause must be one of the three causes: any other is refused, before
+	// the lease is looked at.
 	Cause    ApprovalCause
 	Action   Action
 	Decision Effect
@@ -2862,7 +2892,10 @@ type CancelRequest struct {
 type Store interface {
 	// CreateRun inserts run as runnable. When run.Key is set and a run of
 	// the same agent already has it, that run is returned and created is
-	// false.
+	// false. A Depth that is not the parent's plus one (zero for a run with
+	// no parent) is refused. A store whose insert can fail for a reason that
+	// goes away before it looks, such as a parent stored in between, tries
+	// the insert once more.
 	CreateRun(ctx context.Context, run Run) (stored Run, created bool, err error)
 	GetRun(ctx context.Context, id string) (Run, error)
 	ListRuns(ctx context.Context, f RunFilter) ([]Run, error)
@@ -2871,7 +2904,8 @@ type Store interface {
 	// whose NextAttemptAt has passed, raising its Epoch. It returns nil
 	// when there is none. Taking over a lapsed lease counts as a failure.
 	Claim(ctx context.Context, req ClaimRequest) (*Run, error)
-	// Heartbeat extends the lease to now plus ttl and reports whether
+	// Heartbeat extends the lease to now plus ttl, rounded up to the
+	// microsecond a lease's expiry is kept to, and reports whether
 	// cancellation has been requested.
 	Heartbeat(ctx context.Context, lease Lease, now time.Time, ttl time.Duration) (cancelRequested bool, err error)
 	// Yield releases the lease and leaves the run runnable.
@@ -3325,9 +3359,9 @@ from the request; a store never reads a clock.
 | Every method taking a `Lease` | Once the request itself has passed, locks the run, and returns `ErrLeaseLost` without changing anything unless the run's owner and epoch equal the lease's. The fence comes before every check that reads the store, and after the checks of the request alone. A lease with an empty `Owner` is never the run's, even when the run records no owner, so nothing writes to a run nobody holds. The hold is the epoch and not the time: under a lease that has lapsed and that no other claim has taken, a write goes through and `Heartbeat` extends the expiry. A run that does not exist is `ErrNotFound`, whatever the lease |
 | Every method that makes a waiting run runnable | These are `DecideApproval`, `ExpireApprovals`, `RequestCancel`, and `Finish` for the run's parent. Each sets `Status` runnable and clears `Reason`, since the run no longer waits. A run that is not waiting keeps its status and its lease |
 | Every method that is given something to keep | Refuses, with an error that is none of the package's sentinels and with nothing changed, what a database could not keep or would keep as something else, where that would change what the thing is or names. (A string that is only recorded is the exception, and is kept as the row above says.) An id to be stored must be a UUID in the one form `uuid.NewString` writes, lower case with hyphens: a run's `ID` and `ParentID`, an approval's `ID`, a step's `ChildRunID`. Another spelling of a UUID, upper case or without hyphens, is refused, because a database would take it and hand back the canonical one, and the id would no longer be the one given. A `ParentID` must name a run that exists, one level above. The other refusals are in the rows below |
-| `CreateRun` | The run is stored as given, with `Rev` 1 whatever `Rev` it was given. `Status` must be `StatusRunnable`: any other is an error and stores nothing. `ID`, and `ParentID` when set, must be UUIDs in canonical form; `Agent`, `Key` and `LeaseOwner` must be strings that can be kept; and each schema in `Definition` must be JSON. These are judged from the request, so a create that would find its key is still refused for them. Then a create that finds its agent and key returns the run that has them, as it now stands, and stores nothing. Otherwise an id already in use is an error, and the run that has it is left alone; then a `ParentID` that names no run is an error; and then a `Depth` that is not the parent's plus one, or not zero for a run with no parent, is an error. The depth is what the order of row locks is taken from (6.10), so a store does not take the caller's word for it. `Metadata` reads back as a JSON round trip gives it, so a byte that is not UTF-8 comes back as the replacement character, and as an empty map, not nil, when the run was given none |
+| `CreateRun` | The run is stored as given, with `Rev` 1 whatever `Rev` it was given. `Status` must be `StatusRunnable`: any other is an error and stores nothing. `ID`, and `ParentID` when set, must be UUIDs in canonical form; `Agent`, `Key` and `LeaseOwner` must be strings that can be kept; and each schema in `Definition` must be JSON. These are judged from the request, so a create that would find its key is still refused for them. Then a create that finds its agent and key returns the run that has them, as it now stands, and stores nothing. Otherwise an id already in use is an error, and the run that has it is left alone; then a `ParentID` that names no run is an error; and then a `Depth` that is not the parent's plus one, or not zero for a run with no parent, is an error. The depth is what the order of row locks is taken from (6.10), so a store does not take the caller's word for it. A `LeaseExpiresAt` is kept to the microsecond above, like any lease's expiry. `agent/pg` makes its insert and then looks for why it stored nothing; if the reason has gone by then (a parent stored in between, or the run it conflicted with purged), it makes the insert once more, and a second change is an error. `Metadata` reads back as a JSON round trip gives it, so a byte that is not UTF-8 comes back as the replacement character, and as an empty map, not nil, when the run was given none |
 | `Claim` | 6.6. `Owner` must not be empty, must be a string that can be kept, and `TTL` must be more than zero: otherwise an error. Of runs created at the same instant the one whose id sorts first is taken first: a table keeps no order of arrival. A claim leaves `NextAttemptAt` as it is, for the next `Yield` to set or clear. With `RunID`, the same conditions apply to that run alone, its agent being named in `Agents` among them, and `ErrNotClaimable` is returned when they do not hold. A claim by `RunID` locks the run and waits for a write in progress before it decides; only a claim without `RunID` passes over a run that is locked. A `RunID` that names no run is `ErrNotFound` |
-| `Heartbeat` | Sets the lease's expiry to `now` plus `ttl` and reports the cancel mark. `ttl` must be more than zero: otherwise an error, and the lease is as it was |
+| `Heartbeat` | Sets the lease's expiry to `now` plus `ttl`, rounded up to the microsecond, and reports the cancel mark. `ttl` must be more than zero: otherwise an error, and the lease is as it was |
 | `Yield` | Owner cleared, expiry cleared, `NextAttemptAt` set as given, which clears it when none is given. With `Failed`: `Failures` plus one, `Error` recorded. Without it, `Failures` and `Error` stay as they were. `Error` is therefore the last failure: it stays through later executions that go well, until `Finish` |
 | `Park` | 6.10. Sets `Status` waiting and `Reason`, clears the lease |
 | `Finish` | `Status` must be completed, failed or cancelled: any other is an error and changes nothing, and is judged before the run is looked for and before the lease. Sets `Status`, `Reason`, `Output`, `Error`, `FinishedAt`; clears the lease; sets every pending approval of the run `cancelled`; and when the run has a parent that is waiting, sets it runnable and adds one to its `Rev`. `Error` is set as given, so a run that ended well has none, whatever an earlier failure left. A cancelled approval gets that status, `DecidedAt` the request's time and the run's new `Rev`, and no `DecidedBy` or `Reason`, since nobody decided it |
@@ -3967,7 +4001,9 @@ returning <the run's columns>
 ```
 
 `$1` is the claim's time and `$3` that time plus the TTL, added in Go like
-every other time the store writes. `skip locked` means two processes
+every other time the store writes and then rounded up to the microsecond, which
+is all the column keeps, so that the store never counts a lease lapsed before
+its holder does. `skip locked` means two processes
 claiming at once take different runs and neither waits. Runs created at one
 instant are taken in the order of their ids, by both stores: the table has
 no column for the order runs arrived in, so that is the one order both can

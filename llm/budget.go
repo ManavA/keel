@@ -178,7 +178,7 @@ func (b *Budgeted) admit(req Request) (hold, error) {
 func (b *Budgeted) settle(h hold, resp *Response) {
 	var tokens, cost int64
 	if resp != nil {
-		tokens = billed(resp).Total()
+		tokens = resp.BilledUsage().Total()
 		cost = h.cost
 		if c, ok := priceReply(b.opts.Prices, resp, h.model); ok {
 			cost = c
@@ -230,10 +230,13 @@ func priceReply(prices Prices, resp *Response, asked string) (cost int64, ok boo
 	return cost, true
 }
 
-// billed is the usage of every attempt behind resp.
-func billed(resp *Response) Usage {
+// BilledUsage is the usage of every attempt behind r: the sum over its
+// Attempts when it lists any, otherwise its one Usage. It is what a budget, a
+// meter and anything that counts a reply against a limit should read, since
+// Usage alone is only the last model's share after a fallback.
+func (r *Response) BilledUsage() Usage {
 	var u Usage
-	for _, a := range attemptsOf(resp) {
+	for _, a := range attemptsOf(r) {
 		u = u.Add(a.Usage)
 	}
 	return u
