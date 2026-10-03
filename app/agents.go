@@ -199,14 +199,7 @@ func (a *agentModel) response(ctx context.Context, resp *llm.Response, asked str
 	}
 	// What the run's limits count is what was billed: every attempt, as the
 	// cost is, and not only the last model's share.
-	attempts := resp.Attempts
-	if len(attempts) == 0 {
-		attempts = []llm.Attempt{{Model: resp.Model, Usage: resp.Usage}}
-	}
-	var billed llm.Usage
-	for _, at := range attempts {
-		billed = billed.Add(at.Usage)
-	}
+	billed := resp.BilledUsage()
 	usage := agent.Usage{
 		InputTokens:  billed.InputTokens + billed.CacheReadTokens + billed.CacheWriteTokens,
 		OutputTokens: billed.OutputTokens,

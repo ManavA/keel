@@ -332,6 +332,10 @@ type Response struct {
 	Attempts []Attempt
 }
 
+// BilledUsage is the usage of every attempt behind r: the sum over its
+// Attempts when it lists any, otherwise its one Usage.
+func (r *Response) BilledUsage() Usage
+
 // Delta is one increment of a streamed reply.
 type Delta struct {
 	Text      string
