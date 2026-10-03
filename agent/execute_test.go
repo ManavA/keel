@@ -3108,6 +3108,54 @@ func TestExecute_ARunThatIsCancelledAsksEveryChildHoweverMany(t *testing.T) {
 	})
 }
 
+func TestExecute_ALeaseLostWhileAskingChildrenToStopAfterACancelRequestStopsTheAsking(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newExecFixture(t, execConfig{
+			defs:   []agent.Definition{execLead(), execReviewer()},
+			script: execLeadScript(execSummaries),
+		})
+		started := f.start("lead", "review the batch")
+		ctx := t.Context()
+		const many = 10
+		for i := range many {
+			_, _, err := f.memory.CreateRun(ctx, agent.Run{
+				ID: execID(7, i+1), Agent: "reviewer", Status: agent.StatusRunnable, Input: "{}",
+				ParentID: started.ID, ParentSeq: 2, Depth: 1, CreatedAt: execStart, UpdatedAt: execStart,
+			})
+			require.NoError(t, err)
+		}
+		require.NoError(t, f.engine.Cancel(ctx, started.ID, "ops@example.test", "wrong batch"))
+
+		asked := 0
+		f.wire.hold("RequestCancel", func(context.Context) {
+			asked++
+			switch asked {
+			case 1:
+				// A heartbeat reports the request, and the work goes on
+				// under step.
+				f.pass(execHeartbeat)
+			case 2:
+				// Then no heartbeat succeeds for a whole TTL, and another
+				// process takes the run.
+				f.faults.FailBefore("Heartbeat", 1000)
+				f.pass(execTTL + execHeartbeat)
+				_, err := f.memory.Claim(ctx, agent.ClaimRequest{
+					Owner: "worker-9", Agents: []string{"lead"}, RunID: started.ID, Now: f.clock.Now(), TTL: execTTL,
+				})
+				require.NoError(t, err)
+			}
+		})
+
+		_, err := f.engine.Execute(ctx, started.ID)
+
+		require.ErrorIs(t, err, agent.ErrLeaseLost)
+		assert.Equal(t, 2, asked, "no child is asked once the lease is known lost")
+		got := f.run(started.ID)
+		assert.Equal(t, "worker-9", got.LeaseOwner)
+		assert.False(t, got.Terminal())
+	})
+}
+
 func TestExecute_ARunThatFailsAsksItsRunningChildrenToStop(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		calls := &execCalls{}

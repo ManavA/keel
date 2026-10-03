@@ -28,6 +28,10 @@ type keepOptions struct {
 	Interval time.Duration
 	// Logger defaults to slog.Default.
 	Logger *slog.Logger
+	// Lost, when set, is called once, from the keeper's goroutine, when the
+	// lease is lost or given up. It is called after a cancel request too,
+	// when the held context has already ended with another cause.
+	Lost func()
 }
 
 // keep extends lease every Interval until stop is called. The context it
@@ -109,6 +113,12 @@ func keep(ctx context.Context, lease Lease, opts keepOptions) (held context.Cont
 			"interval", opts.Interval, "ttl", opts.TTL, "using", interval)
 	}
 
+	lost := func() {
+		if opts.Lost != nil {
+			opts.Lost()
+		}
+	}
+
 	// beating is the keeper's own context. It is not held, because a cancel
 	// request ends held and leaves the heartbeats going.
 	beating, quit := context.WithCancel(ctx)
@@ -151,6 +161,7 @@ func keep(ctx context.Context, lease Lease, opts keepOptions) (held context.Cont
 			case errors.Is(err, ErrLeaseLost), errors.Is(err, ErrNotFound):
 				logger.Warn("agent: lease lost", "error", err)
 				cancel(ErrLeaseLost)
+				lost()
 				return
 			default:
 				silent := opts.Clock.Now().Sub(last)
@@ -158,6 +169,7 @@ func keep(ctx context.Context, lease Lease, opts keepOptions) (held context.Cont
 					logger.Warn("agent: lease given up: no heartbeat has succeeded for a whole TTL",
 						"error", err, "silent", silent, "ttl", opts.TTL)
 					cancel(ErrLeaseLost)
+					lost()
 					return
 				}
 				logger.Warn("agent: heartbeat failed", "error", err, "silent", silent, "ttl", opts.TTL)

@@ -8,6 +8,7 @@ import (
 	"maps"
 	"runtime/debug"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/ManavA/keel/agent/internal/storerule"
@@ -129,6 +130,10 @@ type execution struct {
 	held  context.Context
 	stop  func()
 	cause error
+	// leaseLost is set by the keeper when the lease is lost. After a cancel
+	// request held has already ended with errCancelRequested, so this is how
+	// a loss is noticed then.
+	leaseLost atomic.Bool
 	// work is the context the store, the model, the guard and the tools are
 	// called under: held, or step once the keeper has been stopped or
 	// cancellation of the run has been requested, since the run is then
@@ -202,6 +207,7 @@ func (x *execution) hold() {
 		TTL:      x.e.opts.LeaseTTL,
 		Interval: x.e.opts.HeartbeatInterval,
 		Logger:   x.e.log,
+		Lost:     func() { x.leaseLost.Store(true) },
 	})
 	x.work, x.cause = x.held, nil
 }
@@ -225,7 +231,7 @@ func (x *execution) letGo() {
 // then, in which case nothing more is to be written.
 func (x *execution) released() (lost bool) {
 	x.letGo()
-	return errors.Is(x.cause, ErrLeaseLost)
+	return errors.Is(x.cause, ErrLeaseLost) || x.leaseLost.Load()
 }
 
 // interrupted reports why the execution cannot go on working, or nil when it
@@ -233,6 +239,9 @@ func (x *execution) released() (lost bool) {
 // execution's to finish as cancelled, the keeper beats on until it is
 // stopped, and the work goes on under step.
 func (x *execution) interrupted() error {
+	if x.leaseLost.Load() {
+		return ErrLeaseLost
+	}
 	if x.work.Err() == nil {
 		return nil
 	}
@@ -858,7 +867,16 @@ func (x *execution) cancelChildren(run Run, status Status, reason string) error 
 		if cause := x.interrupted(); cause != nil {
 			return cause
 		}
-		children, err := x.e.store.ListRuns(x.work, RunFilter{ParentID: run.ID, Before: before, Limit: maxListLimit})
+		filter := RunFilter{ParentID: run.ID, Before: before, Limit: maxListLimit}
+		children, err := x.e.store.ListRuns(x.work, filter)
+		if err != nil && x.work.Err() != nil {
+			// Cut off by a request to cancel, which moves the work on to
+			// step; asked again there.
+			if cause := x.interrupted(); cause != nil {
+				return cause
+			}
+			children, err = x.e.store.ListRuns(x.work, filter)
+		}
 		if err != nil {
 			return err
 		}
@@ -870,9 +888,14 @@ func (x *execution) cancelChildren(run Run, status Status, reason string) error 
 				return cause
 			}
 			now := x.e.clock.Now()
-			err := x.e.store.RequestCancel(x.work, CancelRequest{
-				RunID: child.ID, By: journalText(by), Reason: journalText(why), Now: now,
-			})
+			req := CancelRequest{RunID: child.ID, By: journalText(by), Reason: journalText(why), Now: now}
+			err := x.e.store.RequestCancel(x.work, req)
+			if err != nil && x.work.Err() != nil {
+				if cause := x.interrupted(); cause != nil {
+					return cause
+				}
+				err = x.e.store.RequestCancel(x.work, req)
+			}
 			switch {
 			case errors.Is(err, ErrFinished):
 			case err != nil:
